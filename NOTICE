@@ -1,0 +1,7 @@
+Copyright 2026 botstead contributors
+
+deploy/seccomp/moby-default.json is a copy of the default seccomp profile of Moby
+(https://github.com/moby/profiles, seccomp/default.json, commit 6fe7deb1b9fb7c0397a4593480d7d22b9ee8caef),
+Copyright Docker, Inc. and the Moby contributors, licensed under the Apache License 2.0.
+deploy/seccomp/bot.json is generated from it by deploy/seccomp/build_profile.py (modified, see the comments in
+that script and docs/isolation.md).

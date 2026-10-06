@@ -1,0 +1,30 @@
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+# read_only rootfs: конфигурация docker CLI пишется в tmpfs
+ENV DOCKER_CONFIG=/tmp/.docker
+
+# docker CLI (единственный клиент docker.sock), iptables (правила сетей ботов), curl (healthcheck и launcherctl.sh)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    iptables \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+    && chmod a+r /etc/apt/keyrings/docker.asc \
+    && echo \
+       "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+       $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+       tee /etc/apt/sources.list.d/docker.list > /dev/null \
+    && apt-get update && apt-get install -y --no-install-recommends \
+       docker-ce-cli \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY launcher/ ./launcher/
+RUN pip install --no-cache-dir ./launcher/
+
+# Запускается от root внутри контейнера: нужен доступ к docker.sock и iptables. Права урезаны в compose
+# (cap_drop ALL, NET_ADMIN и NET_RAW, no-new-privileges, read_only).
+CMD ["python", "-m", "bothub_launcher"]

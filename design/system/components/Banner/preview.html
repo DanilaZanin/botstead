@@ -1,0 +1,38 @@
+<!-- @dsCard group="Feedback" height=330 -->
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;600&family=Golos+Text:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+body{margin:0;background:var(--bg-canvas);color:var(--fg-default);font-family:var(--font-sans)}
+*{box-sizing:border-box}
+button{font:inherit;cursor:pointer}
+:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.row{display:flex;gap:var(--space-2);align-items:center;flex-wrap:wrap}
+.col{display:flex;flex-direction:column;gap:var(--space-3)}
+.pad{padding:var(--space-4)}
+.btn{min-height:var(--hit-min);padding:0 var(--space-4);border-radius:var(--radius-md);border:1px solid transparent;font-size:.9375rem;font-weight:500;display:inline-flex;align-items:center;justify-content:center;gap:var(--space-2)}
+.btn-primary{background:var(--bg-emphasis);color:var(--fg-on-emphasis)}
+.btn-secondary{background:var(--bg-surface);color:var(--fg-default);border-color:var(--border-control)}
+.btn-ghost{background:transparent;color:var(--fg-default)}
+.btn-danger{background:var(--danger-bg);color:var(--danger-fg)}
+.btn-approve{background:var(--attention-emphasis);color:var(--fg-on-attention)}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+.icon-btn{width:var(--hit-min);padding:0;border-radius:var(--radius-md)}
+.badge{display:inline-flex;align-items:center;gap:var(--space-1);padding:2px 7px;border-radius:var(--radius-sm);font-size:.75rem;font-weight:600;letter-spacing:.02em;line-height:1rem}
+.p-claude{background:var(--claude-bg);color:var(--claude-fg)}
+.p-codex{background:var(--codex-bg);color:var(--codex-fg)}
+.p-gemini{background:var(--gemini-bg);color:var(--gemini-fg)}
+.dot{width:8px;height:8px;border-radius:4px;display:inline-block}
+.muted{color:var(--fg-muted)}
+.mono{font-family:var(--font-mono);font-size:.8125rem;line-height:1.125rem}
+.card{background:var(--bg-surface);border:1px solid var(--border-default);border-radius:var(--radius-lg)}
+@media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important}}
+.spin{display:inline-flex;animation:r 1s linear infinite}@keyframes r{to{transform:rotate(360deg)}}</style>
+</head>
+<body>
+<div class="pad"><div style="max-width:360px;display:flex;flex-direction:column;gap:12px"><div role="status" style="display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 14px; background: var(--bg-sunken); border: 1px solid var(--border-default); color: var(--fg-default); flex-shrink: 0;"><span style="display: flex;"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex-shrink: 0;"><rect x="4" y="7" width="16" height="12" rx="3"></rect><path d="M12 3v4M9 13h.01M15 13h.01"></path></svg></span><span style="flex-grow: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px;"><span style="font: 600 15px/20px 'Golos Text', -apple-system, system-ui, sans-serif;">Управляет бот</span><span style="font: 400 13px/18px 'Golos Text', -apple-system, system-ui, sans-serif; color: var(--fg-default);">Шаг 4 из 6: заполняет форму отклика.</span></span></div><div role="status" style="display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 14px; background: var(--attention-bg); border: 1px solid var(--attention-border); color: var(--attention-text); flex-shrink: 0;"><span style="display: flex;"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex-shrink: 0;"><path d="M8 13V5a1.5 1.5 0 013 0v6M11 11V4a1.5 1.5 0 013 0v7M14 11V5.5a1.5 1.5 0 013 0V14c0 4-2.5 7-6.5 7S5 18 4.5 15L3 11.5a1.5 1.5 0 012.6-1.4L8 13"></path></svg></span><span style="flex-grow: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px;"><span style="font: 600 15px/20px 'Golos Text', -apple-system, system-ui, sans-serif;">Управляете вы</span><span style="font: 400 13px/18px 'Golos Text', -apple-system, system-ui, sans-serif; color: var(--fg-default);">Бот остановлен, ожидавшие действия отменены.</span></span></div><div role="status" style="display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 14px; background: var(--bg-sunken); border: 1px solid var(--border-default); color: var(--fg-default); flex-shrink: 0;"><span style="display: flex;"><span class="spin"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex-shrink: 0;"><path d="M12 3a9 9 0 109 9"></path></svg></span></span><span style="flex-grow: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px;"><span style="font: 600 15px/20px 'Golos Text', -apple-system, system-ui, sans-serif;">Возврат боту</span><span style="font: 400 13px/18px 'Golos Text', -apple-system, system-ui, sans-serif; color: var(--fg-default);">Бот заново читает страницу.</span></span></div><div role="status" style="display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 14px; background: var(--danger-bg); border: 1px solid transparent; color: var(--danger-fg); flex-shrink: 0;"><span style="display: flex;"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex-shrink: 0;"><path d="M3 3l18 18"></path><path d="M7 7a5 5 0 00-1 9.9h10M10 5.2A6 6 0 0118 10a4 4 0 012.6 6.5"></path></svg></span><span style="flex-grow: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px;"><span style="font: 600 15px/20px 'Golos Text', -apple-system, system-ui, sans-serif;">Связь с терминалом потеряна</span><span style="font: 400 13px/18px 'Golos Text', -apple-system, system-ui, sans-serif; color: var(--fg-default);">Вход не завершён.</span></span></div><div role="status" style="display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 14px; background: var(--bg-surface); border: 1px solid var(--border-default); color: var(--fg-default); flex-shrink: 0;"><span style="display: flex; color: var(--success-fg);"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex-shrink: 0;"><path d="M5 12l5 5 9-10"></path></svg></span><span style="flex-grow: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px;"><span style="font: 600 15px/20px 'Golos Text', -apple-system, system-ui, sans-serif;">Вход выполнен</span><span style="font: 400 13px/18px 'Golos Text', -apple-system, system-ui, sans-serif; color: var(--fg-default);">Claude Code подключён.</span></span></div></div></div>
+<script>document.documentElement.setAttribute("lang","ru");</script>
+</body>
+</html>

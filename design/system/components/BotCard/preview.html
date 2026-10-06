@@ -1,0 +1,44 @@
+<!-- @dsCard group="Data" height=130 -->
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;600&family=Golos+Text:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+body{margin:0;background:var(--bg-canvas);color:var(--fg-default);font-family:var(--font-sans)}
+*{box-sizing:border-box}
+button{font:inherit;cursor:pointer}
+:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.row{display:flex;gap:var(--space-2);align-items:center;flex-wrap:wrap}
+.col{display:flex;flex-direction:column;gap:var(--space-3)}
+.pad{padding:var(--space-4)}
+.btn{min-height:var(--hit-min);padding:0 var(--space-4);border-radius:var(--radius-md);border:1px solid transparent;font-size:.9375rem;font-weight:500;display:inline-flex;align-items:center;justify-content:center;gap:var(--space-2)}
+.btn-primary{background:var(--bg-emphasis);color:var(--fg-on-emphasis)}
+.btn-secondary{background:var(--bg-surface);color:var(--fg-default);border-color:var(--border-control)}
+.btn-ghost{background:transparent;color:var(--fg-default)}
+.btn-danger{background:var(--danger-bg);color:var(--danger-fg)}
+.btn-approve{background:var(--attention-emphasis);color:var(--fg-on-attention)}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+.icon-btn{width:var(--hit-min);padding:0;border-radius:var(--radius-md)}
+.badge{display:inline-flex;align-items:center;gap:var(--space-1);padding:2px 7px;border-radius:var(--radius-sm);font-size:.75rem;font-weight:600;letter-spacing:.02em;line-height:1rem}
+.p-claude{background:var(--claude-bg);color:var(--claude-fg)}
+.p-codex{background:var(--codex-bg);color:var(--codex-fg)}
+.p-gemini{background:var(--gemini-bg);color:var(--gemini-fg)}
+.dot{width:8px;height:8px;border-radius:4px;display:inline-block}
+.muted{color:var(--fg-muted)}
+.mono{font-family:var(--font-mono);font-size:.8125rem;line-height:1.125rem}
+.card{background:var(--bg-surface);border:1px solid var(--border-default);border-radius:var(--radius-lg)}
+@media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div class="pad"><a href="#" class="card" style="display:flex;gap:12px;padding:14px;max-width:360px;text-decoration:none;color:var(--fg-default)">
+<span aria-hidden="true" style="position: relative; display: inline-block; width: 44px; height: 44px; flex-shrink: 0;"><svg width="44" height="44" viewBox="0 0 48 48" aria-hidden="true" style="display: block; flex-shrink: 0;"><rect width="48" height="48" rx="13.1" fill="var(--avatar-sky)"></rect><ellipse cx="24" cy="41.5" rx="14" ry="3" fill="#0d1013" opacity="0.16"></ellipse><defs><radialGradient id="bg0" cx="38%" cy="24%" r="78%"><stop offset="0%" stop-color="#ffd7a8"></stop><stop offset="55%" stop-color="#ffb066"></stop><stop offset="100%" stop-color="#d97f2e"></stop></radialGradient><clipPath id="bc0"><circle cx="24" cy="28" r="13"></circle></clipPath></defs><circle cx="24" cy="28" r="13" fill="url(#bg0)" stroke="var(--avatar-ink)" stroke-width="2.4"></circle><g clip-path="url(#bc0)"><ellipse cx="17" cy="15" rx="9" ry="6" fill="#ffffff" opacity="0.30" transform="rotate(-20 17 15)"></ellipse><ellipse cx="30" cy="40" rx="17" ry="8" fill="#d97f2e" opacity="0.28"></ellipse></g><path d="M24 7 L31 9.5 L24 12 Z" fill="#e35b4a"></path><path d="M24 15V7l7 2.5L24 12" fill="none" stroke="var(--avatar-ink)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"></path><circle cx="19" cy="27" r="5" fill="#eaf4ff" stroke="var(--avatar-ink)" stroke-width="2.4"></circle><circle cx="19" cy="27" r="1.8" fill="var(--avatar-ink)"></circle><circle cx="30" cy="27" r="2" fill="var(--avatar-ink)"></circle><path d="M20 34q4 2.5 8 0" fill="none" stroke="var(--avatar-ink)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"></path></svg><span title="gemini" style="position: absolute; right: -2px; bottom: -2px; width: 13px; height: 13px; border-radius: 13px; background: var(--gemini-fg); border: 2px solid var(--bg-surface); box-sizing: border-box;"></span></span>
+<span style="display:flex;flex-direction:column;gap:4px;min-width:0">
+<span class="row" style="gap:8px"><span class="headline">Скаут</span><span class="badge p-gemini">Gemini 3.1 Pro</span></span>
+<span class="footnote muted" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Нашёл 7 вакансий SRE, жду решения по отклику</span>
+<span class="row footnote muted" style="gap:10px"><span class="row" style="gap:5px"><span class="dot" style="background:var(--attention-fg)"></span>Ждёт подтверждения</span><span>Сервер</span></span>
+</span></a></div>
+<script>document.documentElement.setAttribute("lang","ru");</script>
+</body>
+</html>
