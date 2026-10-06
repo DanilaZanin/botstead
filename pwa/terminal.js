@@ -52,14 +52,71 @@ function loadXterm() {
 const ANSI = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]/g;
 export const stripAnsi = (text) => text.replace(ANSI, '');
 
-// Последняя законченная ссылка https в тексте (за ней пробел или перевод строки), без хвостовой пунктуации.
-// Недописанную ссылку на границе фрагмента не берём. Другие схемы (javascript:, http:) не принимаем.
-export function findLoginUrl(text) {
-  const found = text.match(/https:\/\/[^\s"'<>\x1b\x00-\x1f]+(?=\s)/g);
-  if (!found) return '';
-  const url = found[found.length - 1].replace(/[.,;:)\]}>]+$/, '');
+// Гиперссылка OSC 8: ESC ] 8 ; параметры ; URI (BEL | ESC \). Адрес кончается перед ESC или BEL, поэтому недописанная
+// ссылка на границе фрагмента (терминатора ещё нет) не совпадает. Закрывающая последовательность `ESC ] 8 ; ;` без адреса
+// и ссылки не на https тоже не подходят. Claude Code печатает так длинный адрес, который в тексте переносится по строкам.
+// eslint-disable-next-line no-control-regex
+const OSC8_LINK = /\x1b\]8;[^;\x07\x1b]*;(https:\/\/[^\x00-\x20\x7f"'<>\x1b]+)(?=\x07|\x1b)/g;
+
+function cleanUrl(raw) {
+  const url = raw.replace(/[.,;:)\]}>]+$/, '');
   try { return new URL(url).protocol === 'https:' ? url : ''; } catch { return ''; }
 }
+
+// Ссылка входа в выводе терминала. Ищет в сыром тексте (с управляющими последовательностями) и берёт:
+// 1) последнюю гиперссылку OSC 8: её адрес целый, даже если видимый текст перенесён по строкам;
+// 2) иначе последнюю законченную ссылку https в тексте без управляющих последовательностей (за ней пробел или перевод
+//    строки), без хвостовой пунктуации. Недописанную ссылку на границе фрагмента не берём.
+// Другие схемы (javascript:, http:) не принимаем. accept(url) необязательный фильтр (например, список хостов):
+// ссылка, которую он отклонил, пропускается, берётся предыдущая подходящая.
+export function findLoginUrl(text, accept = () => true) {
+  const pick = (candidates) => {
+    for (let i = candidates.length - 1; i >= 0; i--) {
+      const url = cleanUrl(candidates[i]);
+      if (url && accept(url)) return url;
+    }
+    return '';
+  };
+  const osc = pick(Array.from(text.matchAll(OSC8_LINK), (m) => m[1]));
+  if (osc) return osc;
+  return pick(stripAnsi(text).match(/https:\/\/[^\s"'<>\x1b\x00-\x1f]+(?=\s)/g) || []);
+}
+
+// Код устройства `codex login --device-auth`: после строки «Enter this one-time code (expires in 15 minutes)» идёт код
+// вида ABCD-12345 (4 и 5 символов A-Z0-9). Последний найденный; неполный код на границе фрагмента не берём (нужны ровно
+// 5 символов после дефиса и граница слова). Возвращает '' если кода нет.
+export function findDeviceCode(text) {
+  const found = Array.from(stripAnsi(text).matchAll(/[Oo]ne-time code[\s\S]{0,120}?\b([A-Z0-9]{4}-[A-Z0-9]{5})\b/g), (m) => m[1]);
+  return found.length ? found[found.length - 1] : '';
+}
+
+// ---------------------------------------------------------------------------
+// Вход по подписке: сценарий и допустимые ссылки каждого CLI (docs/contracts.md §12)
+// ---------------------------------------------------------------------------
+// site-code: сайт показывает код, его вставляют в терминал (claude auth login, agy).
+// screen-code: терминал показывает код устройства, его вводят на сайте, CLI завершается сам (codex login --device-auth).
+export const LOGIN_FLOW = { claude: 'site-code', agy: 'site-code', codex: 'screen-code' };
+export const loginFlow = (cli) => LOGIN_FLOW[cli] || 'site-code';
+
+// Ссылку из вывода терминала открывает кнопка на странице, поэтому берутся только адреса входа самого провайдера:
+// строка, которую напечатала страница или файл в терминале входа, не должна стать кнопкой на чужой сайт.
+export const LOGIN_HOSTS = {
+  claude: ['claude.ai', 'claude.com', 'platform.claude.com', 'console.anthropic.com'],
+  codex: ['auth.openai.com', 'chatgpt.com'],
+  agy: ['accounts.google.com'],
+};
+
+// Точное совпадение хоста (поддомены не считаются), https, без логина, пароля и нестандартного порта.
+export function isLoginUrlAllowed(cli, url) {
+  const hosts = LOGIN_HOSTS[cli];
+  if (!hosts) return false;
+  let u;
+  try { u = new URL(url); } catch { return false; }
+  return u.protocol === 'https:' && !u.username && !u.password && u.port === '' && hosts.includes(u.hostname);
+}
+
+// Сколько ждать ссылку (и код устройства у codex) после открытия соединения, прежде чем признать вход зависшим.
+export const LINK_TIMEOUT_MS = 60000;
 
 // ---------------------------------------------------------------------------
 // Размер: колонки и строки под размер блока (ядро принимает cols 20–300, rows 5–100)

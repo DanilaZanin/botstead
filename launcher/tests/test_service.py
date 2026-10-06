@@ -573,7 +573,7 @@ async def test_login_session_roundtrip(launcher, backend):
     sess = await launcher.open_login_session("o1", command="claude", cols=100, rows=30)
     sid = sess["session_id"]
     spawned = ops(backend, "spawn_pty")[0]
-    assert spawned[1] == "login-o1" and spawned[2] == ["claude"] and spawned[3:] == (100, 30)
+    assert spawned[1] == "login-o1" and spawned[2] == ["claude", "auth", "login"] and spawned[3:] == (100, 30)
     pty = backend.last_pty
     pty.feed(b"hello\r\n")
     await launcher.login_input(sid, b"ls\r")

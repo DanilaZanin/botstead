@@ -799,6 +799,7 @@ dl.kv dd { margin: 0; font: 400 15px/20px var(--font-sans); color: var(--fg-defa
 .cl-code label { font: 400 0.8125rem/1.125rem var(--font-sans); color: var(--fg-muted); }
 .cl-code .input-row .btn { flex-shrink: 0; }
 .cl-link-text { word-break: break-all; color: var(--fg-default); }
+.cl-device-code { font-family: var(--font-mono); font-size: 1.5rem; line-height: 2rem; letter-spacing: 0.08em; color: var(--fg-default); user-select: all; word-break: break-all; }
 .cl-link-actions { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
 .cl-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .cl-steps li { display: flex; align-items: center; gap: 10px; font: 400 14px/20px var(--font-sans); color: var(--fg-muted); }

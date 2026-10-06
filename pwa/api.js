@@ -141,6 +141,8 @@ const mockBots = [
 // window.__providerCalls: {name, id, body}. &probe=slow растягивает создание и правку с ключом до 2,5 с.
 const MOCK_PROVIDERS_MODE = params.get('providers') || '';
 const MOCK_LOGIN_MODE = params.get('login') || '';
+// Экран входа ждёт ссылку (и код устройства у codex) 60 с. В моке срок можно сократить: &login_timeout=<мс>.
+export const MOCK_LOGIN_TIMEOUT_MS = MOCK ? Number(params.get('login_timeout')) || 0 : 0;
 const MOCK_RUNNER = { anthropic_api: 'claude', openai_api: 'codex', openai_compatible: 'codex', google_api: 'gemini' };
 const MOCK_CLI_RUNNER = { claude: 'claude', codex: 'codex', agy: 'gemini' };
 const MOCK_VENDOR_MODELS = {
@@ -1069,11 +1071,49 @@ async function mockRecreateBot(id) {
   return { ok: true, container: 'started' };
 }
 
-// Поддельный WebSocket терминала входа: вывод, ссылка входа, ожидание кода. Код `ok` даёт успех, `bad` ошибку.
-// Печатные символы ввода эхом возвращаются как «*», управляющие клавиши как <Esc>, <Tab>, <Up>, <C-c>.
+// Поддельный WebSocket терминала входа. Вывод повторяет фрагменты настоящих CLI (ANSI-цвета, гиперссылка OSC 8 с
+// адресом, перенесённым по строкам, код устройства codex). Два сценария (docs/contracts.md §12):
+//   claude и agy (код с сайта): ссылка, затем «Paste code here»; код `ok` даёт успех, `bad` ошибку.
+//   codex (код с экрана): ссылка и код устройства, ввода нет. Тест играет роль сайта через
+//   window.__loginMock.approve() (код принят, успех) и window.__loginMock.expire() (код просрочен).
+// Режимы &login=: busy, forbidden, revoked, start, lost, timeout (сбои соединения); silent (терминал молчит);
+// nocode (codex печатает ссылку без кода); foreign (ссылка на чужой хост вместо настоящей); mixed (чужая ссылка
+// после настоящей). Печатные символы ввода эхом возвращаются как «*», управляющие клавиши как <Esc>, <Tab>, <Up>, <C-c>.
 // window.__loginMock.frames хранит только управляющие JSON-кадры клиента (resize, close), вводимые данные не пишутся.
 const MOCK_LOGIN_FIRST_OUTPUT_MS = 2500;
 const MOCK_KEY_NAMES = { '\x1b': '<Esc>', '\t': '<Tab>', '\x1b[A': '<Up>', '\x1b[B': '<Down>', '\x1b[C': '<Right>', '\x1b[D': '<Left>' };
+export const MOCK_CLAUDE_URL = 'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference&code_challenge=mock-challenge&code_challenge_method=S256&state=mock-state';
+export const MOCK_AGY_URL = 'https://accounts.google.com/o/oauth2/auth?client_id=mock-agy.apps.googleusercontent.com&response_type=code&scope=openid+email&redirect_uri=urn%3Aietf%3Awg%3Aoauth%3A2.0%3Aoob&state=mock-state';
+const MOCK_EVIL_LINE = 'More info: https://evil.example/login?next=claude.ai\r\n';
+// Терминал переносит длинный адрес по строкам жёстко (\r\n посреди ссылки), поэтому целый адрес есть только в OSC 8.
+const mockWrap = (text, width) => text.match(new RegExp(`.{1,${width}}`, 'g')).join('\r\n');
+const mockOsc8 = (url, width) => `\x1b]8;;${url}\x1b\\${mockWrap(url, width)}\x1b]8;;\x1b\\`;
+// Куски вывода по CLI. Гиперссылка claude нарочно разрезана посреди адреса на два кадра, код codex посреди кода:
+// недописанные ссылку и код брать нельзя.
+function mockLoginChunks(cli, mode) {
+  if (mode === 'silent') return [];
+  if (cli === 'codex') {
+    const intro = '\r\nWelcome to Codex [v0.156.1]\r\n\x1b[90mOpenAI\'s command-line coding agent\x1b[0m\r\n\r\nFollow these steps to sign in with ChatGPT using device code authorization:\r\n\r\n';
+    const host = mode === 'foreign' ? 'evil.example' : 'auth.openai.com';
+    const step1 = `1. Open this link in your browser and sign in to your account\r\n   \x1b[94mhttps://${host}/codex/device\x1b[0m\r\n\r\n`;
+    if (mode === 'nocode') return [intro, step1];
+    return [intro, step1, '2. Enter this one-time code \x1b[90m(expires in 15 minutes)\x1b[0m\r\n   \x1b[94mABCD-12', '345\x1b[0m\r\n\r\n\x1b[90mDevice codes are a common phishing target. Never share this code.\x1b[0m\r\n'];
+  }
+  const foreign = mode === 'foreign';
+  if (cli === 'agy') {
+    return ['To sign in, open this URL in your browser:\r\n', foreign ? `${MOCK_EVIL_LINE}` : `${mockOsc8(MOCK_AGY_URL, 78)}\r\n`,
+      ...(mode === 'mixed' ? [MOCK_EVIL_LINE] : []), '\r\nPaste the authorization code here > '];
+  }
+  const link = mockOsc8(MOCK_CLAUDE_URL, 76);
+  const mid = 60; // разрез внутри адреса OSC 8: терминатора нет, ссылку брать нельзя до второго кадра
+  return [
+    'Opening browser to sign in…\r\n',
+    foreign ? `If the browser didn't open, visit: ${MOCK_EVIL_LINE}` : `If the browser didn't open, visit: \r\n${link.slice(0, mid)}`,
+    ...(foreign ? [] : [`${link.slice(mid)}\r\n`]),
+    ...(mode === 'mixed' ? [MOCK_EVIL_LINE] : []),
+    '\r\nPaste code here if prompted > ',
+  ];
+}
 class MockLoginSocket {
   constructor(providerId) {
     this.readyState = 0;
@@ -1085,6 +1125,9 @@ class MockLoginSocket {
     window.__loginMock.socket = this;
     // Для e2e: соединение молча обрывается, как у свёрнутой страницы на телефоне (onclose не вызывается).
     window.__loginMock.silentDrop = () => { if (window.__loginMock.socket) window.__loginMock.socket.readyState = 3; };
+    // codex: человек ввёл код устройства на сайте (approve) или код просрочился (expire); CLI завершается сам.
+    window.__loginMock.approve = () => { const s = window.__loginMock.socket; if (s) s.deviceResult(true); };
+    window.__loginMock.expire = () => { const s = window.__loginMock.socket; if (s) s.deviceResult(false); };
     setTimeout(() => this.start(), 250);
   }
   out(text) {
@@ -1105,8 +1148,7 @@ class MockLoginSocket {
     this.readyState = 1;
     if (this.onopen) this.onopen({});
     const cli = this.provider.cli;
-    const host = { claude: 'https://claude.ai/oauth/authorize', codex: 'https://auth.openai.com/oauth/authorize', agy: 'https://accounts.google.com/o/oauth2/auth' }[cli];
-    const lines = [`$ ${cli} login\r\n`, "Browser didn't open? Use the url below to sign in:\r\n", `${host}?code=true&client_id=mock-${cli}&scope=user:inference\r\n`, '\r\nPaste code here if prompted > '];
+    const lines = mockLoginChunks(cli, mode);
     // Первый вывод приходит не сразу: шаг 1 («жду ссылку») должен продержаться дольше шага опроса в тестах и быть виден глазами.
     lines.forEach((text, i) => setTimeout(() => this.out(text), MOCK_LOGIN_FIRST_OUTPUT_MS + 60 * (i + 1)));
     if (mode === 'lost') setTimeout(() => this.finish(1006), MOCK_LOGIN_FIRST_OUTPUT_MS + 700);
@@ -1132,10 +1174,21 @@ class MockLoginSocket {
       else { this.line += ch; this.out('*'); }
     }
   }
+  deviceResult(ok) {
+    if (this.readyState !== 1 || !this.provider || this.provider.cli !== 'codex') return;
+    if (ok) {
+      this.out('\r\nSuccessfully logged in\r\n$ ');
+      setTimeout(() => this.exit(0), 150);
+    } else {
+      this.out('\r\nError logging in with device code: device auth timed out after 15 minutes\r\n');
+      setTimeout(() => this.exit(1), 150);
+    }
+  }
   submit() {
     const code = this.line;
     this.line = '';
     this.out('\r\n');
+    if (this.provider && this.provider.cli === 'codex') return; // у codex ввода кода нет: решает сайт
     if (code === 'ok') {
       this.out('Login successful.\r\n$ ');
       setTimeout(() => this.exit(0), 150);

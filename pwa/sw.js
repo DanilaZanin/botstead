@@ -1,7 +1,7 @@
 // sw.js: кэш оболочки приложения + push-уведомления (approval_req → #/approvals/<id>).
 // Данные пользователя не кэшируются: /api/* (включая /api/auth/*) и WebSocket идут мимо кэша, в кэше только статика.
 // Версию бампать при каждом релизе оболочки, иначе обновления не доходят до телефона.
-const CACHE = 'bothub-shell-v19';
+const CACHE = 'bothub-shell-v20';
 const SHELL = [
   './',
   './index.html',

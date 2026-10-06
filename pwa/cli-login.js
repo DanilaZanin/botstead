@@ -1,16 +1,24 @@
 // cli-login.js: экран входа по подписке (docs/contracts.md §12). WebSocket /api/providers/{id}/login: бинарные кадры несут
 // байты терминала, клиент шлёт байты ввода и JSON {t:'resize', cols, rows} / {t:'close'}; ядро присылает {t:'exit', code}.
-// Над терминалом шапка «что сейчас происходит» по шагам, ссылка входа и поле кода вынесены в обычные элементы.
-// В состояниях ошибки ссылка и поле кода прячутся (они устарели), остаётся одно главное действие.
+// Над терминалом шапка «что сейчас происходит» по шагам, ссылка входа, код устройства и поле кода вынесены в обычные элементы.
+// Два сценария (loginFlow в terminal.js):
+//   site-code (claude, agy): сайт показывает код, его вставляют в поле «Код из браузера», он уходит в терминал.
+//   screen-code (codex): терминал показывает код устройства, его вводят на сайте, поля кода нет, CLI завершается сам.
+// Ссылка берётся только с хостов провайдера (LOGIN_HOSTS). Если за минуту после соединения нет ссылки (у codex ещё и
+// кода), вход считается зависшим: сессия закрывается, предлагается начать заново.
+// В состояниях ошибки ссылка, код и поле кода прячутся (они устарели), остаётся одно главное действие.
 import * as api from './api.js';
 import { ICONS, esc } from './ui.js';
 import { context, stateHtml, isDesktop } from './account.js';
 import { CLI_LABEL } from './registry.js';
-import { createTerminal, findLoginUrl, stripAnsi, applyCtrl, KEY_BYTES, ESCAPE_HATCH } from './terminal.js';
+import { createTerminal, findLoginUrl, findDeviceCode, isLoginUrlAllowed, loginFlow, LINK_TIMEOUT_MS, applyCtrl, KEY_BYTES, ESCAPE_HATCH } from './terminal.js';
 
 const HASH_LIST = '#/settings/providers';
 const SUB_LABEL = { claude: 'Claude', codex: 'ChatGPT', agy: 'Google' };
-const STEP_NAMES = ['Запуск входа на сервере', 'Открыть ссылку и войти в аккаунт', 'Вставить код из браузера'];
+const STEP_NAMES = {
+  'site-code': ['Запуск входа на сервере', 'Открыть ссылку и войти в аккаунт', 'Вставить код из браузера'],
+  'screen-code': ['Запуск входа на сервере', 'Открыть ссылку входа', 'Ввести код с экрана на странице входа'],
+};
 // Состояния, когда сессия на сервере закончилась: терминал неактивен, ссылка и поле кода устарели.
 const ENDED = ['failed', 'lost', 'busy', 'forbidden', 'revoked', 'timeout', 'error'];
 const encoder = new TextEncoder();
@@ -43,6 +51,9 @@ export async function viewProviderLogin(providerId) {
 
   const desktop = isDesktop();
   const cli = provider.cli;
+  const flow = loginFlow(cli);
+  const screenCode = flow === 'screen-code';
+  const linkTimeoutMs = api.MOCK_LOGIN_TIMEOUT_MS || LINK_TIMEOUT_MS;
   const title = `Вход: ${CLI_LABEL[cli] || cli}`;
   const subtitle = `Подписка ${SUB_LABEL[cli] || ''}`.trim();
   const providerHref = `${HASH_LIST}/${providerId}`;
@@ -56,13 +67,20 @@ export async function viewProviderLogin(providerId) {
     <span class="t-log cl-link-text" id="cl-link-text" data-i18n-skip></span>
     <div class="cl-link-actions"><a id="cl-open" class="btn btn-primary" href="#" target="_blank" rel="noopener noreferrer">${ICONS.external}Открыть страницу входа</a><button type="button" id="cl-copy" class="btn btn-secondary">${ICONS.copy}Скопировать ссылку</button></div>
   </div>`;
-  const codeHtml = `<form id="cl-form" class="cl-code stack gap-2" novalidate autocomplete="off">
+  // Код устройства (codex): крупно, с кнопкой копирования. Поле «Код из браузера» в этом сценарии скрыто.
+  const deviceHtml = screenCode ? `<div id="cl-device-card" class="card card-pad stack gap-2" hidden>
+    <span class="t-footnote">Код для страницы входа</span>
+    <span class="t-headline mono cl-device-code" id="cl-device-code" data-i18n-skip></span>
+    <div class="cl-link-actions"><button type="button" id="cl-device-copy" class="btn btn-secondary">${ICONS.copy}Скопировать код</button></div>
+    <span id="cl-device-note" class="field-note" aria-live="polite">Введите этот код на странице входа. Он действует 15 минут и подходит один раз.</span>
+  </div>` : '';
+  const codeHtml = `<form id="cl-form" class="cl-code stack gap-2" novalidate autocomplete="off"${screenCode ? ' hidden' : ''}>
     <label for="cl-code">Код из браузера</label>
     <div class="input-row"><input id="cl-code" class="input mono" type="text" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" aria-describedby="cl-code-note"><button type="button" class="icon-btn sunken" id="cl-code-paste" aria-label="Вставить код из буфера">${ICONS.clipboard}</button><button type="submit" class="btn btn-primary" id="cl-send" disabled>Отправить</button></div>
     <span id="cl-code-note" class="field-note" aria-live="polite">Страница входа покажет код. Вставьте его сюда.</span>
   </form>`;
   const statusHtml = '<div id="cl-status" class="banner banner-info" role="status"></div>';
-  const stepsHtml = `<ol id="cl-steps" class="cl-steps">${STEP_NAMES.map((name, i) => `<li data-step="${i + 1}"><span class="cl-step-mark" aria-hidden="true"></span><span>${esc(name)}</span></li>`).join('')}</ol>`;
+  const stepsHtml = `<ol id="cl-steps" class="cl-steps">${STEP_NAMES[flow].map((name, i) => `<li data-step="${i + 1}"><span class="cl-step-mark" aria-hidden="true"></span><span>${esc(name)}</span></li>`).join('')}</ol>`;
   const actionsHtml = '<div id="cl-actions" class="stack gap-2"></div>';
   const resultHtml = '<div id="cl-result" class="stack gap-2" aria-live="polite"></div>';
   const closeLink = `<a id="cl-close" class="btn btn-secondary" href="${HASH_LIST}">Закрыть</a>`;
@@ -71,7 +89,7 @@ export async function viewProviderLogin(providerId) {
     await c.frame({
       title, subtitle, backHref: providerHref,
       body: `<div class="cl-desktop-body">${termHtml}</div>`,
-      desktopAside: `<div class="stack gap-3"><h2 class="desktop-aside-label">Что происходит</h2>${statusHtml}${stepsHtml}${linkHtml}${codeHtml}${resultHtml}${actionsHtml}</div>`,
+      desktopAside: `<div class="stack gap-3"><h2 class="desktop-aside-label">Что происходит</h2>${statusHtml}${stepsHtml}${linkHtml}${deviceHtml}${codeHtml}${resultHtml}${actionsHtml}</div>`,
     });
   } else {
     c.app.innerHTML = `<div class="screen cl-screen">
@@ -81,16 +99,17 @@ export async function viewProviderLogin(providerId) {
       </header>
       <div class="cl-banner">${statusHtml}</div>
       <div class="cl-term-area">${termHtml}</div>
-      <div class="cl-below stack gap-3">${linkHtml}${codeHtml}${resultHtml}${actionsHtml}</div>
+      <div class="cl-below stack gap-3">${linkHtml}${deviceHtml}${codeHtml}${resultHtml}${actionsHtml}</div>
       ${keyButtons()}
     </div>`;
   }
 
   // ---- состояние экрана ----
-  const st = { phase: 'connecting', link: '', opened: false, exitCode: null, socket: null, open: false, size: null, ctrl: false, failStep: 0, background: false, linkFocused: false, retryLabel: '' };
+  const st = { phase: 'connecting', link: '', code: '', opened: false, exitCode: null, socket: null, open: false, size: null, ctrl: false, failStep: 0, background: false, linkFocused: false, retryLabel: '' };
   let term = null;
   let disposed = false;
   let tail = '';
+  let linkTimer = null;
   const decoder = new TextDecoder();
   const host = $('#cl-term');
   host.tabIndex = -1;
@@ -100,10 +119,15 @@ export async function viewProviderLogin(providerId) {
   const codeInput = $('#cl-code');
   const sendBtn = $('#cl-send');
   const linkCard = $('#cl-link-card');
+  const deviceCard = $('#cl-device-card');
   const keysEl = $('.term-keys');
+  // Подсказка о копировании: у codex поле кода скрыто, поэтому своя строка рядом с кодом устройства.
+  const noteEl = () => (screenCode ? $('#cl-device-note') : $('#cl-code-note'));
 
+  // Всё, что нужно для следующего шага, уже в выводе: ссылка, а у codex ещё и код устройства.
+  const ready = () => Boolean(st.link) && (!screenCode || Boolean(st.code));
   function step() {
-    if (st.phase === 'connecting' || !st.link) return 1;
+    if (st.phase === 'connecting' || !ready()) return 1;
     return st.opened ? 3 : 2;
   }
   function describe() {
@@ -111,6 +135,11 @@ export async function viewProviderLogin(providerId) {
     switch (st.phase) {
       case 'connecting': return { kind: 'info', spin: true, title: 'Шаг 1 из 3. Запускаю терминал', text: 'Готовлю вход на сервере.' };
       case 'waiting':
+        if (screenCode) {
+          if (!ready()) return { kind: 'info', spin: true, title: 'Шаг 1 из 3. Жду ссылку и код для входа', text: 'Терминал запущен, ссылка и код появятся в выводе.' };
+          if (n === 2) return { kind: 'attention', title: 'Шаг 2 из 3. Откройте ссылку и войдите', text: 'Страница попросит код. Шаг 3: ввести на ней код с экрана.' };
+          return { kind: 'attention', title: 'Шаг 3 из 3. Введите код на странице входа', text: 'Код действует 15 минут. Вход завершится сам, когда страница примет код.' };
+        }
         if (!st.link) return { kind: 'info', spin: true, title: 'Шаг 1 из 3. Жду ссылку для входа', text: 'Терминал запущен, ссылка появится в выводе.' };
         if (n === 2) return { kind: 'attention', title: 'Шаг 2 из 3. Откройте ссылку и войдите', text: 'Сайт покажет код. Шаг 3: вставить его в поле «Код из браузера».' };
         return { kind: 'attention', title: 'Шаг 3 из 3. Вставьте код из браузера', text: 'Код действует несколько минут и только один раз.' };
@@ -174,16 +203,40 @@ export async function viewProviderLogin(providerId) {
     sendBtn.disabled = !st.open || !codeInput.value.trim();
     // Вход выполнен или сессия закончилась: ссылка и поле кода уже не нужны. Введённый код остаётся в скрытом поле.
     const finished = ended || st.phase === 'done';
-    $('#cl-form').hidden = finished;
+    $('#cl-form').hidden = finished || screenCode;
     linkCard.hidden = finished || !st.link;
+    if (deviceCard) deviceCard.hidden = finished || !st.code;
     if (keysEl) keysEl.hidden = finished;
     paintSteps();
     paintActions();
+  }
+  function clearLinkTimer() {
+    clearTimeout(linkTimer);
+    linkTimer = null;
+  }
+  // Минута на ссылку (и код устройства у codex) после открытия соединения. Не дождались: сессию закрываем, чтобы не
+  // держать вход на сервере, терминал остаётся на экране для разбора, предлагаем начать заново.
+  function armLinkTimer() {
+    clearLinkTimer();
+    linkTimer = setTimeout(() => {
+      linkTimer = null;
+      if (disposed || st.phase !== 'waiting' || ready()) return;
+      const socket = st.socket;
+      st.socket = null;
+      st.open = false;
+      if (socket) {
+        socket.onmessage = socket.onclose = socket.onerror = socket.onopen = null;
+        try { if (socket.readyState === 1) socket.send(JSON.stringify({ t: 'close' })); socket.close(); } catch { /* уже закрыт */ }
+      }
+      if (st.link) setPhase('failed', { failStep: 1, reason: 'Код для входа не появился', reasonText: 'Ссылка есть, но терминал не показал код за минуту. Сессия на сервере закрыта: начните вход заново.', retryLabel: 'Начать заново' });
+      else setPhase('failed', { failStep: 1, reason: 'Ссылка для входа не появилась', reasonText: 'Терминал не показал ссылку входа за минуту. Сессия на сервере закрыта: начните вход заново.', retryLabel: 'Начать заново' });
+    }, linkTimeoutMs);
   }
   function setPhase(phase, extra = {}) {
     if (disposed) return;
     Object.assign(st, extra);
     st.phase = phase;
+    if (phase !== 'waiting') clearLinkTimer();
     if (phase === 'failed' && !st.failStep) st.failStep = step();
     paint();
     if (phase === 'revoked') api.authMe().catch((err) => { if (err.status === 401) window.dispatchEvent(new CustomEvent('bothub-unauthorized')); });
@@ -206,20 +259,29 @@ export async function viewProviderLogin(providerId) {
     st.socket.send(JSON.stringify({ t: 'resize', cols: st.size.cols, rows: st.size.rows }));
   }
 
-  // ---- вывод: ссылка входа ----
+  // ---- вывод: ссылка входа и код устройства ----
+  // Хвост хранится сырым (с управляющими последовательностями): гиперссылка OSC 8 несёт целый адрес, даже если видимый
+  // текст перенесён по строкам. Ссылка берётся только с хостов этого провайдера.
   function scan(bytes) {
-    tail = (tail + stripAnsi(decoder.decode(bytes, { stream: true }))).slice(-4000);
-    const url = findLoginUrl(tail);
-    if (!url || url === st.link) return;
-    st.link = url;
-    let shown = url;
-    try { const u = new URL(url); shown = `${u.host}${u.pathname}`; } catch { /* оставляем как есть */ }
-    $('#cl-link-text').textContent = shown.length > 56 ? `${shown.slice(0, 55)}…` : shown;
-    const open = $('#cl-open');
-    open.href = url;
+    tail = (tail + decoder.decode(bytes, { stream: true })).slice(-8000);
+    const url = findLoginUrl(tail, (candidate) => isLoginUrlAllowed(cli, candidate));
+    const code = screenCode ? findDeviceCode(tail) : '';
+    if ((!url || url === st.link) && (!code || code === st.code)) return;
+    if (url && url !== st.link) {
+      st.link = url;
+      let shown = url;
+      try { const u = new URL(url); shown = `${u.host}${u.pathname}`; } catch { /* оставляем как есть */ }
+      $('#cl-link-text').textContent = shown.length > 56 ? `${shown.slice(0, 55)}…` : shown;
+      $('#cl-open').href = url;
+    }
+    if (code && code !== st.code) {
+      st.code = code;
+      $('#cl-device-code').textContent = code;
+    }
+    if (ready()) clearLinkTimer();
     paint();
     // На компьютере фокус переходит на главное действие: с клавиатуры это один Enter. В терминал Tab не заходит.
-    if (desktop && !st.linkFocused && !linkCard.hidden) { st.linkFocused = true; open.focus(); }
+    if (desktop && !st.linkFocused && !linkCard.hidden) { st.linkFocused = true; $('#cl-open').focus(); }
   }
 
   // ---- подключение ----
@@ -244,8 +306,10 @@ export async function viewProviderLogin(providerId) {
       try { previous.close(); } catch { /* уже закрыт */ }
     }
     st.open = false;
+    clearLinkTimer();
     st.phase = 'connecting';
     st.link = '';
+    st.code = '';
     st.opened = false;
     st.exitCode = null;
     st.failStep = 0;
@@ -257,8 +321,10 @@ export async function viewProviderLogin(providerId) {
     tail = '';
     resultEl.innerHTML = '';
     linkCard.hidden = true;
+    if (deviceCard) deviceCard.hidden = true;
     if (!keepCode) codeInput.value = '';
     $('#cl-code-note').textContent = 'Страница входа покажет код. Вставьте его сюда.';
+    if (screenCode) $('#cl-device-note').textContent = 'Введите этот код на странице входа. Он действует 15 минут и подходит один раз.';
     setCtrl(false);
     paint();
     let socket;
@@ -271,6 +337,7 @@ export async function viewProviderLogin(providerId) {
       wasOpen = true;
       st.open = true;
       setPhase('waiting');
+      armLinkTimer();
       term.fit();
       sendResize();
     };
@@ -293,8 +360,10 @@ export async function viewProviderLogin(providerId) {
   // После выхода ядро отдельно проверяет подписку и обновляет статус провайдера: ждём новую отметку проверки.
   async function finish() {
     if (st.exitCode !== 0) {
+      // codex: выход с ошибкой после показа кода значит, что код не приняли или он просрочился (15 минут).
+      if (screenCode && st.code) setPhase('failed', { failStep: st.opened ? 3 : 2, reason: 'Код не принят или просрочен', reasonText: 'Код действует 15 минут и подходит один раз. Вход откроется заново, в терминале появится новый код.', retryLabel: 'Получить новый код' });
       // Выход после отправки кода значит, что код не подошёл (просрочен или уже использован).
-      if (st.opened) setPhase('failed', { failStep: 3, reason: 'Код не подошёл', reasonText: 'Код действует несколько минут и только один раз. Получите новый код: вход откроется заново, на странице входа появится свежий код.', retryLabel: 'Получить новый код' });
+      else if (st.opened) setPhase('failed', { failStep: 3, reason: 'Код не подошёл', reasonText: 'Код действует несколько минут и только один раз. Получите новый код: вход откроется заново, на странице входа появится свежий код.', retryLabel: 'Получить новый код' });
       else setPhase('failed', { failStep: step(), reason: 'Вход не завершён', reasonText: 'Вход на сервере завершился с ошибкой. Начните вход заново.', retryLabel: 'Начать заново' });
       return;
     }
@@ -364,8 +433,12 @@ export async function viewProviderLogin(providerId) {
   });
   $('#cl-open').addEventListener('click', () => { if (!st.opened) { st.opened = true; paint(); } });
   $('#cl-copy').addEventListener('click', async () => {
-    const note = $('#cl-code-note');
+    const note = noteEl();
     try { await navigator.clipboard.writeText(st.link); note.textContent = 'Ссылка скопирована.'; } catch { note.textContent = 'Не удалось скопировать ссылку: откройте её кнопкой выше.'; }
+  });
+  $('#cl-device-copy')?.addEventListener('click', async () => {
+    const note = $('#cl-device-note');
+    try { await navigator.clipboard.writeText(st.code); note.textContent = 'Код скопирован.'; } catch { note.textContent = 'Не удалось скопировать код: выделите его на экране вручную.'; }
   });
   const keys = $('.term-keys');
   if (keys) {
@@ -378,7 +451,7 @@ export async function viewProviderLogin(providerId) {
       if (btn.hasAttribute('data-ctrl')) { setCtrl(!st.ctrl); return; }
       if (btn.hasAttribute('data-paste-term')) {
         try { const text = await navigator.clipboard.readText(); if (text) sendInput(text, { raw: true }); } catch {
-          $('#cl-code-note').textContent = 'Не удалось прочитать буфер: вставьте код в поле «Код из браузера».';
+          noteEl().textContent = screenCode ? 'Не удалось прочитать буфер.' : 'Не удалось прочитать буфер: вставьте код в поле «Код из браузера».';
         }
         return;
       }
@@ -433,6 +506,7 @@ export async function viewProviderLogin(providerId) {
 
   c.setCleanup(() => {
     disposed = true;
+    clearLinkTimer();
     document.removeEventListener('visibilitychange', onVisible);
     window.removeEventListener('pageshow', onVisible);
     if (vv) { vv.removeEventListener('resize', onViewport); vv.removeEventListener('scroll', onViewport); }

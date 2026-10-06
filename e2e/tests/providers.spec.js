@@ -4,7 +4,10 @@ import { expect, test } from '@playwright/test';
 // Мок-режим: ?mock=1 (по умолчанию вошёл админ), &role=member, &auth=none, &providers=none|fail|slow,
 // &bots=states (Архив без модели, Кодер не запустился, SRE ждёт перезапуска, Запасной без истории),
 // &login=busy|forbidden|revoked|lost|timeout|start (сбои терминала); window.__loginMock.silentDrop() молча обрывает
-// соединение терминала, как у свёрнутой страницы на телефоне. Ключи-триггеры (проверка до сохранения, §11):
+// соединение терминала, как у свёрнутой страницы на телефоне. &login=silent|nocode|foreign|mixed с &login_timeout=<мс>:
+// терминал молчит, codex без кода, ссылка на чужой хост, чужая ссылка после настоящей; срок ожидания ссылки сокращён с
+// 60 с. Вывод мока повторяет фрагменты настоящих CLI (цвета, гиперссылка OSC 8 с адресом, перенесённым по строкам, код
+// устройства codex); у codex вход завершает window.__loginMock.approve() или expire(). Ключи-триггеры (проверка до сохранения, §11):
 // «bad» даёт 422 key_rejected, «offline» unreachable, «weird» incompatible, «limit» 429 rate_limited.
 // Адреса-триггеры: «down» не отвечает, «notapi» не OpenAI-совместимый, 192.168.* и *.lan уходят админу (pending_admin),
 // localhost и 127.* всегда запрещены. Подробные сценарии проверки ключа и запросов админу: provider-verify.spec.js.
@@ -562,7 +565,8 @@ test.describe('удаление', () => {
 });
 
 test.describe('терминал входа по подписке', () => {
-  const login = (id = 'p-codex') => `/?mock=1#/settings/providers/${id}/login`;
+  // По умолчанию claude: сценарий «код с сайта» (поле «Код из браузера»). Сценарий codex «код с экрана» задаётся явно.
+  const login = (id = 'p-claude', query = '') => `/?mock=1${query}#/settings/providers/${id}/login`;
   const term = (page) => page.locator('#cl-term');
   const status = (page) => page.locator('#cl-status');
   const closeLink = (page, testInfo) => (isMobile(testInfo)
@@ -574,37 +578,200 @@ test.describe('терминал входа по подписке', () => {
     await page.getByRole('button', { name: 'Отправить' }).click();
   }
 
-  test('вход выполнен: шаги, ссылка и кнопка, код из браузера, результат и обновлённый статус', async ({ page }, testInfo) => {
+  // Адрес входа claude приходит гиперссылкой OSC 8 и разрезан по кадрам, а видимый текст перенесён по строкам терминала:
+  // целый адрес (с state=mock-state в конце) можно получить только из OSC 8.
+  const CLAUDE_LINK = /^https:\/\/claude\.com\/cai\/oauth\/authorize\?code=true&client_id=[\w-]+&response_type=code&.*&code_challenge_method=S256&state=mock-state$/;
+
+  test('claude, код с сайта: целый адрес из OSC 8, код из браузера уходит в терминал, результат', async ({ page }, testInfo) => {
     const logs = [];
     page.on('console', (message) => logs.push(message.text()));
-    await page.goto(login());
-    await expect(page.getByRole('heading', { name: 'Вход: Codex' })).toBeVisible();
+    await page.goto(login('p-claude'));
+    await expect(page.getByRole('heading', { name: 'Вход: Claude Code' })).toBeVisible();
     await expect(status(page)).toContainText('Шаг 2 из 3. Откройте ссылку и войдите');
     await expect(term(page)).toHaveAttribute('role', 'log');
     await expect(term(page)).toHaveAttribute('aria-label', 'Терминал входа');
-    await expect(term(page)).toContainText('$ codex login');
+    await expect(term(page)).toContainText('Opening browser to sign in');
     // ссылка из вывода дублируется обычной кнопкой: новая вкладка, без передачи opener
     const open = page.getByRole('link', { name: 'Открыть страницу входа' });
-    await expect(open).toHaveAttribute('href', /^https:\/\/auth\.openai\.com\/oauth\/authorize\?/);
+    await expect(open).toHaveAttribute('href', CLAUDE_LINK);
     await expect(open).toHaveAttribute('target', '_blank');
     await expect(open).toHaveAttribute('rel', /noopener/);
     if (!isMobile(testInfo)) await expect(page.getByRole('list').filter({ hasText: 'Запуск входа на сервере' }).getByRole('listitem').nth(1)).toHaveAttribute('aria-label', 'Шаг 2: идёт');
+    // в этом сценарии код вводят в поле на странице, карточки кода устройства нет
+    await expect(page.locator('#cl-device-card')).toHaveCount(0);
+    await expect(page.getByLabel('Код из браузера')).toBeVisible();
     // поле кода: код и Enter уходят в терминал, эхо замаскировано
     await sendCode(page, 'ok');
     await expect(term(page)).toContainText('Login successful.');
     await expect(status(page)).toContainText('Вход выполнен');
     await expect(status(page)).toBeFocused(); // фокус на итоге, а не на скрытом поле кода
-    await expect(page.locator('#cl-result')).toContainText('Найдено моделей: 1.');
-    await expect(page.locator('#cl-result')).toContainText('Ботов с этим провайдером пока нет.');
+    await expect(page.locator('#cl-result')).toContainText('Перезапущены бот: Мак.', { timeout: 8000 });
     await expect(page.getByLabel('Код из браузера')).toHaveValue('');
-    await expect(page.getByRole('link', { name: 'Выбрать модели' })).toHaveAttribute('href', '#/settings/providers/p-codex');
+    await expect(page.getByRole('link', { name: 'Выбрать модели' })).toHaveAttribute('href', '#/settings/providers/p-claude');
     // вывод терминала нигде не сохранён: ни в памяти браузера, ни в консоли
     expect(await page.evaluate(() => JSON.stringify([{ ...localStorage }, { ...sessionStorage }]))).not.toMatch(/oauth|Login successful/);
-    expect(logs.join('\n')).not.toMatch(/oauth|Login successful|codex login/);
+    expect(logs.join('\n')).not.toMatch(/oauth|Login successful|Opening browser/);
+  });
+
+  test('agy, код с сайта: ссылка accounts.google.com из OSC 8 целиком, поле «Код из браузера»', async ({ page }) => {
+    await page.goto(login('p-agy'));
+    await expect(page.getByRole('heading', { name: 'Вход: Antigravity' })).toBeVisible();
+    await expect(status(page)).toContainText('Шаг 2 из 3. Откройте ссылку и войдите');
+    await expect(page.getByRole('link', { name: 'Открыть страницу входа' })).toHaveAttribute('href', /^https:\/\/accounts\.google\.com\/o\/oauth2\/auth\?client_id=mock-agy\.apps\.googleusercontent\.com&.*&state=mock-state$/);
+    await expect(page.locator('#cl-device-card')).toHaveCount(0);
+    await sendCode(page, 'ok');
+    await expect(status(page)).toContainText('Вход выполнен');
+  });
+
+  test('codex, код с экрана: ссылка и код устройства отдельно, поля кода нет, вход завершается сам', async ({ page, context }, testInfo) => {
+    await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+    const logs = [];
+    page.on('console', (message) => logs.push(message.text()));
+    await page.goto(login('p-codex'));
+    await expect(page.getByRole('heading', { name: 'Вход: Codex' })).toBeVisible();
+    await expect(status(page)).toContainText('Шаг 2 из 3. Откройте ссылку и войдите');
+    await expect(status(page)).toContainText('Шаг 3: ввести на ней код с экрана.');
+    await expect(term(page)).toContainText('Enter this one-time code');
+    const open = page.getByRole('link', { name: 'Открыть страницу входа' });
+    await expect(open).toHaveAttribute('href', 'https://auth.openai.com/codex/device');
+    await expect(open).toHaveAttribute('rel', /noopener/);
+    // код пришёл двумя кадрами («ABCD-12» и «345»): показан только целый
+    await expect(page.locator('#cl-device-card')).toBeVisible();
+    await expect(page.locator('#cl-device-code')).toHaveText('ABCD-12345');
+    // поля «Код из браузера» в этом сценарии нет: код вводят на сайте
+    await expect(page.locator('#cl-form')).toBeHidden();
+    await expect(page.getByLabel('Код из браузера')).toBeHidden();
+    // переход по ссылке (в новую вкладку не уходим) открывает шаг 3
+    await open.evaluate((el) => el.addEventListener('click', (e) => e.preventDefault()));
+    await open.click();
+    await expect(status(page)).toContainText('Шаг 3 из 3. Введите код на странице входа');
+    await expect(status(page)).toContainText('Вход завершится сам');
+    if (!isMobile(testInfo)) await expect(page.getByRole('list').filter({ hasText: 'Запуск входа на сервере' }).getByRole('listitem').nth(2)).toHaveAttribute('aria-label', 'Шаг 3: идёт');
+    // копирование кода
+    await page.getByRole('button', { name: 'Скопировать код' }).click();
+    await expect(page.locator('#cl-device-note')).toContainText('Код скопирован.');
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('ABCD-12345');
+    // сайт принял код: CLI завершился сам, проверка подписки и результат
+    await page.evaluate(() => window.__loginMock.approve());
+    await expect(term(page)).toContainText('Successfully logged in');
+    await expect(status(page)).toContainText('Вход выполнен');
+    await expect(status(page)).toBeFocused();
+    await expect(page.locator('#cl-device-card')).toBeHidden(); // код отработал, на экране его не оставляем
+    await expect(page.locator('#cl-result')).toContainText('Найдено моделей: 1.');
+    await expect(page.locator('#cl-result')).toContainText('Ботов с этим провайдером пока нет.');
+    await expect(page.getByRole('link', { name: 'Выбрать модели' })).toHaveAttribute('href', '#/settings/providers/p-codex');
+    // вывод терминала и код устройства нигде не сохранены: ни в памяти браузера, ни в консоли
+    expect(await page.evaluate(() => JSON.stringify([{ ...localStorage }, { ...sessionStorage }]))).not.toMatch(/ABCD-12345|device|Successfully/);
+    expect(logs.join('\n')).not.toMatch(/ABCD-12345|one-time code|Successfully logged in/);
     // статус провайдера обновился
     await page.goto('/?mock=1#/settings/providers');
     await expect(row(page, 'Codex')).toContainText('Вход выполнен');
     await expect(row(page, 'Codex')).toContainText('Подписка · 1 модель');
+  });
+
+  test('codex: код просрочен или не принят, главное действие «Получить новый код», старый код скрыт', async ({ page }) => {
+    await page.goto(login('p-codex'));
+    await expect(page.locator('#cl-device-code')).toHaveText('ABCD-12345');
+    await page.evaluate(() => window.__loginMock.expire());
+    await expect(term(page)).toContainText('device auth timed out');
+    const alert = page.getByRole('alert').filter({ hasText: 'Код не принят или просрочен' });
+    await expect(alert).toBeVisible();
+    await expect(page.locator('#cl-device-card')).toBeHidden();
+    await expect(page.locator('#cl-link-card')).toBeHidden();
+    await expect(page.locator('#cl-actions .btn-primary')).toHaveCount(1);
+    await page.getByRole('button', { name: 'Получить новый код' }).click();
+    await expect(status(page)).toContainText('Шаг 2 из 3. Откройте ссылку и войдите', { timeout: 8000 });
+    await expect(page.locator('#cl-device-code')).toHaveText('ABCD-12345');
+  });
+
+  // Срок ожидания ссылки 60 с, в моке сокращён до 4 с (&login_timeout=4000): вывод мока начинается через 2,5 с.
+  test('терминал молчит: за отведённое время ссылки нет, сессия закрывается, предлагается начать заново', async ({ page }) => {
+    await page.goto(login('p-claude', '&login=silent&login_timeout=4000'));
+    await expect(status(page)).toContainText('Шаг 1 из 3. Жду ссылку для входа');
+    const alert = page.getByRole('alert').filter({ hasText: 'Ссылка для входа не появилась' });
+    await expect(alert).toBeVisible({ timeout: 10000 });
+    await expect(alert).toContainText('Сессия на сервере закрыта');
+    await expect(page.locator('#cl-link-card')).toBeHidden();
+    await expect(page.locator('#cl-form')).toBeHidden();
+    await expect(page.locator('#cl-actions .btn-primary')).toHaveCount(1);
+    await expect(page.locator('#cl-actions .btn-primary')).toContainText('Начать заново');
+    // сессия на сервере закрыта кадром close
+    expect(await page.evaluate(() => window.__loginMock.frames.some((f) => f.t === 'close'))).toBe(true);
+    // заново: сокет открывается снова и снова ждёт ссылку
+    await page.getByRole('button', { name: 'Начать заново' }).click();
+    await expect(status(page)).toContainText('Шаг 1 из 3');
+  });
+
+  test('codex: ссылка есть, а кода нет: тот же срок, сообщение про код', async ({ page }) => {
+    await page.goto(login('p-codex', '&login=nocode&login_timeout=4000'));
+    await expect(page.getByRole('link', { name: 'Открыть страницу входа' })).toHaveAttribute('href', 'https://auth.openai.com/codex/device');
+    await expect(status(page)).toContainText('Шаг 1 из 3. Жду ссылку и код для входа'); // без кода шаг 2 не наступает
+    await expect(page.locator('#cl-device-card')).toBeHidden();
+    await expect(page.getByRole('alert').filter({ hasText: 'Код для входа не появился' })).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('#cl-link-card')).toBeHidden();
+  });
+
+  test('ссылка на чужой хост не становится кнопкой: ни в OSC 8, ни простым текстом', async ({ page }) => {
+    await page.goto(login('p-claude', '&login=foreign&login_timeout=4000'));
+    await expect(term(page)).toContainText('evil.example');
+    await expect(page.locator('#cl-link-card')).toBeHidden();
+    await expect(page.getByRole('link', { name: 'Открыть страницу входа' })).toBeHidden();
+    await expect(status(page)).toContainText('Шаг 1 из 3. Жду ссылку для входа');
+    await expect(page.getByRole('alert').filter({ hasText: 'Ссылка для входа не появилась' })).toBeVisible({ timeout: 10000 });
+  });
+
+  test('codex: чужая ссылка и настоящий код, шага 2 нет', async ({ page }) => {
+    await page.goto(login('p-codex', '&login=foreign&login_timeout=4000'));
+    await expect(term(page)).toContainText('evil.example');
+    await expect(page.locator('#cl-link-card')).toBeHidden();
+    await expect(status(page)).toContainText('Шаг 1 из 3');
+    await expect(page.getByRole('alert').filter({ hasText: 'Ссылка для входа не появилась' })).toBeVisible({ timeout: 10000 });
+  });
+
+  test('чужая ссылка после настоящей пропускается: кнопка остаётся на хосте провайдера', async ({ page }) => {
+    await page.goto(login('p-claude', '&login=mixed'));
+    await expect(status(page)).toContainText('Шаг 2 из 3. Откройте ссылку и войдите');
+    await expect(term(page)).toContainText('evil.example');
+    await expect(page.getByRole('link', { name: 'Открыть страницу входа' })).toHaveAttribute('href', CLAUDE_LINK);
+  });
+
+  test('разбор вывода в браузере: OSC 8, код устройства, список хостов', async ({ page }) => {
+    await page.goto('/?mock=1#/');
+    const result = await page.evaluate(async () => {
+      const m = await import('/terminal.js');
+      const url = 'https://claude.com/cai/oauth/authorize?code=true&client_id=x&state=abc';
+      const link = `\x1b]8;;${url}\x1b\\https://claude.com/cai/oauth/auth\r\norize?code=true&client_id=x&state=abc\x1b]8;;\x1b\\\r\n`;
+      const codex = '2. Enter this one-time code \x1b[90m(expires in 15 minutes)\x1b[0m\r\n   \x1b[94mABCD-12345\x1b[0m\r\n';
+      return {
+        osc: m.findLoginUrl(link) === url,
+        partial: m.findLoginUrl(link.slice(0, 40)) === '',
+        plain: m.findLoginUrl('   \x1b[94mhttps://auth.openai.com/codex/device\x1b[0m\r\n'),
+        code: m.findDeviceCode(codex),
+        codePartial: m.findDeviceCode(codex.slice(0, codex.indexOf('ABCD-12') + 8)),
+        hosts: [m.isLoginUrlAllowed('claude', url), m.isLoginUrlAllowed('claude', 'https://evil.example/'), m.isLoginUrlAllowed('claude', 'https://claude.ai.evil.example/'), m.isLoginUrlAllowed('codex', url)],
+        filtered: m.findLoginUrl('https://claude.ai/ok \r\nhttps://evil.example/x \r\n', (u) => m.isLoginUrlAllowed('claude', u)),
+      };
+    });
+    expect(result).toEqual({
+      osc: true, partial: true, plain: 'https://auth.openai.com/codex/device', code: 'ABCD-12345', codePartial: '',
+      hosts: [true, false, false, false], filtered: 'https://claude.ai/ok',
+    });
+  });
+
+  test('английский интерфейс: оба сценария переведены, шаги и карточка кода устройства', async ({ page }) => {
+    await page.addInitScript(() => { try { localStorage.setItem('bothub.lang', 'en'); } catch { /* приватный режим */ } });
+    await page.goto(login('p-claude'));
+    await expect(status(page)).toContainText('Step 2 of 3. Open the link and sign in');
+    await expect(page.getByLabel('Code from the browser')).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Open sign-in page' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Sign-in: Claude Code' })).toBeVisible();
+    await page.goto(login('p-codex'));
+    await expect(status(page)).toContainText('Step 2 of 3. Open the link and sign in');
+    await expect(page.locator('#cl-device-card')).toContainText('Code for the sign-in page');
+    await expect(page.locator('#cl-device-card')).toContainText('Enter this code on the sign-in page');
+    await expect(page.getByRole('button', { name: 'Copy code' })).toBeVisible();
+    await expect(page.locator('#cl-device-code')).toHaveText('ABCD-12345'); // сам код не переводится
+    expect(await page.locator('#app').innerText()).not.toMatch(/Введите|Скопировать|Откройте ссылку/);
   });
 
   test('после входа видно, какие боты перезапущены и какие перезапустятся позже', async ({ page }) => {
@@ -941,7 +1108,8 @@ test.describe('словарь: без жаргона в экранах пров�
 });
 
 test.describe('терминал входа: ошибки, обрыв, клавиатура, телефон', () => {
-  const login = (query = '') => `/?mock=1${query}#/settings/providers/p-codex/login`;
+  // claude: сценарий «код с сайта», поле «Код из браузера» есть (сценарий codex проверяется выше)
+  const login = (query = '') => `/?mock=1${query}#/settings/providers/p-claude/login`;
   const status = (page) => page.locator('#cl-status');
   const term = (page) => page.locator('#cl-term');
 

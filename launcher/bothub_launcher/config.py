@@ -22,7 +22,7 @@ DEFAULT_BLOCKED_V6 = ("::1/128", "fc00::/7", "fe80::/10", "ff00::/8")
 
 DEFAULT_LOGIN_COMMANDS = {
     "shell": ("bash", "-l"),
-    "claude": ("claude",),
+    "claude": ("claude", "auth", "login"),
     "codex": ("codex", "login", "--device-auth"),
     "agy": ("agy",),
     "claude_status": ("claude", "auth", "status"),

@@ -33,7 +33,7 @@ Isolation model, guarantees, and limitations: `docs/isolation.md`.
    Before installing on a Linux Docker host, run `./preflight.sh`. On Colima, run the check inside the Linux VM from a checkout with Docker daemon access. The script checks `br_netfilter`, `DOCKER-USER`, iptables backend, IPv6 default bridge, and the Docker version (below 28: a warning, the exit code does not change). On error it prints a remediation command and exits with code 1.
    If your setup uses internal DNS, configure its real IP in `launcher.toml` via `internal_dns`.
    `127.0.0.11` is not suitable here: that address is already used by Docker internal DNS inside the container.
-5. **Nginx**: the service runs on the path `https://bots.example.com/bots/` behind an SSO proxy.
+5. **Nginx**: the service runs on the path `https://bots.example.com/bots/` behind an SSO proxy. Another prefix needs the same value in `BOTHUB_BASE_PATH` (`.env`): the session cookie is issued for that path, otherwise login succeeds and every next request gets 401.
    ```bash
    sudo cp nginx/bothub-locations.conf /etc/nginx/snippets/
    # Add: proxy_set_header X-Bothub-Proxy <BOTHUB_PROXY_SECRET>;
@@ -67,12 +67,14 @@ Isolation model, guarantees, and limitations: `docs/isolation.md`.
 
 The image is built by `./build-bot-image.sh` or `docker compose --profile build build bot-image`. CLI versions are pinned by build arguments `CLAUDE_CODE_VERSION`, `CODEX_VERSION`, and `PLAYWRIGHT_MCP_VERSION` in `bot-image/Dockerfile`.
 
-Antigravity CLI (`agy`) is installed as an optional layer and only with checksum verification. It was previously fetched via `curl | bash`; now a direct binary URL and SHA-256 are required, both set in `deploy/.env`:
+Antigravity CLI (`agy`) is installed as an optional layer and only with checksum verification. It was previously fetched via `curl | bash`; now a direct URL and SHA-256 are required, both set in `deploy/.env`:
 
 ```bash
-curl -fsSL -o /tmp/agy "<direct URL to agy binary>"
+curl -fsSL -o /tmp/agy "<direct URL to the agy binary or archive>"
 sha256sum /tmp/agy                  # verify checksum from vendor, then write to AGY_SHA256
 ```
+
+`AGY_URL` may point to a binary or to a `.tar.gz`/`.tgz` archive (the extension is taken from the URL path; query and `#` are ignored). For an archive, the checksum is computed over the downloaded archive itself, not the binary inside it. The build unpacks the archive and installs the first regular file named `agy` or `antigravity` (at any depth) as `/usr/local/bin/agy`; if there is no such file, the build fails. If the archive contains both names, the one `find` lists first is used and the order is not guaranteed, so the archive should hold only one of them.
 
 Without `AGY_URL` and `AGY_SHA256`, the layer is skipped, the image builds, and the `gemini` runner remains unavailable.
 

@@ -144,7 +144,7 @@ docker compose --profile build build bot-image
 ### Optional: Antigravity CLI (`agy`) for Gemini Runner
 
 To enable the `agy` CLI layer in the bot image:
-1. Obtain the direct binary URL and calculate its SHA-256:
+1. Obtain the direct URL of the binary or of a `.tar.gz`/`.tgz` archive and calculate the SHA-256 of the downloaded file (for an archive, the archive itself):
    ```bash
    curl -fsSL -o /tmp/agy "<direct_download_url>"
    sha256sum /tmp/agy
@@ -159,6 +159,7 @@ If these variables are omitted, the image builds without `agy` and the `gemini` 
 ## 6. Reverse Proxy Setup (Nginx)
 
 Botstead serves the core API and static PWA through Nginx.
+The snippet mounts the app under `/bots/`. For another prefix, change the paths in the snippet and set the same prefix in `BOTHUB_BASE_PATH` in `.env` (the session cookie path), otherwise login succeeds and every next request gets 401.
 
 1. Copy the Nginx location configuration snippet:
    ```bash

@@ -22,6 +22,15 @@ def test_defaults_match_the_spec():
     assert cfg.max_screen_sessions == 32 and cfg.screen_idle == 900 and cfg.screen_connect_timeout == 5
 
 
+def test_default_login_commands():
+    # claude входит командой `claude auth login` (без неё CLI открывает интерактивный сеанс), codex по коду с экрана
+    cmds = load_config(None, ENV).login_commands
+    assert cmds["claude"] == ("claude", "auth", "login")
+    assert cmds["codex"] == ("codex", "login", "--device-auth")
+    assert cmds["agy"] == ("agy",)
+    assert cmds["claude_status"] == ("claude", "auth", "status")
+
+
 def test_screen_session_limits_must_be_positive():
     with pytest.raises(ConfigError):
         Config(secret="x" * 40, max_screen_sessions=0)

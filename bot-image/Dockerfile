@@ -83,6 +83,9 @@ RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} @openai/code
 
 # Antigravity CLI (agy): необязательный слой. Скачивается только при заданных AGY_URL и AGY_SHA256,
 # сумма проверяется до установки. Без обоих аргументов слой пропускается (раннер gemini тогда недоступен).
+# AGY_URL ведёт либо на сам бинарник, либо на архив .tar.gz/.tgz (расширение берётся из пути, без query):
+# сумма в обоих случаях считается от скачанного файла, из архива ставится первый обычный файл с именем agy или
+# antigravity (под именем /usr/local/bin/agy).
 # Как получить сумму: deploy/README.md, раздел "Образ бота".
 ARG AGY_URL=""
 ARG AGY_SHA256=""
@@ -90,8 +93,19 @@ RUN if [ -n "$AGY_URL" ] || [ -n "$AGY_SHA256" ]; then \
         if [ -z "$AGY_URL" ] || [ -z "$AGY_SHA256" ]; then echo "AGY_URL and AGY_SHA256 must be set together" >&2; exit 1; fi; \
         curl -fsSL --proto '=https' --tlsv1.2 -o /tmp/agy "$AGY_URL" \
         && echo "${AGY_SHA256}  /tmp/agy" | sha256sum -c - \
-        && install -m 0755 /tmp/agy /usr/local/bin/agy \
-        && rm -f /tmp/agy; \
+        || exit 1; \
+        case "${AGY_URL%%[?#]*}" in \
+            *.tar.gz|*.tgz) \
+                mkdir /tmp/agy-unpack \
+                && tar -xzf /tmp/agy -C /tmp/agy-unpack --no-same-owner \
+                && bin="$(find /tmp/agy-unpack -type f \( -name agy -o -name antigravity \) | head -n 1)" \
+                && if [ -z "$bin" ]; then echo "no file named agy or antigravity in the AGY_URL archive" >&2; exit 1; fi \
+                && install -m 0755 "$bin" /usr/local/bin/agy \
+                && rm -rf /tmp/agy /tmp/agy-unpack ;; \
+            *) \
+                install -m 0755 /tmp/agy /usr/local/bin/agy \
+                && rm -f /tmp/agy ;; \
+        esac; \
     else \
         echo "agy skipped: AGY_URL and AGY_SHA256 are empty"; \
     fi
