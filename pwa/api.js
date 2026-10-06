@@ -1431,15 +1431,15 @@ export async function listBots() {
 // Вход, инвайты, пользователи, сессии (docs/contracts.md §10)
 // ---------------------------------------------------------------------------
 
-// Первый запуск: пользователей ещё нет. Прямого признака в API нет, поэтому шлём пустой POST /setup без кода.
-// Ядро сначала проверяет наличие пользователей: 409 значит «настроено», 401 `unauthorized` значит «нужна настройка».
+// Первый запуск: пользователей ещё нет. Признак отдаёт GET /api/setup/status (docs/contracts.md §10); пустой POST /setup
+// для этого не годится: ядро отвечает 400 на тело раньше проверки пользователей, и вход показывался вместо настройки.
 export async function needsSetup() {
   if (MOCK) return !mockSetupDone;
   try {
-    const res = await fetch('api/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}', credentials: 'same-origin' });
-    if (res.status !== 401) return false;
+    const res = await fetch('api/setup/status', { credentials: 'same-origin' });
+    if (!res.ok) return false;
     const body = await res.json().catch(() => null);
-    return !!body && body.error === 'unauthorized';
+    return !!body && body.needs_setup === true;
   } catch { return false; }
 }
 export async function setup(email, password, setupCode = '') {
