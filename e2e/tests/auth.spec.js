@@ -52,8 +52,9 @@ test.describe('вход', () => {
   test('ошибка сервера: сообщение и кнопка «Повторить»', async ({ page }) => {
     await openLogin(page);
     await fillLogin(page, ADMIN, 'server-down');
-    await expect(page.locator('#login-alert')).toContainText('Сервер не отвечает');
-    await expect(page.locator('#login-alert')).toContainText('Попробуйте ещё раз через минуту');
+    await expect(page.locator('#login-alert')).toContainText('Ошибка сервера');
+    await expect(page.locator('#login-alert')).toContainText('Подробности в логе ядра');
+    await expect(page.locator('#login-alert')).not.toContainText('Сервер не отвечает');
     await expect(page.locator('#login-alert')).not.toContainText('500');
     await expect(page.locator('#login-alert [role="alert"]')).toBeFocused();
     await expect(page.getByRole('button', { name: 'Повторить' })).toBeVisible();

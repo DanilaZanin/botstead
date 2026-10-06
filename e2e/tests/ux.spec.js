@@ -285,8 +285,9 @@ test.describe('9. вход: ошибки и фокус', () => {
     await page.getByLabel('Пароль', { exact: true }).fill('server-down');
     await page.getByRole('button', { name: 'Войти', exact: true }).click();
     const message = page.locator('#login-alert [role="alert"]');
-    await expect(message).toContainText('Сервер не отвечает');
-    await expect(message).toContainText('Попробуйте ещё раз через минуту');
+    await expect(message).toContainText('Ошибка сервера');
+    await expect(message).toContainText('Подробности в логе ядра (docker compose logs core)');
+    await expect(message).not.toContainText('Сервер не отвечает');
     await expect(page.locator('#login-alert')).not.toContainText(/Ответ|500/);
     await expect(message).toBeFocused();
   });
@@ -298,7 +299,8 @@ test.describe('9. вход: ошибки и фокус', () => {
     await page.getByLabel('Новый пароль ещё раз', { exact: true }).fill('new-password-456');
     await page.getByRole('button', { name: 'Сменить пароль' }).click();
     const message = page.locator('#pw-alert [role="alert"]');
-    await expect(message).toContainText('Сервер не отвечает');
+    await expect(message).toContainText('Ошибка сервера');
+    await expect(message).toContainText('Подробности в логе ядра');
     await expect(message).not.toContainText(/Ответ|500/);
     await expect(message).toBeFocused();
     await expect(message).toHaveAttribute('tabindex', '-1');
@@ -308,6 +310,35 @@ test.describe('9. вход: ошибки и фокус', () => {
     await expect(message).toContainText('Слишком много попыток');
     await expect(message).toBeFocused();
   });
+});
+
+test.describe('9a. ошибки сети и сервера не смешаны', () => {
+  test('failure(): сеть, шлюз (502–504) и остальные 5xx называются по-разному', async ({ page }) => {
+    await page.goto('/?mock=1');
+    const result = await page.evaluate(async () => {
+      const { failure, isServerFault } = await import('/account.js');
+      const err = (status) => Object.assign(new Error('x'), { status });
+      return {
+        network: failure(new TypeError('Failed to fetch'), 'Не сохранено. '),
+        b500: failure(err(500), 'Не сохранено. '),
+        b501: failure(err(501)),
+        b502: failure(err(502)),
+        b503: failure(err(503)),
+        b504: failure(err(504)),
+        b418: failure(err(418)),
+        faults: [500, 501, 502, 503, 504, 404, undefined].map((s) => isServerFault(s === undefined ? new TypeError('x') : err(s))),
+      };
+    });
+    expect(result.network).toEqual({ title: 'Сервер не отвечает', text: 'Не сохранено. Проверьте сеть или VPN.' });
+    expect(result.b500).toEqual({ title: 'Ошибка сервера', text: 'Не сохранено. Подробности в логе ядра (docker compose logs core).' });
+    expect(result.b501.title).toBe('Ошибка сервера');
+    for (const gateway of [result.b502, result.b503, result.b504]) {
+      expect(gateway).toEqual({ title: 'Сервер не отвечает', text: 'Попробуйте ещё раз через минуту.' });
+    }
+    expect(result.b418.title).toBe('Сервер не отвечает');
+    expect(result.faults).toEqual([true, true, false, false, false, false, false]);
+  });
+
 });
 
 test.describe('10. безличные формулировки', () => {
@@ -466,5 +497,38 @@ test.describe('лист выбора модели: «Готово» на вид�
     if (isMobile(testInfo)) await expect(page.getByRole('dialog', { name: 'Модель бота' })).toContainText('идёт задача');
     await page.locator('[role="radio"][data-provider="p-claude"]').filter({ hasText: 'Sonnet 5' }).click();
     await expect(page.getByRole('alert').filter({ hasText: 'Сейчас идёт задача' })).toContainText('Модель можно сменить, когда бот закончит работу');
+  });
+});
+
+test.describe('вход по подписке: проверка при открытии экрана', () => {
+  test('вход выполнен: на телефоне нет терминала и клавиш, кнопки не меньше 44 px и видны, «Войти заново» открывает терминал', async ({ page }, testInfo) => {
+    await page.goto('/?mock=1#/settings/providers/p-claude/login');
+    const status = page.locator('#cl-status');
+    await expect(status).toContainText('Вход уже выполнен');
+    await expect(page.locator('#cl-term-wrap')).toBeHidden();
+    await expect(page.locator('.term-keys')).toBeHidden();
+    const done = page.getByRole('link', { name: 'Закрыть', exact: true });
+    const again = page.getByRole('button', { name: 'Войти заново' });
+    for (const control of [done, again]) {
+      await expect(control).toBeVisible();
+      const box = await control.boundingBox();
+      expect(box.height).toBeGreaterThanOrEqual(44 - 0.5);
+      expect(box.y + box.height).toBeLessThanOrEqual(page.viewportSize().height);
+    }
+    if (!isMobile(testInfo)) await expect(page.locator('#cl-steps')).toBeHidden();
+    await again.click();
+    await expect(page.locator('#cl-term-wrap')).toBeVisible();
+    if (isMobile(testInfo)) await expect(page.locator('.term-keys')).toBeVisible();
+    else await expect(page.locator('#cl-steps')).toBeVisible();
+    await expect(status).toContainText('Шаг 2 из 3. Откройте ссылку и войдите', { timeout: 8000 });
+  });
+
+  test('по-английски: подписи проверки входа переведены', async ({ page }) => {
+    await page.addInitScript(() => { try { localStorage.setItem('bothub.lang', 'en'); } catch { /* без хранилища */ } });
+    await page.goto('/?mock=1#/settings/providers/p-claude/login');
+    await expect(page.locator('#cl-status')).toContainText('Already signed in');
+    await expect(page.getByRole('button', { name: 'Log in again' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Close', exact: true })).toBeVisible();
+    await expect(page.locator('#cl-idle')).toContainText('The terminal opens if you need to sign in again.');
   });
 });

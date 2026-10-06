@@ -20,3 +20,4 @@ build/
 uv.lock.bak
 .ai/wt/
 .jevrouter/
+pwa/vendor/novnc/.backup-*/

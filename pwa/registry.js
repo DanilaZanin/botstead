@@ -58,17 +58,20 @@ export function providerProblem(p) {
     return { code: 'login', short: 'Нужен вход', title: 'Нужен вход', text: 'Войдите в аккаунт подписки: кнопка «Войти».' };
   }
   const compat = p.kind === 'openai_compatible';
-  if (/non-public|HTTP requires|HTTP is allowed|origin without|invalid provider|resolves to/i.test(e)) {
+  if (/invalid provider path/i.test(e)) {
+    return { code: 'path', short: 'Путь в адресе не принят', title: 'Путь в адресе не принят', text: 'В пути после хоста нельзя «..», пустые части («//»), «%», «;» и пробелы. Проверьте написание.' };
+  }
+  if (/non-public|HTTP requires|HTTP is allowed|http\(s\):\/\/host|origin without|invalid provider|resolves to/i.test(e)) {
     return { code: 'private', short: 'Адрес закрыт', title: 'Адрес закрыт', text: 'Серверу нельзя ходить на этот адрес: он в локальной сети или не проходит проверку. Исключения задаёт администратор сервера.' };
   }
   if (/did not resolve/i.test(e)) return { code: 'down', short: 'Адрес не найден', title: 'Адрес не найден', text: 'Имя хоста не разрешается в адрес. Проверьте написание.' };
   if (/provider check failed/i.test(e)) {
-    if (compat) return { code: 'key', short: 'Адрес вернул ошибку', title: 'Адрес вернул ошибку', text: 'Ключ не принят, либо путь не тот: обычно адрес заканчивается на /v1.' };
+    if (compat) return { code: 'key', short: 'Адрес вернул ошибку', title: 'Адрес вернул ошибку', text: 'Ключ не принят, либо путь не тот: /v1 на конце можно не писать, а путь сервера (например /api) нужен целиком.' };
     const vendor = VENDORS.find((v) => v.kind === p.kind);
     return { code: 'key', short: 'Ключ отклонён', title: 'Ключ отклонён', text: `Провайдер не принял ключ.${vendor ? ` Новый ключ создаётся на ${vendor.keyHint}.` : ''}` };
   }
   if (/no models|expecting|json|decode|too large/i.test(e)) {
-    return { code: 'bad', short: compat ? 'Не совместим с OpenAI' : 'Нет списка моделей', title: compat ? 'Адрес не совместим с OpenAI' : 'Провайдер не вернул модели', text: 'Адрес ответил, но списка моделей в нужном формате не отдал. Обычно адрес заканчивается на /v1.' };
+    return { code: 'bad', short: compat ? 'Не совместим с OpenAI' : 'Нет списка моделей', title: compat ? 'Адрес не совместим с OpenAI' : 'Провайдер не вернул модели', text: 'Адрес ответил, но списка моделей в нужном формате не отдал. /v1 на конце можно не писать, а путь сервера (например /api) нужен целиком.' };
   }
   return { code: 'down', short: e ? 'Не отвечает' : 'Проверка не прошла', title: e ? 'Адрес не отвечает' : 'Проверка не прошла', text: 'Сервер моделей должен быть запущен и доступен с сервера botstead, а не только с этого устройства.' };
 }

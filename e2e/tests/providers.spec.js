@@ -566,7 +566,8 @@ test.describe('удаление', () => {
 
 test.describe('терминал входа по подписке', () => {
   // По умолчанию claude: сценарий «код с сайта» (поле «Код из браузера»). Сценарий codex «код с экрана» задаётся явно.
-  const login = (id = 'p-claude', query = '') => `/?mock=1${query}#/settings/providers/${id}/login`;
+  // &cli_auth=out: подписки не залогинены, иначе проверка входа при открытии экрана сразу показывает «Вход уже выполнен».
+  const login = (id = 'p-claude', query = '') => `/?mock=1&cli_auth=out${query}#/settings/providers/${id}/login`;
   const term = (page) => page.locator('#cl-term');
   const status = (page) => page.locator('#cl-status');
   const closeLink = (page, testInfo) => (isMobile(testInfo)
@@ -590,7 +591,7 @@ test.describe('терминал входа по подписке', () => {
     await expect(status(page)).toContainText('Шаг 2 из 3. Откройте ссылку и войдите');
     await expect(term(page)).toHaveAttribute('role', 'log');
     await expect(term(page)).toHaveAttribute('aria-label', 'Терминал входа');
-    await expect(term(page)).toContainText('Opening browser to sign in');
+    await expect(term(page)).toContainText('oauth/authorize') // первая строка вывода на телефоне уходит из видимого буфера, ссылка остаётся;
     // ссылка из вывода дублируется обычной кнопкой: новая вкладка, без передачи opener
     const open = page.getByRole('link', { name: 'Открыть страницу входа' });
     await expect(open).toHaveAttribute('href', CLAUDE_LINK);
@@ -1109,7 +1110,7 @@ test.describe('словарь: без жаргона в экранах пров�
 
 test.describe('терминал входа: ошибки, обрыв, клавиатура, телефон', () => {
   // claude: сценарий «код с сайта», поле «Код из браузера» есть (сценарий codex проверяется выше)
-  const login = (query = '') => `/?mock=1${query}#/settings/providers/p-claude/login`;
+  const login = (query = '') => `/?mock=1&cli_auth=out${query}#/settings/providers/p-claude/login`;
   const status = (page) => page.locator('#cl-status');
   const term = (page) => page.locator('#cl-term');
 
@@ -1224,3 +1225,216 @@ test.describe('терминал входа: ошибки, обрыв, клави
   });
 });
 
+
+test.describe('проверка входа при открытии экрана', () => {
+  // Без &cli_auth=out: Claude Code и Antigravity в моке залогинены, Codex нет.
+  const open = (id, query = '') => `/?mock=1${query}#/settings/providers/${id}/login`;
+  const status = (page) => page.locator('#cl-status');
+  const checks = (page) => page.evaluate(() => (window.__providerCalls || []).filter((c) => c.name === 'checkProvider'));
+  const loginFrames = (page) => page.evaluate(() => (window.__loginMock ? window.__loginMock.frames.length : 0));
+
+  test('вход выполнен: спиннер «Проверяю вход», затем «Вход уже выполнен», модели и «Готово»; терминал не открывался', async ({ page }) => {
+    await page.goto(open('p-claude'));
+    await expect(page.getByRole('heading', { name: 'Вход: Claude Code' })).toBeVisible();
+    await expect(status(page)).toContainText('Проверяю вход');
+    await expect(page.locator('#cl-term-wrap')).toBeHidden();
+    await expect(status(page)).toContainText('Вход уже выполнен');
+    await expect(status(page)).toBeFocused();
+    await expect(page.locator('#cl-term-wrap')).toBeHidden();
+    await expect(page.locator('#cl-idle')).toBeVisible();
+    await expect(page.locator('#cl-result')).toContainText('Найдено моделей: 3.');
+    await expect(page.locator('#cl-result .cl-models')).toContainText('claude-opus-5-5');
+    await expect(page.getByRole('link', { name: 'Закрыть', exact: true })).toHaveAttribute('href', '#/settings/providers/p-claude');
+    await expect(page.getByRole('button', { name: 'Войти заново' })).toBeVisible();
+    // форм кода и ссылки входа нет, соединение терминала не открывалось
+    await expect(page.locator('#cl-form')).toBeHidden();
+    await expect(page.locator('#cl-link-card')).toBeHidden();
+    expect(await loginFrames(page)).toBe(0);
+    // проверка одна, без force: статус провайдера в списке был ok
+    expect(await checks(page)).toEqual([{ name: 'checkProvider', id: 'p-claude', body: null }]);
+  });
+
+  test('вход не выполнен: после проверки открывается терминал, проверка с force=1, т.к. статус не ok', async ({ page }) => {
+    await page.goto(open('p-codex'));
+    await expect(status(page)).toContainText('Проверяю вход');
+    await expect(status(page)).toContainText('Шаг 1 из 3', { timeout: 8000 });
+    await expect(page.locator('#cl-term-wrap')).toBeVisible();
+    await expect(page.locator('#cl-idle')).toBeHidden();
+    await expect(page.getByRole('button', { name: 'Войти заново' })).toHaveCount(0);
+    await expect(page.locator('#cl-device-code')).toHaveText(/^[A-Z0-9]{4}-[A-Z0-9]{5}$/, { timeout: 8000 });
+    expect(await checks(page)).toEqual([{ name: 'checkProvider', id: 'p-codex', body: { force: true } }]);
+  });
+
+  test('проверка не ответила (500): терминал открывается как раньше', async ({ page }) => {
+    await page.goto(open('p-claude', '&check=fail'));
+    await expect(status(page)).toContainText('Шаг 2 из 3. Откройте ссылку и войдите', { timeout: 8000 });
+    await expect(page.locator('#cl-term-wrap')).toBeVisible();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+  });
+
+  test('«Войти заново»: терминал без новой проверки, после кода exit(0) идёт «Проверяю вход» и «Вход выполнен»', async ({ page }) => {
+    await page.goto(open('p-claude'));
+    await expect(status(page)).toContainText('Вход уже выполнен');
+    await page.getByRole('button', { name: 'Войти заново' }).click();
+    await expect(page.locator('#cl-term-wrap')).toBeVisible();
+    await expect(page.locator('#cl-idle')).toBeHidden();
+    await expect(status(page)).toContainText('Шаг 2 из 3. Откройте ссылку и войдите', { timeout: 8000 });
+    await expect(page.getByRole('button', { name: 'Войти заново' })).toHaveCount(0);
+    await expect(page.locator('#cl-result')).toBeEmpty();
+    await page.getByLabel('Код из браузера').fill('ok');
+    await page.getByRole('button', { name: 'Отправить' }).click();
+    await expect(status(page)).toContainText('Проверяю вход');
+    await expect(status(page)).toContainText('Вход выполнен');
+    await expect(status(page)).not.toContainText('уже');
+    await expect(page.getByRole('link', { name: 'Выбрать модели' })).toHaveAttribute('href', '#/settings/providers/p-claude');
+    // «Войти заново» повторных проверок при открытии не делает: одна проверка экрана
+    expect((await checks(page)).length).toBe(1);
+  });
+
+  test('«Войти заново» с неверным кодом: обычная ошибка входа, а не «Вход уже выполнен»', async ({ page }) => {
+    await page.goto(open('p-agy'));
+    await expect(status(page)).toContainText('Вход уже выполнен');
+    await page.getByRole('button', { name: 'Войти заново' }).click();
+    await expect(status(page)).toContainText('Шаг 2 из 3', { timeout: 8000 });
+    await page.getByLabel('Код из браузера').fill('bad');
+    await page.getByRole('button', { name: 'Отправить' }).click();
+    await expect(page.getByRole('alert').filter({ hasText: 'Код не подошёл' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Получить новый код' })).toBeVisible();
+  });
+
+  test('уход с экрана во время проверки: терминал не открывается', async ({ page }) => {
+    await page.goto(open('p-codex'));
+    await expect(status(page)).toContainText('Проверяю вход');
+    await page.goto('/?mock=1#/settings/providers');
+    await expect(page.getByRole('heading', { name: 'Провайдеры' }).first()).toBeVisible();
+    await page.waitForTimeout(1500);
+    expect(await loginFrames(page)).toBe(0);
+  });
+});
+
+// Провайдер с сотнями моделей (&providers=many: OpenRouter, 60 включённых моделей acme/…, globex/…, initech/…, umbrella/…).
+test.describe('много моделей у провайдера', () => {
+  const MANY = '/?mock=1&providers=many#/settings/providers/p-many';
+  const rows = (page) => page.locator('#pd-models .model-row');
+  const heading = (page, enabled, total = 60) => page.getByRole('heading', { name: `Модели · включено ${enabled} из ${total}` });
+  const searchbox = (page) => page.getByRole('searchbox', { name: 'Поиск модели' });
+
+  test('поиск по подстроке без учёта регистра, счётчик заголовка не зависит от поиска', async ({ page }) => {
+    await page.goto(MANY);
+    await expect(heading(page, 60)).toBeVisible();
+    await expect(rows(page)).toHaveCount(60);
+    await searchbox(page).fill('model-07');
+    await expect(rows(page)).toHaveCount(1);
+    await expect(page.locator('#pd-filter-note')).toContainText('Найдено 1 из 60');
+    await searchbox(page).fill('ACME/');
+    await expect(rows(page)).toHaveCount(15);
+    await expect(heading(page, 60)).toBeVisible();
+    await searchbox(page).fill('нет такой');
+    await expect(page.getByText('Ничего не найдено')).toBeVisible();
+    await searchbox(page).fill('');
+    await expect(rows(page)).toHaveCount(60);
+    await expect(page.locator('#pd-filter-note')).toBeHidden();
+  });
+
+  test('«Выключить все» на найденных: до 50 без подтверждения, остальные модели не тронуты', async ({ page }) => {
+    await page.goto(MANY);
+    await searchbox(page).fill('acme/');
+    await page.getByRole('button', { name: 'Выключить все' }).click();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await expect(heading(page, 45)).toBeVisible();
+    await expect(page.locator('#pd-bulk')).toContainText('Выключено моделей: 15');
+    await expect(rows(page)).toHaveCount(15);
+    expect(await page.locator('#pd-models input[data-model]:checked').count()).toBe(0);
+    await searchbox(page).fill('');
+    await expect(rows(page)).toHaveCount(60);
+    expect(await page.locator('#pd-models input[data-model]:checked').count()).toBe(45);
+    await expect(rows(page).filter({ hasText: 'отключена вами' })).toHaveCount(15);
+  });
+
+  test('больше 50 найденных: подтверждение, отмена ничего не меняет', async ({ page }) => {
+    await page.goto(MANY);
+    await page.getByRole('button', { name: 'Выключить все' }).click();
+    const dialog = page.getByRole('dialog', { name: 'Выключить все найденные модели?' });
+    await expect(dialog).toBeVisible();
+    await expect(dialog).toContainText('Найдено моделей: 60');
+    await dialog.getByRole('button', { name: 'Отмена' }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect(heading(page, 60)).toBeVisible();
+    await page.getByRole('button', { name: 'Выключить все' }).click();
+    await page.getByRole('dialog').getByRole('button', { name: 'Выключить', exact: true }).click();
+    await expect(heading(page, 0)).toBeVisible();
+    await expect(page.locator('#pd-bulk')).toContainText('Выключено моделей: 60');
+    // и обратно: «Включить все» возвращает отключённые вручную
+    await page.getByRole('button', { name: 'Включить все' }).click();
+    await page.getByRole('dialog').getByRole('button', { name: 'Включить', exact: true }).click();
+    await expect(heading(page, 60)).toBeVisible();
+    await expect(page.locator('#pd-bulk')).toContainText('Включено моделей: 60');
+  });
+
+  test('после проверки провайдера с 60 моделями: подсказка выключить лишние; у малого списка её нет', async ({ page }) => {
+    await openAdd(page);
+    await pickKind(page, 'Свой адрес');
+    await page.locator('#pa-ep-name').fill('OpenRouter 2');
+    await page.locator('#pa-url').fill('https://many.example.org/api/v1');
+    await page.locator('#pa-ep-key').fill('sk-or-test-key-123');
+    await submit(page);
+    await expect(page.getByText('Найдено моделей: 60')).toBeVisible();
+    const hint = page.locator('[data-many-models]');
+    await expect(hint).toContainText('Включены все 60');
+    await expect(hint).toContainText('поиск и кнопка «Выключить все»');
+  });
+
+  test('после проверки провайдера с малым числом моделей подсказки нет', async ({ page }) => {
+    await openAdd(page);
+    await page.locator('#pa-name').fill('Мой Anthropic');
+    await page.locator('#pa-key').fill(SECRET);
+    await submit(page);
+    await expect(page.getByText('Найдено моделей: 3')).toBeVisible();
+    await expect(page.locator('[data-many-models]')).toHaveCount(0);
+  });
+
+  test('выбор модели бота: поле поиска и первые 12 совпадений, выбранная модель всегда в списке', async ({ page }, testInfo) => {
+    await page.goto('/?mock=1&providers=many#/bots/archive');
+    await expect(page.locator('[data-model-label]')).toHaveText(/llama3/);
+    await openPicker(page, testInfo);
+    const search = page.locator('[data-pick-search]');
+    await expect(search).toBeVisible();
+    const group = page.locator('.model-group').filter({ hasText: 'OpenRouter' });
+    await expect(group.getByRole('radio')).toHaveCount(12);
+    await expect(group).toContainText('Показаны первые 12 из 60');
+    // выбранная llama3.3 (Ollama дома) остаётся в списке при любом запросе
+    await search.fill('model-33');
+    await expect(group.getByRole('radio')).toHaveCount(1);
+    await expect(group).not.toContainText('Показаны первые');
+    await expect(page.locator('.model-option[aria-checked="true"]')).toContainText('llama3.3');
+    await search.fill('нет такой модели');
+    await expect(page.locator('.model-option[aria-checked="true"]')).toHaveCount(1);
+    await search.fill('model-33');
+    await group.getByRole('radio').click();
+    await expect(page.locator('.model-option[aria-checked="true"]')).toContainText('model-33');
+    await expect(search).toHaveValue('model-33'); // поиск остаётся после выбора
+    if (isMobile(testInfo)) await page.getByRole('button', { name: 'Готово' }).click();
+    await expect(page.locator('[data-model-label]')).toHaveText(/model-33/);
+  });
+
+  test('у провайдеров с малым числом моделей поля поиска в выборе нет', async ({ page }, testInfo) => {
+    await page.goto('/?mock=1#/bots/archive');
+    await openPicker(page, testInfo);
+    await expect(page.getByRole('radiogroup', { name: 'Модель бота' })).toBeVisible();
+    await expect(page.locator('[data-pick-search]')).toHaveCount(0);
+  });
+});
+
+test.describe('ошибка сервера при сохранении провайдера', () => {
+  test('500: «Ошибка сервера при сохранении» и подсказка про лог ядра, а не «Сервер не отвечает»', async ({ page }) => {
+    await openAdd(page, '&provider_save=500');
+    await page.locator('#pa-name').fill('Мой Anthropic');
+    await page.locator('#pa-key').fill(SECRET);
+    await submit(page);
+    const alert = page.getByRole('alert').filter({ hasText: 'Ошибка сервера при сохранении' });
+    await expect(alert).toBeVisible();
+    await expect(alert).toContainText('Подробности в логе ядра (docker compose logs core)');
+    await expect(page.getByText('Сервер не отвечает')).toHaveCount(0);
+    await expect(page.getByText('Попробуйте ещё раз через минуту')).toHaveCount(0);
+  });
+});

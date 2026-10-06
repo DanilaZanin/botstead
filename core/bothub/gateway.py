@@ -219,15 +219,46 @@ class NetworksCache:
 
 @dataclass(frozen=True)
 class Target:
-    origin: str
-    pinned: str
+    origin: str                 # схема, хост, порт и base_path: то, что сохраняется как base_url
+    pinned: str                 # то же с проверенным IP вместо хоста; к нему дописывается v1/...
     hostname: str
     addresses: tuple[str, ...]  # все ответы DNS в канонической форме (IPv4-mapped сведён к IPv4)
     private: tuple[str, ...]    # из них приватные: то, что одобряет администратор
     exempt: bool                # хост в устаревшем PROVIDER_PRIVATE_ALLOW
+    base_path: str = ""         # префикс пути перед v1/... ("" или "/api"), без хвостового слэша и без /v1
 
 
 ForbiddenNetworks = Sequence[Network] | Callable[[], Sequence[Network]]
+
+# Шлюз и проба сами дописывают v1/... и v1beta/...: версию в конце адреса пользователя отбрасываем,
+# иначе https://host/api/v1 дал бы /api/v1/v1/models.
+VERSION_SEGMENTS = frozenset({"v1", "v1beta"})
+BASE_SEGMENT = re.compile(r"[A-Za-z0-9._~:@+\-]+")
+
+
+def split_base(base_url: str) -> tuple[str, str]:
+    """(origin, base_path) адреса провайдера: схема://хост[:порт] и нормализованный префикс пути.
+
+    Префикс без хвостовых слэшей и без хвостовых сегментов v1/v1beta (результат идемпотентен); корень даёт "". ValueError на префикс,
+    который может сменить цель запроса: пустой сегмент, точечные сегменты, «%», «;», пробелы и прочие символы вне
+    BASE_SEGMENT. Логин, запрос и фрагмент здесь не проверяются: это делает inspect_target."""
+    try:
+        parsed = urlsplit(base_url)
+        parsed.hostname, parsed.port  # noqa: B018 (ValueError на кривой хост или порт)
+    except ValueError as exc:
+        raise ValueError("malformed provider URL") from exc
+    segments = parsed.path.rstrip("/").split("/")[1:] if parsed.path.rstrip("/") else []
+    while segments and segments[-1].lower() in VERSION_SEGMENTS:
+        segments.pop()
+    if any(not BASE_SEGMENT.fullmatch(part) or not part.strip(".") for part in segments):
+        raise ValueError("invalid provider path")
+    return f"{parsed.scheme}://{parsed.netloc}", "".join(f"/{part}" for part in segments)
+
+
+def normalized_base(base_url: str) -> str:
+    """Форма base_url, в которой адрес хранится: origin + base_path. ValueError, как у split_base."""
+    origin, base_path = split_base(base_url)
+    return origin + base_path
 
 
 async def inspect_target(base_url: str, allowed_private_hosts: Sequence[str], resolver: Resolver,
@@ -241,11 +272,12 @@ async def inspect_target(base_url: str, allowed_private_hosts: Sequence[str], re
         port = parsed.port
     except ValueError as exc:
         raise ValueError("malformed provider URL") from exc
+    base_path = split_base(base_url)[1]
     if (parsed.scheme not in {"https", "http"} or not host or parsed.username is not None
             or parsed.password is not None or parsed.fragment or parsed.query
             or host.endswith(".") or "%" in host or "\\" in base_url
             or any(c.isspace() for c in base_url)):
-        raise ValueError("provider URL must be an origin without credentials, query or fragment")
+        raise ValueError("provider URL must be http(s)://host[:port][/path] without credentials, query or fragment")
     if port is not None and not 1 <= port <= 65535:
         raise ValueError("invalid provider port")
     if (not re.fullmatch(r"[A-Za-z0-9.\-]+", host) and ":" not in host) or ".." in host or host.startswith("-"):
@@ -283,11 +315,11 @@ async def inspect_target(base_url: str, allowed_private_hosts: Sequence[str], re
     address = addresses[0]
     pinned_host = f"[{address}]" if address.version == 6 else str(address)
     suffix = f":{port}" if port is not None else ""
-    origin = urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
-    pinned = urlunsplit((parsed.scheme, pinned_host + suffix, parsed.path.rstrip("/"), "", ""))
+    origin = urlunsplit((parsed.scheme, parsed.netloc, base_path, "", ""))
+    pinned = urlunsplit((parsed.scheme, pinned_host + suffix, base_path, "", ""))
     private_ips = tuple(dict.fromkeys(str(a) for a in addresses if any(a in network for network in PRIVATE_NETWORKS)))
     return Target(origin, pinned, host, tuple(dict.fromkeys(str(a) for a in addresses)), private_ips,
-                  host.lower() in {item.lower() for item in allowed_private_hosts})
+                  host.lower() in {item.lower() for item in allowed_private_hosts}, base_path)
 
 
 def unapproved_addresses(target: Target, allow_private: bool, approved_ips: Iterable[str] | None) -> tuple[str, ...]:

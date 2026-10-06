@@ -133,7 +133,9 @@ const mockBots = [
 // нужно повторное одобрение, одобрен; два бота на первых двух), &bots=states (боты в статусах no_model,
 // error_starting, need_restart и бот без истории для удаления), &login=busy|forbidden|revoked|lost|timeout|start
 // (сбои терминала входа), &requests=1 (три запроса админу на внутренние адреса), &requests=stale (то же, первое
-// одобрение отвечает 409), &requests=fail (список запросов не загрузился с первого раза).
+// одобрение отвечает 409), &requests=fail (список запросов не загрузился с первого раза), &providers=many (провайдер
+// OpenRouter с 60 включёнными моделями; так же отвечает любой новый адрес с «many»), &provider_save=500 (создание
+// провайдера отвечает 500), &decide=409 (решение по одобрению отвечает 409, одобрение истекло; &decide=409-decided: уже решено на другом устройстве).
 // Проверка ключа до сохранения (§11): ключ с «bad» даёт 422 key_rejected, с «offline» 422 unreachable, с «weird»
 // 422 incompatible, с «limit» 429 rate_limited. Адрес с «down» даёт unreachable, с «notapi» incompatible,
 // localhost, 127.*, 169.254.* всегда запрещены (422 invalid_base_url), 192.168.*, 10.*, 172.16.*, *.lan и *.local
@@ -154,6 +156,8 @@ const MOCK_VENDOR_MODELS = {
   cli_codex: ['gpt-5.4'],
   cli_agy: ['gemini-3.1-pro-preview', 'gemini-3.1-flash-lite-preview'],
 };
+// 60 моделей одного провайдера: как OpenRouter, у которого сотни. Имена с префиксом производителя и номером для поиска.
+const MANY_MODEL_NAMES = Array.from({ length: 60 }, (_, i) => `${['acme', 'globex', 'initech', 'umbrella'][i % 4]}/model-${String(i + 1).padStart(2, '0')}`);
 let mockModelSeq = 0;
 const mockModel = (provider_id, name, extra = {}) => ({ id: `m-${++mockModelSeq}`, provider_id, name, display_name: '', enabled: true, manually_disabled: false, context_window: null, ...extra });
 const mockProvider = (id, kind, name, extra = {}) => ({ id, kind, cli: null, name, base_url: null, status: 'ok', last_check_at: minutesAgo(5), last_error: null, has_secret: kind !== 'cli_subscription', secret_tail: null, allow_private: false, created_at: minutesAgo(60 * 24 * 9), ...extra });
@@ -174,6 +178,11 @@ if (MOCK_PROVIDERS_MODE === 'private') {
     mockProvider('p-lan-ok', 'openai_compatible', 'Домашний Ollama', { base_url: 'https://ollama.lan/v1', allow_private: true, allow_private_ips: ['192.168.1.20'], secret_tail: 'abcd' }),
   );
 }
+// &cli_auth=out: подписки не залогинены (терминал входа открывается сразу, проверка входа не проходит).
+if (params.get('cli_auth') === 'out') for (const p of mockProviders) if (p.kind === 'cli_subscription') p._loggedIn = false;
+// Вход по подписке, выполненный в этой вкладке, переживает перезагрузку (страница провайдеров после терминала входа).
+const MOCK_CLI_LOGIN_KEY = 'bothub_mock_cli_login';
+const mockSaveCliLogin = (id) => { try { const done = JSON.parse(sessionStorage.getItem(MOCK_CLI_LOGIN_KEY) || '[]'); if (!done.includes(id)) done.push(id); sessionStorage.setItem(MOCK_CLI_LOGIN_KEY, JSON.stringify(done)); } catch { /* приватный режим */ } };
 const mockModels = MOCK_PROVIDERS_MODE === 'none' ? [] : [
   mockModel('p-claude', 'claude-sonnet-5'), mockModel('p-claude', 'claude-opus-5-5'), mockModel('p-claude', 'claude-haiku-4-5-20251001'),
   mockModel('p-anthropic', 'claude-opus-5-5', { context_window: 200000 }),
@@ -185,6 +194,10 @@ const mockModels = MOCK_PROVIDERS_MODE === 'none' ? [] : [
   mockModel('p-agy', 'gemini-3.1-pro-preview'), mockModel('p-agy', 'gemini-3.1-flash-lite-preview'),
 ];
 
+if (MOCK_PROVIDERS_MODE === 'many') {
+  mockProviders.push(mockProvider('p-many', 'openai_compatible', 'OpenRouter', { base_url: 'https://many.example.org/api/v1', secret_tail: 'k3Yz' }));
+  mockModels.push(...MANY_MODEL_NAMES.map((name) => mockModel('p-many', name)));
+}
 if (MOCK_PROVIDERS_MODE === 'private') {
   mockModels.push(mockModel('p-lan', 'llama3.3'), mockModel('p-lan-re', 'qwen3'), mockModel('p-lan-ok', 'llama3.3'));
 }
@@ -833,7 +846,7 @@ async function mockListGate() {
 // Список моделей провайдера после успешной проверки: новые модели включаются, прежние ручные отключения сохраняются.
 function mockSyncModels(provider) {
   const key = provider.kind === 'cli_subscription' ? `cli_${provider.cli}` : provider.kind;
-  const names = MOCK_VENDOR_MODELS[key] || [];
+  const names = /many/i.test(provider.base_url || '') ? MANY_MODEL_NAMES : MOCK_VENDOR_MODELS[key] || [];
   for (const name of names) {
     const known = mockModels.find((m) => m.provider_id === provider.id && m.name === name);
     if (!known) mockModels.push(mockModel(provider.id, name));
@@ -854,6 +867,12 @@ function mockRunCheck(p) {
   if (!error) mockSyncModels(p);
   return p;
 }
+try {  // вход по подписке из этой вкладки: после перезагрузки провайдер уже проверен
+  for (const id of JSON.parse(sessionStorage.getItem(MOCK_CLI_LOGIN_KEY) || '[]')) {
+    const p = mockProviders.find((x) => x.id === id && x.kind === 'cli_subscription');
+    if (p) { p._loggedIn = true; mockRunCheck(p); }
+  }
+} catch { /* повреждённое значение */ }
 // Адрес по правилам §11: forbidden (всегда запрещён), private (нужно одобрение админа), public.
 function mockAddressKind(url) {
   const host = String(url || '').replace(/^[a-z]+:\/\//i, '').split(/[/:?#]/)[0].toLowerCase();
@@ -883,6 +902,7 @@ async function mockCreateProvider(body) {
   await delay(params.get('probe') === 'slow' ? 2500 : 600);
   mockRequireSession();
   mockCall('createProvider', null, body);
+  if (params.get('provider_save') === '500') mockFail(500, 'internal', 'internal');
   const name = typeof body.name === 'string' ? body.name.trim() : '';
   const kinds = ['anthropic_api', 'openai_api', 'google_api', 'openai_compatible', 'cli_subscription'];
   if (!kinds.includes(body.kind) || !name) mockFail(400, 'invalid');
@@ -971,10 +991,11 @@ async function mockPatchProvider(id, body) {
   if ('status' in body) p.status = 'disabled';
   return mockPublicProvider(p);
 }
-async function mockCheckProvider(id) {
+async function mockCheckProvider(id, force = false) {
   await delay(700);
   const p = mockProviderById(id);
-  mockCall('checkProvider', id);
+  mockCall('checkProvider', id, force ? { force: true } : undefined);
+  if (params.get('check') === 'fail') mockFail(500, 'invalid', 'internal');  // &check=fail: проверка не отвечает
   if (p.status === 'pending_admin') return mockPublicProvider(p);
   if (p.status === 'disabled') p.status = 'new';
   return mockPublicProvider(mockRunCheck(p));
@@ -1032,7 +1053,7 @@ async function mockDeleteProvider(id) {
   return { ok: true };
 }
 async function mockPatchModel(id, body) {
-  await delay(120);
+  await delay(MOCK_PROVIDERS_MODE === 'many' ? 4 : 120);  // пачка из 60 запросов не должна тянуться секундами
   const m = mockModels.find((x) => x.id === id);
   if (!m) mockFail(404, 'not_found');
   if (!body || Object.keys(body).some((k) => !['enabled', 'display_name'].includes(k)) || ('enabled' in body && typeof body.enabled !== 'boolean')) mockFail(400, 'invalid');
@@ -1206,6 +1227,7 @@ class MockLoginSocket {
       if (!p) return;
       if (code === 0) {
         p._loggedIn = true;
+        mockSaveCliLogin(p.id);
         mockRunCheck(p);
         for (const bot of mockBots) {
           if (bot.provider_id !== p.id) continue;
@@ -1670,9 +1692,10 @@ export async function allowPrivateProvider(id, body) {
   if (MOCK) return mockAllowPrivate(id, body);
   return request(`/providers/${encodeURIComponent(id)}/allow-private`, { method: 'PATCH', body });
 }
-export async function checkProvider(id) {
-  if (MOCK) return mockCheckProvider(id);
-  return request(`/providers/${encodeURIComponent(id)}/check`, { method: 'POST' });
+// force=1: ядро обходит кэш проверки (30 с, у agy 10 мин), но не чаще раза в 5 с на провайдера.
+export async function checkProvider(id, { force = false } = {}) {
+  if (MOCK) return mockCheckProvider(id, force);
+  return request(`/providers/${encodeURIComponent(id)}/check${force ? '?force=1' : ''}`, { method: 'POST' });
 }
 export async function deleteProvider(id) {
   if (MOCK) return mockDeleteProvider(id);
@@ -1946,10 +1969,19 @@ export async function listApprovals(status = 'pending') {
   if (MOCK) { await delay(); return clone(mockApprovals.filter((a) => a.status === status)); }
   return request(`/approvals?status=${status}`);
 }
+// Одобрение по id: в ядре нет GET /approvals/{id}, поэтому ищем по спискам статусов. null, если нигде нет.
+export async function findApproval(id) {
+  const lists = await Promise.all(['expired', 'approved', 'rejected', 'pending'].map((status) => listApprovals(status)));
+  return lists.flat().find((a) => a.id === id) || null;
+}
 export async function decideApproval(id, decision, remember = false) {
   if (MOCK) {
     await delay(200);
     const a = mockApprovals.find((x) => x.id === id);
+    if (['409', '409-decided'].includes(params.get('decide'))) {  // карточка устарела: ядро отвечает 409, одобрение уже expired или решено
+      if (a) a.status = params.get('decide') === '409' ? 'expired' : 'approved';
+      mockFail(409, 'conflict');
+    }
     if (a) a.status = decision === 'approve' ? 'approved' : 'rejected';
     return clone(a);
   }

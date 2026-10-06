@@ -105,8 +105,15 @@ function lockForm(form, locked) {
 // Ошибка сети: у fetch нет status. Остальное разбираем по коду ответа.
 function isNetworkError(err) { return !err || !err.status; }
 
+// 5xx кроме 502/503/504: сервер ответил и сломался. Это не обрыв связи и не «попробуйте через минуту», причина в логе ядра.
+export function isServerFault(err) {
+  return Boolean(err) && err.status >= 500 && ![502, 503, 504].includes(err.status);
+}
+const FAULT_HINT = 'Подробности в логе ядра (docker compose logs core).';
+
 // Текст для сбоя без понятного ответа сервера: код ответа пользователю не показываем.
 export function failure(err, unsent = '') {
+  if (isServerFault(err)) return { title: 'Ошибка сервера', text: `${unsent}${FAULT_HINT}` };
   return { title: 'Сервер не отвечает', text: `${unsent}${isNetworkError(err) ? 'Проверьте сеть или VPN.' : 'Попробуйте ещё раз через минуту.'}` };
 }
 function failureAlert(box, err, unsent = '') {
@@ -281,10 +288,11 @@ export function viewLogin({ notice = '', initialError = '', email = '' } = {}) {
 
   const showServerState = (kind) => {
     if (kind === 'down') setAlert(alertBox, 'Сервер не отвечает', 'Данные не отправлены. Проверьте сеть или VPN.');
+    else if (kind === 'fault') setAlert(alertBox, 'Ошибка сервера', FAULT_HINT);
     else setAlert(alertBox, 'Сервер не отвечает', 'Попробуйте ещё раз через минуту.');
     submit.innerHTML = `${ICONS.retry}Повторить`;
   };
-  if (initialError) showServerState(initialError === 'down' ? 'down' : 'server');
+  if (initialError) showServerState(['down', 'fault'].includes(initialError) ? initialError : 'server');
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -307,7 +315,7 @@ export function viewLogin({ notice = '', initialError = '', email = '' } = {}) {
       } else if (err.status === 429) {
         setAlert(alertBox, 'Слишком много попыток', 'Подождите минуту и повторите.');
       } else {
-        showServerState(isNetworkError(err) ? 'down' : 'server');
+        showServerState(isNetworkError(err) ? 'down' : isServerFault(err) ? 'fault' : 'server');
       }
     }
   });

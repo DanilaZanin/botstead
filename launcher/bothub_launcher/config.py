@@ -29,7 +29,8 @@ DEFAULT_LOGIN_COMMANDS = {
     "agy": ("agy", "--mode", "plan", "-p", "Reply OK"),
     "claude_status": ("claude", "auth", "status"),
     "codex_status": ("codex", "login", "status"),
-    "agy_status": ("agy", "--mode", "plan", "--output-format", "json", "-p", "Reply OK"),
+    # agy models: без входа «Please sign in» и ненулевой код за секунды; промпт шёл дольше 30 с проверки.
+    "agy_status": ("agy", "models"),
 }
 
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")

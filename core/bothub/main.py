@@ -41,8 +41,9 @@ from bothub.launcher_client import launcher_client_from_env
 from bothub.launcher_client import (ExecExit, ExecChunk, LauncherError, LauncherNotFound, LauncherTimeout, LauncherUnavailable,
                                     run_exec)
 from bothub.gateway import (ADDRESS_CHANGED_DETAIL, ApprovalChangedError, GatewayProvider, UnresolvedHostError,
-                            NetworksCache, configured_forbidden_networks, create_gateway_router, inspect_target, own_networks,
-                            unapproved_addresses, _validated_target, _resolve_host)
+                            NetworksCache, configured_forbidden_networks, create_gateway_router, inspect_target, normalized_base,
+                            own_networks, unapproved_addresses, _validated_target, _resolve_host)
+from bothub import secrets as secrets_module
 from bothub.secrets import encrypt_secret, decrypt_secret
 from bothub.browser_control import (BrowserEventMasker, RFBClientFilter, RFBProtocolError, is_browser_tool,
                                     human_url, mask_browser_args, mask_browser_text, mask_url, transition, url_forbidden)
@@ -63,6 +64,7 @@ PROVIDER_PROBE_RATE = 10              # пробных запросов в ми�
 PROVIDER_ADMIN_REQUESTS_PER_HOUR = 5  # заявок администратору (приватный адрес без одобрения) в час на пользователя
 PROVIDER_REQUEST_RESOLVE_TIMEOUT = 5  # DNS одной строки в списке заявок администратора
 AGY_CHECK_COOLDOWN = 600
+PROVIDER_FORCE_COOLDOWN = 5
 LAUNCHER_STOP_RETRY_DELAY = 1
 
 # Решение владельца 2026-09-25: мозг ботов только Claude. codex/gemini остаются
@@ -77,10 +79,26 @@ def runner_provider(kind: str, cli: str | None) -> str:
         error('invalid', 400, 'google_api CLI routing unavailable')
     return ('gemini' if cli == 'agy' else cli) if kind == 'cli_subscription' else PROVIDER_KINDS[kind]
 SUBSCRIPTION_MODELS = {
-    'claude': ('claude-sonnet-5', 'claude-opus-5-5', 'claude-haiku-4-5-20251001'),
-    'codex': ('gpt-5.4',),
-    'agy': ('gemini-3.1-pro-preview', 'gemini-3.1-flash-lite-preview'),
+    'claude': ('claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-4-5-20251001'),
+    'codex': ('gpt-6-sol', 'gpt-6-luna', 'gpt-6-astra'),
+    'agy': ('gemini-3.8-flash-high', 'gemini-3.8-flash-medium', 'gemini-3.8-flash-low', 'gemini-3.1-pro-high'),
 }
+AGY_MODEL_ID = re.compile(r'[a-z0-9][a-z0-9.-]{1,63}')
+AGY_MODELS_MAX = 50
+_ANSI = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)')
+
+
+def parse_agy_models(text: str) -> list[str]:
+    """Вывод `agy models`: строки `id<TAB>название`. Берутся строки с табом, id по AGY_MODEL_ID и непустым названием
+    до 80 символов; повторы убираются, максимум AGY_MODELS_MAX. Остальные строки (заголовки, подсказки) пропускаются."""
+    ids: list[str] = []
+    for line in _ANSI.sub('', text).splitlines():
+        model_id, tab, name = line.partition('\t')
+        model_id, name = model_id.strip(), name.strip()
+        if not tab or not AGY_MODEL_ID.fullmatch(model_id) or not name or len(name) > 80: continue
+        if model_id not in ids: ids.append(model_id)
+        if len(ids) >= AGY_MODELS_MAX: break
+    return ids
 DEFAULT_PROVIDER_BASES = {'anthropic_api': 'https://api.anthropic.com', 'openai_api': 'https://api.openai.com',
                           'google_api': 'https://generativelanguage.googleapis.com'}
 # Подмена транспорта пробного запроса в тестах; в проде None.
@@ -113,6 +131,14 @@ def private_allow_hosts() -> tuple[str, ...]:
     return tuple(filter(None, os.getenv('PROVIDER_PRIVATE_ALLOW', '').split(',')))
 
 
+def same_base(new: str, stored: str | None) -> bool:
+    """Тот же адрес провайдера с точностью до нормализации (слэш и /v1 в конце не считаются сменой адреса)."""
+    try:
+        return normalized_base(new) == normalized_base(stored or '')
+    except ValueError:
+        return new.rstrip('/') == (stored or '')
+
+
 def secret_tail(secret: str) -> str | None:
     return secret[-4:] if len(secret) >= 12 else None
 
@@ -131,7 +157,8 @@ async def fetch_provider_models(kind: str, base_url: str | None, key: str, *, al
                                 approved_ips=None, forbidden=(), resolver=None) -> list[str]:
     """Один пробный запрос списка моделей через закреплённый проверенный IP. Бросает ProbeError(code, message).
 
-    Разрешение DNS входит в PROVIDER_CHECK_TIMEOUT. approved_ips: одобренные администратором приватные IP (None: без ограничения)."""
+    Разрешение DNS входит в PROVIDER_CHECK_TIMEOUT. approved_ips: одобренные администратором приватные IP (None: без ограничения).
+    base_path адреса (split_base) уже в `pinned`: https://host/api и https://host/api/v1 оба идут на /api/v1/models."""
     path = '/v1beta/models' if kind == 'google_api' else '/v1/models'
     body = bytearray()
     try:
@@ -2065,8 +2092,22 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             await asyncio.sleep(delay)
             delay = min(delay * 2, LAUNCHER_SYNC_DELAY_MAX)
 
+    def check_secret_keys():
+        """Ключи шифрования API-ключей провайдеров проверяются на старте: иначе ошибка формата всплывает только 500-й
+        при добавлении провайдера. Пустое значение допустимо (провайдеры с ключом недоступны), кривое: ядро не стартует."""
+        raw = os.getenv('BOTHUB_SECRET_KEYS', '').strip()
+        if not raw:
+            log.warning('secret_keys_missing', extra={'hint': 'BOTHUB_SECRET_KEYS empty: providers with an API key cannot be added'})
+            return
+        try:
+            secrets_module._keys(None)
+        except ValueError as exc:
+            log.error('secret_keys_invalid', extra={'error': str(exc), 'hint': 'BOTHUB_SECRET_KEYS=1:<base64 of 32 random bytes>'})
+            raise RuntimeError(f'BOTHUB_SECRET_KEYS invalid: {exc}') from None
+
     @asynccontextmanager
     async def lifespan(app):
+        check_secret_keys()
         if os.getenv('BOTHUB_RUNNER_EXEC', 'local') == 'docker':
             if app.state.launcher is None:
                 raise RuntimeError('Docker mode requires launcher configuration')
@@ -2432,7 +2473,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                 'on conflict(provider_id,name) do update set enabled=not models.manually_disabled',provider_id,name)
         await con.execute('update bothub.models set enabled=false where provider_id=$1 and not (name=any($2::text[]))',provider_id,list(names))
 
-    async def check_provider_record(provider_id, owner_id):
+    async def check_provider_record(provider_id, owner_id, force=False):
         async with app.state.pool.acquire() as con:
             row = await con.fetchrow('select * from bothub.providers where id=$1 and owner_id=$2',provider_id,owner_id)
             if not row: error('not_found',404)
@@ -2441,6 +2482,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         cooldown = AGY_CHECK_COOLDOWN if row['cli']=='agy' else PROVIDER_CHECK_COOLDOWN
         if row['status']=='error':
             cooldown = min(cooldown, 30)
+        if force: cooldown = min(cooldown, PROVIDER_FORCE_COOLDOWN)  # force обходит кэш, но не чаще раза в несколько секунд
         if row['last_check_at'] and datetime.now(NOW)-row['last_check_at']<timedelta(seconds=cooldown):
             return public_provider(row)
         task = provider_checks.get(provider_id)
@@ -2473,9 +2515,11 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                     await app.state.launcher.create_login_container(str(owner_id))
                     sid=await app.state.launcher.open_login_session(str(owner_id),command=row['cli']+'_status')
                     code=None
+                    stdout=bytearray()
                     try:
                         async for frame in app.state.launcher.login_output(sid):
                             if isinstance(frame,ExecExit): code=frame.code
+                            elif isinstance(frame,ExecChunk) and frame.stream=='stdout' and len(stdout)<1024*1024: stdout+=frame.data
                     finally:
                         close_task=asyncio.create_task(app.state.launcher.close_login_session(sid))
                         try:
@@ -2484,7 +2528,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                             await close_task
                             raise
                 if code != 0: raise RuntimeError('subscription not authenticated')
-                names=list(SUBSCRIPTION_MODELS[row['cli']])
+                names=(row['cli']=='agy' and parse_agy_models(bytes(stdout).decode('utf-8','replace'))) or list(SUBSCRIPTION_MODELS[row['cli']])
             else:
                 key=decrypt_secret(bytes(row['secret_encrypted']),row['id'].bytes).decode()
                 async with probe_slot(str(owner_id)):
@@ -2648,7 +2692,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         if 'secret' in body:
             # Смена адреса сбрасывает флаг; явный allow_private администратора относится к новому адресу и этим же запросом
             # привязывается к его IP. Без явного флага проверка идёт по уже одобренному набору.
-            changed='base_url' in body and body['base_url'].rstrip('/')!=(row['base_url'] or '')
+            changed='base_url' in body and not same_base(body['base_url'],row['base_url'])
             allow=body['allow_private'] if 'allow_private' in body else (False if changed else row['allow_private'])
             approved=None if allow and 'allow_private' in body else (list(row['allow_private_ips'] or ()) if allow else [])
             base=body['base_url'] if 'base_url' in body else row['base_url']
@@ -2779,7 +2823,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
     @app.post('/api/providers/{id}/check')
     async def provider_check(id: uuid.UUID,request: Request):
         who=await principal(request,owner=True)
-        checked=await check_provider_record(id,who['user_id'])
+        checked=await check_provider_record(id,who['user_id'],force=request.query_params.get('force')=='1')
         if checked['status']=='pending_admin' and checked['allow_private']:
             error('invalid_base_url',422,checked['last_error'] or ADDRESS_CHANGED_DETAIL)  # одобренный адрес сменился
         return checked
@@ -3187,7 +3231,9 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             error('url_forbidden',403,reason)
         if state=='human':
             error('human_in_control',409)
-        if state=='returning' and body.action!='snapshot':
+        # После возврата от человека бот сначала смотрит страницу (snapshot) или открывает новую (navigate):
+        # клик и ввод вслепую по старой странице не разрешаются.
+        if state=='returning' and body.action not in ('snapshot','navigate'):
             error('browser_stale',409)
         require_launcher()  # ни разрешения на шаг, ни доступа к браузеру до стартовой сверки состояния с лаунчером
         try:
@@ -3229,7 +3275,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             if body.action=='fill':
                 payload['secret']=procedures.secret_field(body.role,name)
             await append_event(con,body.thread_id,body.turn_id,'browser_step',f"bot:{who['bot_id']}",payload)
-        if state=='returning' and body.action=='snapshot' and body.result=='ok':
+        if state=='returning' and body.action in ('snapshot','navigate') and body.result=='ok':
             await browser_transition(who['bot_id'],who,'snapshot','snapshot')
         return {'ok':True}
 

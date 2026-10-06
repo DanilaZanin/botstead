@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { avatarHtml, AVATAR_KINDS, avatarLabel, randomAvatar } from './avatars.js';
 import { openThreadStream } from './ws.js';
 import { ICONS, icon, esc, backHeader, alertHtml, modelTitle, fmtDateTime } from './ui.js';
-import { createAccount } from './account.js';
+import { createAccount, failure, isServerFault } from './account.js';
 import { viewProviders, loadModelOptions, renderModelPicker, botModelCardHtml, mountBotModelCard, botStateBanner, botStartHint, recreateBotAction, confirmDeleteBot } from './providers.js';
 import { botNoModel, runnerKind, usableModels, providerStatus } from './registry.js';
 import { viewProviderRequests } from './provider-requests.js';
@@ -305,6 +305,7 @@ async function handleAction(action, el) {
       await api.decideApproval(id, decision, false, client);
       applyApprovalDecision(card, decision);
     } catch (error) {
+      if (error && error.status === 409 && await settleApprovalCard(card, id)) return;
       actions.querySelectorAll('button').forEach((button) => { button.disabled = false; });
       throw error;
     }
@@ -312,7 +313,11 @@ async function handleAction(action, el) {
     const id = el.getAttribute('data-id');
     const remember = !!document.querySelector(`[data-remember="${id}"]`)?.checked;
     el.disabled = true;
-    await api.decideApproval(id, action === 'approve' ? 'approve' : 'reject', remember);
+    try {
+      await api.decideApproval(id, action === 'approve' ? 'approve' : 'reject', remember);
+    } catch (error) {
+      if (!error || error.status !== 409) { el.disabled = false; throw error; }  // 409: уже решено или срок вышел, экран перечитает список
+    }
     render();
   } else if (action === 'run-schedule') {
     el.disabled = true;
@@ -410,7 +415,7 @@ async function updateBotSetting(action, el) {
     if (botSeq.get(botId) !== seq) return;
     paintBotSettings(scope, before);
     if (alertBox) {
-      alertBox.innerHTML = alertHtml('Изменение не сохранено', err && err.status ? 'Попробуйте ещё раз через минуту.' : 'Сервер не отвечает. Проверьте сеть или VPN.');
+      alertBox.innerHTML = alertHtml('Изменение не сохранено', isServerFault(err) ? failure(err).text : err && err.status ? 'Попробуйте ещё раз через минуту.' : 'Сервер не отвечает. Проверьте сеть или VPN.');
       alertBox.firstElementChild.focus();
     }
   }
@@ -486,7 +491,7 @@ async function loadSession() {
     } else if (!err.status) {
       account.viewOffline(); // нет связи: оболочка открылась, данных нет
     } else {
-      account.viewLogin({ initialError: 'server' });
+      account.viewLogin({ initialError: isServerFault(err) ? 'fault' : 'server' });
     }
     return false;
   }
@@ -513,9 +518,9 @@ function desktopSidebar({ bots, approvals, activeBotId = null, activeNav = '' })
   const link = (key, href, iconHtml, label) => `<a href="${href}" class="desktop-nav-link"${key === activeNav ? ' aria-current="page"' : ''}>${iconHtml}${label}</a>`;
   return `<aside class="desktop-sidebar">
     <div class="desktop-sidebar-title">botstead</div>
-    ${bots.map((b) => `<a href="javascript:void(0)" data-action="open-thread" data-bot="${esc(b.id)}" class="desktop-bot-row ${b.id === activeBotId ? 'active' : ''}">
+    ${bots.map((b) => `<a href="javascript:void(0)" data-action="open-thread" data-bot="${esc(b.id)}" class="desktop-bot-row ${b.id === activeBotId ? 'active' : ''}" data-bot-status="${esc(b.status || '')}">
       ${avatarSlot(b, 32)}
-      <span class="stack min-w-0"><span class="t-callout" style="font-size:14px;" data-i18n-skip>${esc(b.name)}</span><span class="t-footnote" style="font-size:12px;">${esc(b.status_label)}</span></span>
+      <span class="stack min-w-0"><span class="t-callout" style="font-size:14px;" data-i18n-skip>${esc(b.name)}</span><span class="t-footnote status-line" style="font-size:12px;">${esc(b.status_label)}</span></span>
     </a>`).join('')}
     <div style="height:12px;"></div>
     ${link('routines', '#/routines', ICONS.routines, 'Рутины')}
@@ -625,7 +630,7 @@ const START_POLL_MS = 2000;
 let startWatchTimer = 0;
 function armStartWatch(seq) {
   clearTimeout(startWatchTimer);
-  if (!document.querySelector('[data-bot-state="starting"], .bot-card[data-bot-status="starting"]')) return;
+  if (!document.querySelector('[data-bot-state="starting"], .bot-card[data-bot-status="starting"], .desktop-bot-row[data-bot-status="starting"]')) return;
   startWatchTimer = setTimeout(async () => {
     if (seq !== renderSeq) return;
     try {
@@ -643,6 +648,13 @@ function paintStartedBots(bots) {
       card.setAttribute('data-bot-status', b.status || '');
       const line = card.querySelector('.status-line');
       if (line) line.innerHTML = statusLineHtml(b);
+    });
+    // Боковая панель на Mac: строка бота со статусом словами, без точки.
+    document.querySelectorAll(`.desktop-bot-row[data-bot-status="starting"][data-bot="${CSS.escape(b.id)}"]`).forEach((row) => {
+      if (b.status === 'starting') return;
+      row.setAttribute('data-bot-status', b.status || '');
+      const line = row.querySelector('.status-line');
+      if (line) line.textContent = b.status_label;
     });
     document.querySelectorAll(`[data-bot-state="starting"][data-bot="${CSS.escape(b.id)}"]`).forEach((banner) => {
       if (b.status === 'starting') return;
@@ -702,13 +714,16 @@ function usageMetaHtml(payload) {
   return `<div class="msg-meta"><span>${fmtTokens((payload.tokens_in || 0) + (payload.tokens_out || 0))}</span><span>${payload.seconds ?? '–'} с</span><span>${esc(payload.model || '')}</span></div>`;
 }
 
+// Итог одобрения словами: approve/reject из ответа и события, expired от ядра, settled когда решение уже принято, а какое, неизвестно.
+const APPROVAL_OUTCOME = { approve: 'Разрешено', reject: 'Отклонено', expired: 'Срок вышел', settled: 'Уже решено' };
+
 function approvalCardHtml(payload, decision) {
   const id = payload.approval_id || '';
-  const resolved = decision === 'approve' || decision === 'reject';
+  const resolved = Boolean(APPROVAL_OUTCOME[decision]);
   return `<section class="risk-card" data-approval-id="${esc(id)}" style="background:var(--attention-bg);border-color:var(--attention-border);">
     <div class="risk-tag" style="color:var(--attention-text);">${ICONS.alert}${esc(RISK_LABEL[payload.risk] || 'ПОДТВЕРЖДЕНИЕ')}</div>
     <div class="t-callout" style="font-size:16px;font-weight:500;">${esc(payload.title || '')}</div>
-    <div class="approval-status t-footnote" role="status" data-approval-status ${resolved ? '' : 'hidden'}>${decision === 'approve' ? 'Разрешено' : decision === 'reject' ? 'Отклонено' : ''}</div>
+    <div class="approval-status t-footnote" role="status" data-approval-status ${resolved ? '' : 'hidden'}>${resolved ? APPROVAL_OUTCOME[decision] : ''}</div>
     ${resolved ? '' : `<div class="btn-row btn-row-2" data-approval-actions>
       <button type="button" class="btn btn-secondary" data-action="thread-approval" data-decision="reject" data-id="${esc(id)}">Отклонить</button>
       <button type="button" class="btn btn-attention" data-action="thread-approval" data-decision="approve" data-id="${esc(id)}">Разрешить</button>
@@ -721,8 +736,18 @@ function applyApprovalDecision(card, decision) {
   const status = card.querySelector('[data-approval-status]');
   if (status) {
     status.hidden = false;
-    status.textContent = decision === 'approve' ? 'Разрешено' : 'Отклонено';
+    status.textContent = APPROVAL_OUTCOME[decision] || APPROVAL_OUTCOME.settled;
   }
+}
+
+// Ядро ответило 409 или ход прервался: перечитываем одобрение и называем состояние. Возвращает false, если одобрение
+// всё ещё ждёт решения (кнопки остаются).
+async function settleApprovalCard(card, id) {
+  let found = null;
+  try { found = await api.findApproval(id); } catch { /* состояние неизвестно: ниже «Уже решено» */ }
+  if (found && found.status === 'pending') return false;
+  applyApprovalDecision(card, found && found.status === 'expired' ? 'expired' : 'settled');
+  return true;
 }
 
 function renderEvent(ev, botAvatar) {
@@ -762,6 +787,8 @@ function renderEvent(ev, botAvatar) {
 // Завершённый turn с действиями браузера (browser_step, кроме чтения страницы) получает под ответом кнопку
 // «Сохранить как процедуру». Завершённость: событие status со статусом done или usage с turn_id; отказ или остановка убирают кнопку.
 const READ_ONLY_STEPS = ['snapshot', 'screenshot'];
+// События-причины, которые ядро пишет перед status=error того же хода: из них собирается «Ход прерван: <причина>».
+const TURN_FAILURE_REASON = { approval_expired: 'срок одобрения вышел' };
 function createThreadEventHandler(body, botAvatar, approvalDecisions, threadId, ctl = null) {
   const assistantEvents = new Map();
   const actionTurns = new Set();
@@ -770,6 +797,28 @@ function createThreadEventHandler(body, botAvatar, approvalDecisions, threadId, 
   function offerProcedure(turnId) {
     if (!turnId || !actionTurns.has(turnId) || !finishedTurns.has(turnId) || findOffer(turnId)) return;
     body.insertAdjacentHTML('beforeend', `<div class="proc-offer" data-offer-turn="${esc(turnId)}"><button type="button" class="btn btn-secondary" data-action="save-procedure" data-turn="${esc(turnId)}" data-thread="${esc(threadId)}">${ICONS.checklist}Сохранить как процедуру</button></div>`);
+  }
+  const failureReasons = new Map();
+  // Плашка об оборванном ходе. Причина из payload показывается как есть (data-i18n-skip), своя подпись переводится.
+  function showTurnError(turnKey, payload) {
+    if (body.querySelector(`[data-turn-error="${CSS.escape(turnKey)}"]`)) return;
+    const given = [payload.reason, payload.detail].find((v) => typeof v === 'string' && v.trim());
+    const reason = given ? given.trim() : failureReasons.get(turnKey) || '';
+    body.insertAdjacentHTML('beforeend', `<div class="system-pill" role="status" data-turn-error="${esc(turnKey)}" style="color:var(--danger-fg);"><span>Ход прерван</span>${reason ? `<span>: </span><span${given ? ' data-i18n-skip' : ''}>${esc(reason)}</span>` : ''}</div>`);
+  }
+  // Карточки с кнопками, которых больше нет среди ожидающих: ход оборвался, одобрение истекло или решено на другом устройстве.
+  let syncing = false;
+  async function syncPendingCards() {
+    if (syncing) return;
+    syncing = true;
+    try {
+      const open = Array.from(body.querySelectorAll('[data-approval-id]')).filter((card) => card.querySelector('[data-approval-actions]'));
+      if (!open.length) return;
+      const pending = new Set((await api.listApprovals('pending')).map((a) => a.id));
+      for (const card of open) {
+        if (card.isConnected && !pending.has(card.dataset.approvalId) && card.querySelector('[data-approval-actions]')) await settleApprovalCard(card, card.dataset.approvalId);
+      }
+    } catch { /* список не загрузился: карточки остаются как были, 409 при нажатии сам перечитает */ } finally { syncing = false; }
   }
   const pendingUsage = new Map();
   const findBubble = (turnId) => Array.from(body.querySelectorAll('.msg-bot[data-turn-id]'))
@@ -815,7 +864,10 @@ function createThreadEventHandler(body, botAvatar, approvalDecisions, threadId, 
     if (ev.kind === 'status' && payload.turn_id != null && payload.turn_id !== '') {
       const key = String(payload.turn_id);
       if (payload.status === 'done') { finishedTurns.add(key); offerProcedure(key); } else if (['error', 'stopped', 'failed'].includes(payload.status)) { finishedTurns.delete(key); findOffer(key)?.remove(); }
+      if (payload.status === 'error' && !(ctl && ctl.isCompactTurn(key))) showTurnError(key, payload);  // сжатие пишет своё «Не удалось сжать»
+      if (['error', 'stopped', 'failed'].includes(payload.status)) syncPendingCards();
     }
+    if (TURN_FAILURE_REASON[ev.kind] && turnKey) failureReasons.set(turnKey, TURN_FAILURE_REASON[ev.kind]);
     if (ev.kind === 'usage' && turnKey) { finishedTurns.add(turnKey); offerProcedure(turnKey); }
     // Ход сжатия невидим: ни пузыря ответа, ни строки расхода (turn_id приходит в событиях и в ответе POST /compact).
     if ((ev.kind === 'assistant_msg' || ev.kind === 'usage') && ctl && turnKey && ctl.isCompactTurn(turnKey)) return;

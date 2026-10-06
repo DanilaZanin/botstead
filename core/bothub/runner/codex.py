@@ -17,12 +17,14 @@ class CodexRunner(SubprocessRunner):
         # несёт свою песочницу); флаг -s есть только у "codex exec" без resume.
         # Проверено через `codex exec resume --help` (реальный CLI на этой машине).
         if turn.cli_session_id:
-            command = ["codex", "exec", "resume", turn.cli_session_id, "--json"]
+            command = ["codex", "exec", "resume", turn.cli_session_id, "--json", "--skip-git-repo-check"]
             if turn.compact:
                 command += ["-c", 'sandbox_mode="read-only"']  # у resume нет -s, то же значение через конфиг
         else:
             sandbox = "read-only" if turn.dry_run or turn.compact else "workspace-write"
-            command = ["codex", "exec", "--json", "-s", sandbox]
+            # Домашний каталог бота не git-репозиторий: без флага codex 0.156 отказывается стартовать
+            # («Not inside a trusted directory»), проверено на стенде.
+            command = ["codex", "exec", "--json", "--skip-git-repo-check", "-s", sandbox]
         if turn.compact:
             # Служебный ход сжатия только пишет сводку. Способа выключить все инструменты у codex нет: отключаем
             # оболочку и unified exec (`--disable <FEATURE>`, `codex features list`), остальное запрещает слой ядра:
@@ -32,6 +34,7 @@ class CodexRunner(SubprocessRunner):
             command += ["-m", turn.bot["model"]]
         if turn.bot.get('_gateway_kind') in ('openai_api','openai_compatible'):
             command += ['-c','model_provider="bothub"',
+                        '-c','model_providers.bothub.name="botstead"',  # codex 0.156: без name «provider name must not be empty»
                         '-c',f'model_providers.bothub.base_url="{turn.bot["_gateway_url"]}/v1"',
                         '-c','model_providers.bothub.env_key="BOTHUB_GATEWAY_TOKEN"',
                         '-c','model_providers.bothub.wire_api="responses"',

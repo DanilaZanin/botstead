@@ -61,6 +61,25 @@ def _client() -> httpx.AsyncClient:
     )
 
 
+def approval_title(tool_name: str, args: dict) -> str:
+    """Заголовок запроса на одобрение: что именно хочет сделать бот, а не только имя инструмента.
+    Значения берутся из уже замаскированных args (ввод в браузер сюда не попадает)."""
+    def short(value, limit=120):
+        text = " ".join(str(value).split())
+        return text if len(text) <= limit else text[:limit - 1] + "…"
+    if not isinstance(args, dict):
+        return tool_name
+    if is_browser_tool(tool_name):
+        action = str(args.get("action", ""))
+        detail = args.get("url") if action == "navigate" else args.get("element") or args.get("target") or ""
+        return short(f"browser {action} {detail}".strip())
+    for key in ("command", "url", "file_path", "path", "pattern", "query", "prompt", "description"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            return short(f"{tool_name}: {value}")
+    return tool_name
+
+
 @mcp.tool()
 async def approve(tool_name: str, input: dict) -> dict:
     """Раздел 4: permission-prompt-tool для claude. Решает allow/deny через ядро."""
@@ -71,7 +90,7 @@ async def approve(tool_name: str, input: dict) -> dict:
         "thread_id": os.environ["BOTHUB_THREAD_ID"],
         "turn_id": os.environ["BOTHUB_TURN_ID"],
         "risk": risk,
-        "title": tool_name,
+        "title": approval_title(tool_name, args)[:512],
         "tool": tool_name,
         "args": args,
     }
@@ -318,12 +337,17 @@ async def browser(action: str, target: str = "", value: str = "", url: str = "",
     args = ({"url": url} if action == "navigate" else
             {"target": target, "element": element or target} if action == "click" else
             {"target": target, "element": element or target, "text": value} if action == "fill" else {})
+    detail = ""
     try:
         result = await _browser_call(names[action], args)
-        success = not result.isError
-    except Exception:
+        # mcp 2.x: поле is_error, у mcp 1.x оно называлось isError
+        success = not (getattr(result, "is_error", None) or getattr(result, "isError", False))
+        if not success:  # текст ошибки Playwright MCP: без него модель и владелец видят только browser_tool_failed
+            detail = " ".join(getattr(block, "text", "") for block in result.content)[:300]
+    except Exception as exc:
         result = None
         success = False
+        detail = f"{type(exc).__name__}: {exc}"[:300]
     element = _page_elements.get(target) if action in ("click", "fill") else None
     async with _client() as client:
         audit = await client.post("/api/browser/step", json=payload | {
@@ -333,7 +357,7 @@ async def browser(action: str, target: str = "", value: str = "", url: str = "",
     if audit.status_code != 200:
         return [str(audit.json().get("detail", "browser_unavailable"))]
     if not success:
-        return ["browser_tool_failed"]
+        return [f"browser_tool_failed: {detail}" if detail else "browser_tool_failed"]
     output: list[Image | str] = []
     for block in result.content:
         if block.type == "image":

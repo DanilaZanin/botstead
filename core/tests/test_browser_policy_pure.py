@@ -442,3 +442,28 @@ async def test_unknown_ref_and_other_actions_send_no_role_and_name(monkeypatch, 
     sent = await _browser_with_core(monkeypatch, action="navigate", url="https://a.example/")
     assert "role" not in sent["/api/browser/step"]
     assert sent["/api/browser/authorize"].keys() <= {"thread_id", "turn_id", "action", "url"}
+
+
+@pytest.mark.pure
+def test_approval_title_says_what_the_bot_wants():
+    from bothub.mcp_server import approval_title
+    assert approval_title("mcp__bothub__browser", {"action": "navigate", "url": "https://example.com"}) == "browser navigate https://example.com"
+    assert approval_title("mcp__bothub__browser", {"action": "click", "element": "кнопка «Войти»"}) == "browser click кнопка «Войти»"
+    assert approval_title("WebFetch", {"url": "https://example.com/a", "prompt": "x"}) == "WebFetch: https://example.com/a"
+    assert approval_title("Bash", {"command": "ls   -la\n/tmp"}) == "Bash: ls -la /tmp"
+    assert approval_title("Bash", {"command": "x" * 300}).endswith("…") and len(approval_title("Bash", {"command": "x" * 300})) <= 125
+    assert approval_title("Weird", {"n": 1}) == "Weird"
+    assert approval_title("Weird", "not a dict") == "Weird"
+
+
+@pytest.mark.pure
+def test_invalid_secret_keys_stop_the_core_at_startup(monkeypatch):
+    import asyncio
+    from bothub.main import create_app
+    monkeypatch.setenv('BOTHUB_SECRET_KEYS', 'oops')
+    app = create_app()
+    async def boot():
+        async with app.router.lifespan_context(app):
+            pass
+    with pytest.raises(RuntimeError, match='BOTHUB_SECRET_KEYS'):
+        asyncio.run(boot())

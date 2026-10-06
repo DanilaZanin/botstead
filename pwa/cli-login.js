@@ -59,7 +59,8 @@ export async function viewProviderLogin(providerId) {
   const providerHref = `${HASH_LIST}/${providerId}`;
 
   // Подсказка про клавиатуру нужна только на компьютере: на телефоне нет Shift+Esc, есть ряд клавиш.
-  const termHtml = `<div class="term-wrap"><div id="cl-term" class="term-host" data-i18n-skip role="log" aria-label="Терминал входа" aria-live="off"></div>
+  const idleHtml = '<div id="cl-idle" class="card card-pad" hidden><span class="t-footnote">Терминал откроется, если вход нужно выполнить заново.</span></div>';
+  const termHtml = `${idleHtml}<div class="term-wrap" id="cl-term-wrap" hidden><div id="cl-term" class="term-host" data-i18n-skip role="log" aria-label="Терминал входа" aria-live="off"></div>
     ${desktop ? `<p class="t-footnote term-hint" id="cl-kbd-hint">Терминал открывается кликом, Tab в него не заходит. Esc уходит в команду. Выйти из терминала с клавиатуры: ${ESCAPE_HATCH}.</p>` : ''}
     <p class="t-footnote term-hint" id="cl-save-note">Содержимое окна нигде не сохраняется. Данные входа хранятся на сервере отдельно для каждого пользователя и доступны только его ботам.</p></div>`;
   const linkHtml = `<div id="cl-link-card" class="card card-pad stack gap-2" hidden>
@@ -105,7 +106,7 @@ export async function viewProviderLogin(providerId) {
   }
 
   // ---- состояние экрана ----
-  const st = { phase: 'connecting', link: '', code: '', opened: false, exitCode: null, socket: null, open: false, size: null, ctrl: false, failStep: 0, background: false, linkFocused: false, retryLabel: '' };
+  const st = { phase: 'precheck', viaPrecheck: false, link: '', code: '', opened: false, exitCode: null, socket: null, open: false, size: null, ctrl: false, failStep: 0, background: false, linkFocused: false, retryLabel: '' };
   let term = null;
   let disposed = false;
   let tail = '';
@@ -133,6 +134,7 @@ export async function viewProviderLogin(providerId) {
   function describe() {
     const n = step();
     switch (st.phase) {
+      case 'precheck': return { kind: 'info', spin: true, title: 'Проверяю вход', text: 'Смотрю, выполнен ли вход на сервере.' };
       case 'connecting': return { kind: 'info', spin: true, title: 'Шаг 1 из 3. Запускаю терминал', text: 'Готовлю вход на сервере.' };
       case 'waiting':
         if (screenCode) {
@@ -144,7 +146,9 @@ export async function viewProviderLogin(providerId) {
         if (n === 2) return { kind: 'attention', title: 'Шаг 2 из 3. Откройте ссылку и войдите', text: 'Сайт покажет код. Шаг 3: вставить его в поле «Код из браузера».' };
         return { kind: 'attention', title: 'Шаг 3 из 3. Вставьте код из браузера', text: 'Код действует несколько минут и только один раз.' };
       case 'checking': return { kind: 'info', spin: true, title: 'Проверяю вход', text: 'Сервер проверяет подписку и обновляет список моделей.' };
-      case 'done': return { kind: 'success', title: 'Вход выполнен', text: `${CLI_LABEL[cli] || cli} подключён. Окно входа можно закрыть, вход сохранён на сервере.` };
+      case 'done':
+        if (st.viaPrecheck) return { kind: 'success', title: 'Вход уже выполнен', text: 'Подписка подключена, список моделей обновлён. Если нужен другой аккаунт, нажмите «Войти заново».' };
+        return { kind: 'success', title: 'Вход выполнен', text: `${CLI_LABEL[cli] || cli} подключён. Окно входа можно закрыть, вход сохранён на сервере.` };
       case 'failed': return { kind: 'danger', title: st.reason || 'Вход не завершён', text: st.reasonText || 'Начните вход заново.' };
       case 'lost':
         if (st.background) return { kind: 'danger', title: 'Связь прервалась, пока приложение было свёрнуто', text: `Вход не завершён: сессия на сервере закрыта вместе с соединением.${codeInput.value.trim() ? ' Код в поле сохранён, но после нового подключения ссылка будет другой: если код не подойдёт, получите новый.' : ''} Нажмите «Подключиться снова».` };
@@ -181,7 +185,8 @@ export async function viewProviderLogin(providerId) {
     const closeBtn = (cls) => (desktop ? closeLink.replace('btn-secondary', cls) : `<a class="btn ${cls}" href="${HASH_LIST}">Закрыть</a>`);
     const restart = (label) => `<button type="button" class="btn btn-primary" data-act="restart">${ICONS.retry}${label}</button>`;
     let html;
-    if (phase === 'done') html = `<a class="btn btn-primary" href="${providerHref}">Выбрать модели</a>${closeBtn('btn-secondary')}`;
+    if (phase === 'done' && st.viaPrecheck) html = `<a class="btn btn-primary" href="${providerHref}">Закрыть</a><button type="button" class="btn btn-secondary" data-act="relogin">${ICONS.retry}Войти заново</button>`;
+    else if (phase === 'done') html = `<a class="btn btn-primary" href="${providerHref}">Выбрать модели</a>${closeBtn('btn-secondary')}`;
     else if (phase === 'failed') html = `${restart(st.retryLabel || 'Начать заново')}${closeBtn('btn-secondary')}`;
     else if (phase === 'timeout' || phase === 'error') html = `${restart('Начать заново')}${closeBtn('btn-secondary')}`;
     else if (phase === 'lost') html = `${restart('Подключиться снова')}${closeBtn('btn-secondary')}`;
@@ -203,10 +208,16 @@ export async function viewProviderLogin(providerId) {
     sendBtn.disabled = !st.open || !codeInput.value.trim();
     // Вход выполнен или сессия закончилась: ссылка и поле кода уже не нужны. Введённый код остаётся в скрытом поле.
     const finished = ended || st.phase === 'done';
-    $('#cl-form').hidden = finished || screenCode;
-    linkCard.hidden = finished || !st.link;
-    if (deviceCard) deviceCard.hidden = finished || !st.code;
-    if (keysEl) keysEl.hidden = finished;
+    // Проверка входа и «уже вошли»: терминал не нужен, вместо него короткая подсказка.
+    const idle = st.phase === 'precheck' || (st.phase === 'done' && st.viaPrecheck);
+    $('#cl-term-wrap').hidden = idle;
+    $('#cl-idle').hidden = !idle;
+    const stepsEl = $('#cl-steps');  // на телефоне списка шагов нет
+    if (stepsEl) stepsEl.hidden = idle;
+    $('#cl-form').hidden = finished || idle || screenCode;
+    linkCard.hidden = finished || idle || !st.link;
+    if (deviceCard) deviceCard.hidden = finished || idle || !st.code;
+    if (keysEl) keysEl.hidden = finished || idle;
     paintSteps();
     paintActions();
   }
@@ -308,6 +319,7 @@ export async function viewProviderLogin(providerId) {
     st.open = false;
     clearLinkTimer();
     st.phase = 'connecting';
+    st.viaPrecheck = false;
     st.link = '';
     st.code = '';
     st.opened = false;
@@ -390,6 +402,15 @@ export async function viewProviderLogin(providerId) {
     await report();
   }
 
+  // Вход уже был выполнен: показываем найденные модели, перезапуск ботов не нужен.
+  async function reportModels() {
+    let names = null;
+    try { names = (await api.listModels(true)).filter((m) => m.provider_id === providerId && m.enabled).map((m) => m.name); } catch { /* без списка */ }
+    if (disposed || st.phase !== 'done' || !st.viaPrecheck || names === null) return;
+    const list = names.length ? `<ul class="list-plain cl-models" data-i18n-skip>${names.map((n) => `<li>${esc(n)}</li>`).join('')}</ul>` : '';
+    resultEl.innerHTML = `<div class="banner banner-info" role="status"><span class="banner-text"><span class="banner-sub">${esc(`Найдено моделей: ${names.length}.`)}</span>${list}</span></div>`;
+  }
+
   async function report() {
     let models = null;
     try { models = (await api.listModels(true)).filter((m) => m.provider_id === providerId && m.enabled).length; } catch { /* без числа */ }
@@ -413,6 +434,7 @@ export async function viewProviderLogin(providerId) {
   // ---- события экрана ----
   actionsEl.addEventListener('click', (e) => {
     if (e.target.closest('[data-act="restart"]')) { const keepCode = st.phase === 'lost'; term.focus(); connect({ keepCode }); }
+    if (e.target.closest('[data-act="relogin"]')) startTerminal();
   });
   $('#cl-form').addEventListener('submit', (e) => {
     e.preventDefault();
@@ -469,13 +491,35 @@ export async function viewProviderLogin(providerId) {
   host.addEventListener('click', () => term.focus());
   const observer = new ResizeObserver(() => { clearTimeout(observer.timer); observer.timer = setTimeout(() => { if (!disposed) term.fit(); }, 120); });
   observer.observe(host);
-  // Первый fit только после раскладки и загрузки шрифтов: иначе на телефоне серверу уходит размер по умолчанию (80 колонок).
-  try { await document.fonts.ready; } catch { /* без шрифтов считаем по тому, что есть */ }
-  await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-  if (disposed) return;
-  term.fit();
-  connect();
-  if (!desktop) term.focus();
+  // Терминал открывается после раскладки и загрузки шрифтов: иначе на телефоне серверу уходит размер по умолчанию (80 колонок).
+  async function startTerminal() {
+    if (disposed) return;
+    st.phase = 'connecting';
+    st.viaPrecheck = false;
+    paint();
+    try { await document.fonts.ready; } catch { /* без шрифтов считаем по тому, что есть */ }
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    if (disposed) return;
+    term.fit();
+    connect();
+    if (!desktop) term.focus();
+  }
+  // Сначала смотрим, выполнен ли вход: если да, терминал не нужен. Любой сбой проверки (сеть, 429, не ok) ведёт в терминал.
+  // Не ждётся в конце view: экран остаётся inert, пока view не вернулся.
+  async function precheck() {
+    paint();
+    let checked = null;
+    try { checked = await api.checkProvider(providerId, { force: provider.status !== 'ok' }); } catch (err) { if (err.status === 401) return; }
+    if (disposed) return;
+    if (checked && checked.status === 'ok') {
+      provider = checked;
+      st.viaPrecheck = true;
+      setPhase('done');
+      statusEl.tabIndex = -1;
+      statusEl.focus();
+      await reportModels();
+    } else await startTerminal();
+  }
 
   // Возврат из браузера: на телефоне страница засыпает, и соединение молча обрывается. При возврате проверяем сокет
   // и честно говорим, что связь прервалась, вместо терминала, который выглядит живым.
@@ -503,6 +547,8 @@ export async function viewProviderLogin(providerId) {
     vv.addEventListener('scroll', onViewport);
     onViewport();
   }
+
+  precheck();
 
   c.setCleanup(() => {
     disposed = true;

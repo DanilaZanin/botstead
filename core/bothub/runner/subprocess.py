@@ -39,12 +39,15 @@ class SubprocessRunner:
             session_id = turn.cli_session_id
             started = asyncio.get_running_loop().time()
             exit_code = None
+            stderr_tail = b''  # хвост stderr CLI: без него в turn_error только «exited with status 1»
             try:
                 async for frame in turn.launcher.exec(turn.bot_container_id, command,
                                                        env=turn.exec_env, stdin=self.prompt(turn),
                                                        exec_id=turn.turn_id, timeout=timeout):
                     if isinstance(frame, ExecExit):
                         exit_code = frame.code
+                    elif isinstance(frame, ExecChunk) and frame.stream == 'stderr':
+                        stderr_tail = (stderr_tail + frame.data)[-2048:]
                     elif isinstance(frame, ExecChunk) and frame.stream == 'stdout':
                         for line in lines.feed(frame.data):
                             try:
@@ -52,6 +55,12 @@ class SubprocessRunner:
                             except (json.JSONDecodeError, UnicodeError):
                                 continue
                             if isinstance(message, dict):
+                                # codex/claude печатают сбой в stdout JSON-строкой ({"type":"error"} или turn.failed):
+                                # запоминаем текст, чтобы turn_error сказал причину, а не только код выхода
+                                if message.get('type') in ('error', 'turn.failed'):
+                                    err = message.get('message') or (message.get('error') or {}).get('message') if isinstance(message.get('error'), dict) else message.get('message')
+                                    if err:
+                                        stderr_tail = (stderr_tail + f' {err}'.encode())[-2048:]
                                 for event in self.parse(message):
                                     session_id = event.cli_session_id or session_id
                                     event.cli_session_id = session_id
@@ -72,7 +81,8 @@ class SubprocessRunner:
                                 event.payload['seconds'] = round(asyncio.get_running_loop().time() - started, 3)
                             yield event
                 if exit_code and turn.turn_id not in self._stopped:
-                    raise RuntimeError(f'{self.provider} exited with status {exit_code}')
+                    detail = ' '.join(stderr_tail.decode('utf-8', 'replace').split())[-300:]
+                    raise RuntimeError(f'{self.provider} exited with status {exit_code}' + (f': {detail}' if detail else ''))
             finally:
                 self._launchers.pop(turn.turn_id, None)
                 self._stopped.discard(turn.turn_id)

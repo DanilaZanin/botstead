@@ -6,7 +6,7 @@
 import * as api from './api.js';
 import { ICONS, esc, plural, modelTitle, fmtAgo, fmtDateTime, alertHtml } from './ui.js';
 import {
-  context, field, setAlert, setBusy, clearErrors, setFieldError, failure, loadingHtml, stateHtml, retryButton,
+  context, field, setAlert, setBusy, clearErrors, setFieldError, failure, isServerFault, loadingHtml, stateHtml, retryButton,
   openDialog, confirmBody, wireConfirm, confirmAction, segmentedHtml, wireSegmented, segmentedValue, isDesktop,
 } from './account.js';
 import {
@@ -52,7 +52,7 @@ export function verifyProblem(err, { compat = false, vendor } = {}) {
         title: compat ? 'Адрес не похож на сервер моделей' : 'Провайдер ответил не так, как ожидалось',
         note: 'Этот адрес отвечает не как API моделей',
         text: compat
-          ? 'Адрес ответил, но не как сервер моделей, совместимый с OpenAI: перенаправляет на другую страницу, отдаёт пустой список или другой формат. Обычно адрес заканчивается на /v1.'
+          ? 'Адрес ответил, но не как сервер моделей, совместимый с OpenAI: перенаправляет на другую страницу, отдаёт пустой список или другой формат. /v1 на конце можно не писать, а путь сервера (например /api) нужен целиком.'
           : 'Ответ пришёл, но списка моделей в нужном виде в нём нет: он пуст или в другом формате.',
       };
     case 'invalid_base_url':
@@ -61,7 +61,7 @@ export function verifyProblem(err, { compat = false, vendor } = {}) {
       }
       return {
         code: 'invalid_base_url', field: 'url', force: false, title: 'Адрес не принят', note: 'Адрес не принят: он запрещён или изменился',
-        text: 'Адрес должен начинаться с https://, не содержать логин и пароль и не вести на закрытый сетевой адрес самого сервера. Проверьте написание.',
+        text: 'Адрес должен начинаться с https://, не содержать логин и пароль и не вести на закрытый сетевой адрес самого сервера. Путь после хоста допустим (например /api), но без «..», «//», «%» и пробелов. Проверьте написание.',
       };
     default:
       return { code: 'other', field: null, force: false, title: 'Проверка не прошла', note: '', text: 'Сервер отклонил запрос. Проверьте введённые значения.' };
@@ -210,8 +210,20 @@ function providerSubtitle(p, html = false) {
   return `${name('API-ключ')}${p.has_secret ? ` · ${key(p)}` : ''}`;
 }
 
+// Модель, которую провайдер больше не отдаёт: переключатель недоступен, массовые действия её пропускают.
+const isVanished = (m) => !m.enabled && !m.manually_disabled;
+// Поиск по подстроке id и названия без учёта регистра.
+const modelMatches = (m, query) => {
+  const q = query.trim().toLowerCase();
+  return !q || m.name.toLowerCase().includes(q) || String(m.display_name || '').toLowerCase().includes(q);
+};
+// Сколько найденных моделей можно включить или выключить разом без подтверждения.
+const BULK_CONFIRM_OVER = 50;
+// Больше стольких моделей после первой проверки: подсказка, что включены все и лишние стоит выключить.
+const MANY_MODELS = 30;
+
 function modelRow(m, provider) {
-  const vanished = !m.enabled && !m.manually_disabled;
+  const vanished = isVanished(m);
   const parts = [];
   // Модели провайдера с ошибкой подписаны причиной («Ключ отклонён»), а не служебным именем модели.
   if (provider && ['error', 'pending_admin', 'unchecked'].includes(provider.status)) parts.push(unusableReason(provider));
@@ -268,8 +280,14 @@ function detailHtml(p, allModels, bots) {
   } else if (cli && p.status !== 'ok') {
     recovery = `<div class="banner banner-attention" role="status"><span class="banner-icon">${ICONS.alert}</span><span class="banner-text"><span class="banner-title">Нужен вход</span><span class="banner-sub">Войдите в аккаунт подписки: откроется окно входа.</span></span></div><div class="row gap-2"><a class="btn btn-primary" href="${loginHref}">Войти</a></div>`;
   }
+  const modelTools = `<div class="stack gap-2" data-model-tools>
+      <input id="pd-search" class="input" type="search" placeholder="Поиск модели" aria-label="Поиск модели" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false">
+      <div class="row gap-2 wrap-row"><button type="button" class="btn btn-secondary" data-act="models-enable">Включить все</button><button type="button" class="btn btn-secondary" data-act="models-disable">Выключить все</button></div>
+      <p class="t-footnote" id="pd-filter-note" hidden></p>
+      <p class="t-footnote" id="pd-bulk" role="status" aria-live="polite" hidden></p>
+    </div>`;
   const modelsBlock = models.length
-    ? `<ul class="settings-group list-plain" id="pd-models">${models.map((m) => modelRow(m, p)).join('')}</ul>
+    ? `${modelTools}<ul class="settings-group list-plain" id="pd-models">${models.map((m) => modelRow(m, p)).join('')}</ul>
        <p class="t-footnote">Включённые модели можно выбрать в настройках бота.${p.status === 'ok' ? '' : ' Пока провайдер не в порядке, выбрать их нельзя.'}</p>`
     : stateHtml({ iconHtml: ICONS.plug, title: 'Провайдер не вернул модели', text: cli && p.status !== 'ok' ? 'Список появится после входа.' : pending ? 'Список появится после одобрения администратора.' : 'Список пуст. Запросите его заново: кнопка «Проверить» выше.' });
   return `<div class="stack gap-4" data-provider="${esc(p.id)}">
@@ -302,10 +320,89 @@ function wireDetail(root, p, allModels, bots) {
   const c = context();
   const box = $('#pd-alert', root);
   const reload = () => c.rerender();
+  const list = $('#pd-models', root);
+  const search = $('#pd-search', root);
+  const filterNote = $('#pd-filter-note', root);
+  const bulkNote = $('#pd-bulk', root);
+  const own = () => allModels.filter((m) => m.provider_id === p.id);
+  const shown = () => own().filter((m) => modelMatches(m, search ? search.value : ''));
+  let bulkBusy = false;
+
+  function paintHeader() {
+    const models = own();
+    $('#pd-models-h', root).textContent = `Модели · включено ${models.filter((m) => m.enabled).length} из ${models.length}`;
+  }
+  // Список по строке поиска: скрытые модели остаются в allModels, переключатели видимых рисуются заново.
+  function paintList() {
+    if (!list) return;
+    const rows = shown();
+    list.innerHTML = rows.length ? rows.map((m) => modelRow(m, p)).join('') : `<li class="model-row"><span class="t-footnote">Ничего не найдено</span></li>`;
+    const total = own().length;
+    const filtering = search.value.trim() !== '';
+    filterNote.hidden = !filtering;
+    filterNote.textContent = filtering ? `Найдено ${rows.length} из ${total}. «Включить все» и «Выключить все» действуют на найденные модели.` : '';
+  }
+  if (search) search.addEventListener('input', paintList);
+
+  // Пачка запросов по одной модели: массового PATCH в ядре нет (/api/models/refresh только перепроверяет провайдеров).
+  async function runBulk(want, rows) {
+    const targets = rows.filter((m) => m.enabled !== want && !isVanished(m));
+    if (!targets.length) {
+      bulkNote.hidden = false;
+      bulkNote.textContent = want ? 'Все найденные модели уже включены.' : 'Все найденные модели уже выключены.';
+      return;
+    }
+    bulkBusy = true;
+    box.innerHTML = '';
+    const controls = root.querySelectorAll('[data-model-tools] button, [data-model-tools] input');
+    controls.forEach((el) => { el.disabled = true; });
+    list.inert = true;
+    list.setAttribute('aria-busy', 'true');
+    bulkNote.hidden = false;
+    const total = targets.length;
+    let done = 0;
+    let failed = null;
+    for (const m of targets) {
+      if (!root.isConnected) return;
+      bulkNote.textContent = want ? `Включаю: ${done} из ${total}` : `Выключаю: ${done} из ${total}`;
+      try { Object.assign(m, await api.patchModel(m.id, { enabled: want })); done += 1; } catch (err) { failed = err; break; }
+    }
+    if (!root.isConnected) return;
+    bulkBusy = false;
+    controls.forEach((el) => { el.disabled = false; });
+    list.inert = false;
+    list.removeAttribute('aria-busy');
+    paintList();
+    paintHeader();
+    if (failed) {
+      bulkNote.textContent = '';
+      bulkNote.hidden = true;
+      showNote(box, 'Изменены не все модели', failure(failed, `Изменено ${done} из ${total}. `).text);
+      box.firstElementChild?.focus?.();
+    } else {
+      bulkNote.textContent = want ? `Включено моделей: ${done}` : `Выключено моделей: ${done}`;
+    }
+  }
+  function askBulk(want) {
+    if (bulkBusy) return;
+    const rows = shown();
+    if (!rows.length) return;
+    if (rows.length <= BULK_CONFIRM_OVER) { runBulk(want, rows); return; }
+    const count = rows.length;
+    confirmAction({
+      title: want ? 'Включить все найденные модели?' : 'Выключить все найденные модели?',
+      subtitle: p.name,
+      text: `Найдено моделей: ${count}. Переключатели изменятся у всех найденных, сузить выбор можно поиском.`,
+      confirmLabel: want ? 'Включить' : 'Выключить',
+      danger: false,
+      run: async () => {},
+      done: () => runBulk(want, rows),
+    });
+  }
 
   root.addEventListener('change', async (e) => {
     const input = e.target.closest('input[data-model]');
-    if (!input) return;
+    if (!input || bulkBusy) return;
     const id = input.getAttribute('data-model');
     const model = allModels.find((m) => m.id === id);
     const want = input.checked;
@@ -322,8 +419,7 @@ function wireDetail(root, p, allModels, bots) {
       input.disabled = false;
       showNote(box, 'Модель не изменена', failure(err).text);
     }
-    const own = allModels.filter((m) => m.provider_id === p.id);
-    $('#pd-models-h', root).textContent = `Модели · включено ${own.filter((m) => m.enabled).length} из ${own.length}`;
+    paintHeader();
   });
 
   root.addEventListener('click', async (e) => {
@@ -344,6 +440,8 @@ function wireDetail(root, p, allModels, bots) {
     else if (name === 'delete') confirmDeleteProvider(p, bots);
     else if (name === 'revoke-private') confirmRevokePrivate(p, bots, reload);
     else if (name === 'retry') reload();
+    else if (name === 'models-enable') askBulk(true);
+    else if (name === 'models-disable') askBulk(false);
   });
 }
 
@@ -603,7 +701,7 @@ async function viewAdd() {
       </section>
       <section class="stack gap-4" data-panel="endpoint" hidden>
         ${field({ id: 'pa-ep-name', label: 'Название', value: 'Свой адрес' })}
-        ${field({ id: 'pa-url', label: 'Адрес сервера моделей', inputmode: 'url', placeholder: 'https://models.example.org/v1', hint: 'Адрес сервера моделей, совместимого с OpenAI. Обычно заканчивается на /v1.' })}
+        ${field({ id: 'pa-url', label: 'Адрес сервера моделей', inputmode: 'url', placeholder: 'https://models.example.org/v1', hint: 'Адрес сервера моделей, совместимого с OpenAI. /v1 на конце можно не писать; путь сервера (например /api) нужен.' })}
         ${field({ id: 'pa-ep-key', label: 'API-ключ', type: 'password', autocomplete: 'new-password', mono: true, hint: 'Нужен всегда. Если сервер ключ не проверяет (например, Ollama), введите любую строку.', after: pasteBtn('pa-ep-key', 'Вставить ключ из буфера') })}
         <div class="banner banner-info" role="note"><span class="banner-icon">${ICONS.lock}</span><span class="banner-text" id="pa-private"><span class="banner-title">Закрытые адреса</span><span class="banner-sub">${esc(privateNotice)}</span></span></div>
       </section>
@@ -701,12 +799,13 @@ async function viewAdd() {
   }
 
   // Итоговый экран: поля формы вместе с введённым ключом убираются из разметки.
-  function showResult({ tone, title, text, link, linkLabel }) {
+  function showResult({ tone, title, text, hint = '', link, linkLabel }) {
     const attention = tone === 'attention';
     form.innerHTML = `<div class="state-box ${attention ? '' : 'state-ok'}" role="status">
       <span class="state-icon" aria-hidden="true" style="color:var(${attention ? '--attention-text' : '--success-fg'});">${attention ? ICONS.alert : ICONS.check}</span>
       <h2 class="state-title">${esc(title)}</h2>
       <p class="t-footnote state-text">${esc(text)}</p>
+      ${hint ? `<p class="t-footnote state-text" data-many-models>${esc(hint)}</p>` : ''}
       <div class="state-actions desktop-only"><a class="btn btn-primary" href="${link}">${esc(linkLabel)}</a></div>
     </div>`;
     const bar = c.app.querySelector('.action-bar');
@@ -716,6 +815,7 @@ async function viewAdd() {
     showResult({
       tone: 'ok', title: 'Провайдер отвечает',
       text: `${created.name}${count === null ? '' : `. Найдено моделей: ${count}`}.${googleNote ? ' Привязать Google API к боту пока нельзя.' : ''}`,
+      hint: count > MANY_MODELS ? `Включены все ${count}. Выключите лишние на экране провайдера: поиск и кнопка «Выключить все».` : '',
       link: `${HASH_LIST}/${esc(created.id)}`, linkLabel: 'Выбрать модели',
     });
   }
@@ -754,6 +854,7 @@ async function viewAdd() {
       target.focus();
     } else if (err.status === 403) setAlert(failBox, 'Нужны права администратора', 'Провайдер не сохранён: это действие доступно только администратору.');
     else if (err.status === 400) setAlert(failBox, 'Данные не приняты', 'Проверьте поля формы. Провайдер не сохранён.');
+    else if (isServerFault(err)) setAlert(failBox, 'Ошибка сервера при сохранении', failure(err).text);
     else setAlert(failBox, failure(err).title, `Провайдер не сохранён. ${failure(err).text}`);
   }
 
@@ -856,11 +957,25 @@ function groupNote(provider) {
   return 'ключ, оплата по токенам';
 }
 
-function optionsHtml(groups, selectedId) {
+// Провайдер с сотнями моделей: в выборе показываются первые PICK_LIMIT совпадений поиска, выбранная модель остаётся в списке всегда.
+const PICK_LIMIT = 12;
+const needsSearch = (groups) => groups.some((g) => g.models.length > PICK_LIMIT);
+
+// Модели группы для показа: { items, matched } (matched: сколько нашлось всего, до обрезки).
+function visibleModels(group, selectedId, query) {
+  const big = group.models.length > PICK_LIMIT;
+  const matched = group.models.filter(({ model }) => modelMatches(model, query));
+  const items = big ? matched.slice(0, PICK_LIMIT) : matched;
+  const pinned = selectedId && !items.some(({ model }) => model.id === selectedId) ? group.models.find(({ model }) => model.id === selectedId) : null;
+  return { items: pinned ? [pinned, ...items] : items, matched: matched.length, big };
+}
+
+function optionsHtml(groups, selectedId, query = '') {
   let first = true;
-  const body = groups.map((g) => `<div class="model-group">
+  const views = groups.map((g) => ({ g, ...visibleModels(g, selectedId, query) })).filter((v) => v.items.length);
+  const body = views.map(({ g, items, matched, big }) => `<div class="model-group">
       <div class="model-group-head"><span class="t-callout" data-i18n-skip>${esc(g.provider.name)}</span><span class="t-footnote">${esc(groupNote(g.provider))}</span></div>
-      ${g.models.map(({ model, usable, reason }) => {
+      ${items.map(({ model, usable, reason }) => {
     const checked = model.id === selectedId;
     const tab = checked || (!selectedId && usable && first) ? 0 : -1;
     if (usable) first = false;
@@ -869,8 +984,15 @@ function optionsHtml(groups, selectedId) {
           <span class="model-option-text"><span class="model-option-title">${esc(modelTitle(model.name, model.display_name))}</span>${checked || reason ? `<span class="model-option-sub">${esc(checked ? `сейчас выбрана${reason ? ` · ${reason.toLowerCase()}` : ''}` : reason)}</span>` : ''}</span>
         </button>`;
   }).join('')}
+      ${big && matched > PICK_LIMIT ? `<p class="t-footnote" data-pick-more>Показаны первые ${PICK_LIMIT} из ${matched}. Уточните поиск.</p>` : ''}
     </div>`).join('');
-  return `<div role="radiogroup" aria-label="Модель бота" class="stack gap-3">${body}</div>`;
+  const empty = views.length ? '' : '<p class="t-footnote" data-pick-empty>Ничего не найдено</p>';
+  return `<div role="radiogroup" aria-label="Модель бота" class="stack gap-3">${body}${empty}</div>`;
+}
+
+// Поле поиска над выбором: только если у какого-то провайдера больше PICK_LIMIT моделей.
+function pickSearchHtml(groups) {
+  return needsSearch(groups) ? '<input type="search" class="input" data-pick-search placeholder="Поиск модели" aria-label="Поиск модели" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false">' : '';
 }
 
 function noModelsState() {
@@ -894,6 +1016,8 @@ export function renderModelPicker(container, opts) {
     return;
   }
   let selectedId = opts.selected();
+  let query = '';
+  const searchHtml = pickSearchHtml(groups);
   const find = (id) => groups.flatMap((g) => g.models.map((m) => ({ provider: g.provider, model: m.model }))).find((x) => x.model.id === id);
   const currentLabel = () => {
     const hit = find(selectedId);
@@ -914,7 +1038,7 @@ export function renderModelPicker(container, opts) {
       setAlert(alertBox, title, text);
     }
     const clicked = radio.getAttribute('data-model');
-    scope.innerHTML = optionsHtml(groups, selectedId);
+    scope.innerHTML = optionsHtml(groups, selectedId, query);
     wireOptions(scope, alertBox);
     paintTrigger();
     scope.querySelector(`[data-model="${clicked}"]`)?.focus();
@@ -927,6 +1051,15 @@ export function renderModelPicker(container, opts) {
       if (radio && !radio.disabled) pick(radio, alertBox, scope);
     });
   }
+  // Поле поиска живёт вне списка: список перерисовывается при выборе, строка поиска остаётся.
+  function wireSearch(scope, alertBox, input) {
+    if (!input) return;
+    input.addEventListener('input', () => {
+      query = input.value;
+      scope.innerHTML = optionsHtml(groups, selectedId, query);
+      wireOptions(scope, alertBox);
+    });
+  }
   function paintTrigger() {
     const trigger = container.querySelector('[data-pick-open]');
     if (!trigger) return;
@@ -935,22 +1068,25 @@ export function renderModelPicker(container, opts) {
   }
 
   if (isDesktop()) {
-    container.innerHTML = `${noteHtml}<div class="form-alert" data-pick-alert aria-live="polite"></div><div data-pick-body></div>`;
+    container.innerHTML = `${noteHtml}<div class="form-alert" data-pick-alert aria-live="polite"></div>${searchHtml}<div data-pick-body></div>`;
     const scope = container.querySelector('[data-pick-body]');
-    scope.innerHTML = optionsHtml(groups, selectedId);
+    scope.innerHTML = optionsHtml(groups, selectedId, query);
     wireOptions(scope, container.querySelector('[data-pick-alert]'));
+    wireSearch(scope, container.querySelector('[data-pick-alert]'), container.querySelector('[data-pick-search]'));
     return;
   }
   container.innerHTML = '<button type="button" class="select-btn model-trigger" data-pick-open aria-haspopup="dialog"></button>';
   paintTrigger();
   container.querySelector('[data-pick-open]').addEventListener('click', () => {
+    query = '';
     const dlg = openDialog({
       title: 'Модель бота',
       subtitle: opts.sheetSubtitle || 'Действует со следующего сообщения',
-      content: `${noteHtml}<div class="form-alert" id="mp-alert" aria-live="polite"></div><div id="mp-body">${optionsHtml(groups, selectedId)}</div><div class="dialog-foot"><button type="button" class="btn btn-primary btn-block" data-close>Готово</button></div>`,
+      content: `${noteHtml}<div class="form-alert" id="mp-alert" aria-live="polite"></div>${searchHtml}<div id="mp-body">${optionsHtml(groups, selectedId)}</div><div class="dialog-foot"><button type="button" class="btn btn-primary btn-block" data-close>Готово</button></div>`,
       focus: 'dialog',
     });
     wireOptions($('#mp-body', dlg.el), $('#mp-alert', dlg.el));
+    wireSearch($('#mp-body', dlg.el), $('#mp-alert', dlg.el), dlg.el.querySelector('[data-pick-search]'));
     const start = dlg.el.querySelector('[role="radio"][aria-checked="true"]') || dlg.el.querySelector('[role="radio"]:not([disabled])');
     if (start) start.focus();
   });
