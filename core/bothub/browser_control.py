@@ -77,7 +77,9 @@ class RFBClientFilter:
                 elif kind == 6:
                     if len(self.buffer) < 8:
                         break
-                    count = struct.unpack("!I", self.buffer[4:8])[0]
+                    # Extended Clipboard (noVNC, x11vnc): длина отрицательная со знаком, модуль = размер тела.
+                    # Без этого первое же сообщение noVNC после ServerInit закрывало экран (rfb_cut_text_too_large).
+                    count = abs(struct.unpack("!i", self.buffer[4:8])[0])
                     if count > 1024 * 1024:
                         raise RFBProtocolError("rfb_cut_text_too_large")
                     length = 8 + count

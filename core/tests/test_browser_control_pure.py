@@ -121,3 +121,22 @@ def test_human_url_turns_the_host_into_punycode(url, expected):
 def test_human_url_keeps_every_other_refusal(url):
     from bothub.browser_control import human_url
     assert human_url(url) is None
+
+
+@pytest.mark.pure
+def test_rfb_filter_accepts_extended_clipboard_caps_message():
+    # noVNC шлёт ClientCutText с отрицательной длиной (Extended Clipboard) сразу после ServerInit
+    import struct
+    from bothub.browser_control import RFBClientFilter
+    parser = RFBClientFilter()
+    parser.feed(b"RFB 003.008\n", allow_input=False)
+    parser.feed(b"\x01", allow_input=False)
+    parser.feed(b"\x01", allow_input=False)
+    body = b"\x10\x00\x00\x00" + b"\x00\x00\x00\x00"  # flags caps + одна запись
+    message = b"\x06\x00\x00\x00" + struct.pack("!i", -len(body)) + body
+    assert parser.feed(message, allow_input=False) == b""  # буфер обмена это ввод: в режиме bot не пропускается
+    assert parser.buffer == bytearray()
+    parser2 = RFBClientFilter()
+    for part in (b"RFB 003.008\n", b"\x01", b"\x01"):
+        parser2.feed(part, allow_input=True)
+    assert parser2.feed(message, allow_input=True) == message

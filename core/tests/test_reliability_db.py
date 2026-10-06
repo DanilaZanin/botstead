@@ -684,3 +684,99 @@ async def test_mac_call_approval_applies_only_to_same_tool_and_args():
         assert (await call({"text": "other text"})).status_code == 403   # другие аргументы
         assert (await call({"text": "hello", "x": 1})).status_code == 403
         assert (await call({"text": "hello"})).status_code == 409        # одобренная операция дошла до Mac (агент офлайн)
+
+
+# ---- закрытие turn'а закрывает его pending-одобрения (approval_dec expired, как при истечении по сроку) ----------
+
+async def approval_status(app, approval_id):
+    async with app.state.pool.acquire() as con:
+        return await con.fetchrow("select status, decided_at from bothub.approvals where id=$1", approval_id)
+
+
+def _decisions(evs):
+    return [e for e in evs if e["kind"] == "approval_dec"]
+
+
+async def test_recover_stale_turns_expires_pending_approvals_of_the_turn():
+    async with api(manual=True) as (client, app, _):
+        await make_bot(client)
+        thread = await make_thread(client)
+        stale = await insert_turn(app, thread["id"], "waiting_approval", lease="now()-interval '1 minute'")
+        first = await insert_approval(app, thread["id"], stale["id"])
+        second = await insert_approval(app, thread["id"], stale["id"], tool="send_mail")
+        decided = await insert_approval(app, thread["id"], stale["id"], status="approved")
+        await app.state.recover_stale_turns()
+        assert await turn_status(app, stale["id"]) == "error"
+        for approval in (first, second):
+            row = await approval_status(app, approval["id"])
+            assert row["status"] == "expired" and row["decided_at"] is not None
+        assert (await approval_status(app, decided["id"]))["status"] == "approved"  # уже решённое не трогаем
+        evs = await events(client, thread["id"])
+        found = _decisions(evs)
+        assert sorted(e["payload"]["approval_id"] for e in found) == sorted([str(first["id"]), str(second["id"])])
+        assert all(e["payload"] == {"approval_id": e["payload"]["approval_id"], "decision": "expired", "remember": False,
+                                    "client": "system"} and e["actor"] == "system" for e in found)
+        status_seq = [e["seq"] for e in evs if e["kind"] == "status" and e["payload"].get("status") == "error"]
+        assert status_seq and all(e["seq"] < status_seq[-1] for e in found)  # решения идут раньше закрытия turn'а
+
+
+async def test_recover_stale_turns_leaves_approvals_of_a_live_turn_pending():
+    async with api(manual=True) as (client, app, _):
+        await make_bot(client)
+        thread = await make_thread(client)
+        live = await insert_turn(app, thread["id"], "waiting_approval")  # lease на час вперёд: не stale
+        approval = await insert_approval(app, thread["id"], live["id"])
+        await app.state.recover_stale_turns()
+        assert await turn_status(app, live["id"]) == "waiting_approval"
+        assert (await approval_status(app, approval["id"]))["status"] == "pending"
+        assert not _decisions(await events(client, thread["id"]))
+
+
+async def test_recover_stale_turns_twice_does_not_repeat_the_decisions():
+    async with api(manual=True) as (client, app, _):
+        await make_bot(client)
+        thread = await make_thread(client)
+        stale = await insert_turn(app, thread["id"], "running", lease="now()-interval '1 minute'")
+        await insert_approval(app, thread["id"], stale["id"])
+        await app.state.recover_stale_turns()
+        await app.state.recover_stale_turns()
+        assert len(_decisions(await events(client, thread["id"]))) == 1
+
+
+async def test_runner_exit_expires_pending_approvals_of_the_turn():
+    box = {}
+
+    async def wait_with_approval(turn):
+        async with box["app"].state.pool.acquire() as con:
+            await con.execute("update bothub.turns set status='waiting_approval' where id=$1", uuid.UUID(turn.turn_id))
+        box["approval"] = await insert_approval(box["app"], box["thread"], uuid.UUID(turn.turn_id))
+
+    runner = Runner(events=[], before=wait_with_approval)
+    async with api(runner) as (client, app, _):
+        box["app"] = app
+        await make_bot(client)
+        thread = await make_thread(client)
+        box["thread"] = thread["id"]
+        turn = await post_turn(client, thread["id"])
+        await until(lambda: _is(app, turn["id"], "error"))
+        assert (await approval_status(app, box["approval"]["id"]))["status"] == "expired"
+        evs = await events(client, thread["id"])
+        assert any(e["kind"] == "guard" and e["payload"]["reason"] == "runner_exited" for e in evs)
+        found = _decisions(evs)
+        assert len(found) == 1 and found[0]["payload"]["approval_id"] == str(box["approval"]["id"])
+        assert found[0]["payload"]["decision"] == "expired"
+
+
+async def test_expiry_sweep_also_expires_the_other_pending_approvals_of_the_turn():
+    async with api() as (client, app, runner):
+        await make_bot(client)
+        thread = await make_thread(client)
+        turn = await insert_turn(app, thread["id"], "waiting_approval")
+        due = await insert_approval(app, thread["id"], turn["id"], expires="now()-interval '1 minute'")
+        other = await insert_approval(app, thread["id"], turn["id"], tool="send_mail")  # срок через час
+        await app.state.deliver_outbox()  # expire_approvals -> fail_turn(approval_expired)
+        assert await turn_status(app, turn["id"]) == "error"
+        assert (await approval_status(app, other["id"]))["status"] == "expired"
+        found = _decisions(await events(client, thread["id"]))
+        assert sorted(e["payload"]["approval_id"] for e in found) == sorted([str(due["id"]), str(other["id"])])
+        assert runner.runs == 0

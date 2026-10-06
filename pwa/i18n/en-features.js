@@ -983,4 +983,6 @@ export default {
   'Уже решено': 'Already decided',
   'Ход прерван': 'Turn interrupted',
   'срок одобрения вышел': 'approval expired',
+  'Ключ не проверен': 'Key not verified',
+  'Сервер принял запрос без ключа: ключ не проверен. Если ключ неверный, бот получит отказ при первом запросе.': 'The server accepted a request without a key, so the key is not verified. If the key is wrong, the bot will get a rejection on its first request.',
 };

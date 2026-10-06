@@ -1,5 +1,6 @@
 """recover_stale_turns: три записи одного turn идут одной транзакцией, отмена посередине ничего не оставляет."""
 import asyncio
+import json
 import uuid
 from contextlib import asynccontextmanager
 
@@ -135,3 +136,87 @@ async def test_cancel_after_the_first_turn_keeps_that_turn_whole(monkeypatch):
         await task
     assert [item[0] for item in pool.connection.committed] == ["turn", "bot", "seq", "event"]
     assert pool.connection.committed[0][1] == TURNS[0]
+
+
+APPROVALS = [uuid.UUID(int=10), uuid.UUID(int=11)]
+
+
+class ApprovalConnection(TxConnection):
+    """TxConnection плюс pending-одобрения turn'а: expire-запрос отдаёт их и пишет «approval» в той же транзакции;
+    события запоминаются вместе с видом, актором и payload."""
+
+    def __init__(self, turns, approvals, hook=None):
+        super().__init__(turns, hook)
+        self.approvals = {turn: list(ids) for turn, ids in approvals.items()}
+        self.events = []
+
+    async def fetch(self, query, *args):
+        if "update bothub.approvals set status='expired'" in query and "turn_id=$1 and status='pending'" in query:
+            ids = self.approvals.pop(args[0], [])
+            for approval in ids:
+                await self.write("approval", approval)
+            return [{"id": approval} for approval in ids]
+        return await super().fetch(query, *args)
+
+    async def fetchrow(self, query, *args):
+        row = await super().fetchrow(query, *args)
+        if "insert into bothub.events" in query:
+            payload = json.loads(args[6])
+            self.events.append((args[3], args[4], payload))
+            return {**row, "kind": args[3], "payload": payload}
+        return row
+
+
+def make_approval_pool(turns, approvals, hook=None):
+    pool = TxPool(turns, hook)
+    pool.connection = ApprovalConnection(turns, approvals, hook)
+    return pool
+
+
+async def test_pending_approvals_of_a_stale_turn_expire_with_it_in_one_transaction(monkeypatch):
+    pool = make_approval_pool(TURNS[:1], {TURNS[0]: APPROVALS})
+    await make_app(monkeypatch, pool).state.recover_stale_turns()
+    kinds = [item[0] for item in pool.connection.committed]
+    # turn, bot, один UPDATE одобрений, по паре (seq, event) на каждое одобрение, затем status-событие
+    assert kinds == ["turn", "bot", "approval", "approval", "seq", "event", "seq", "event", "seq", "event"]
+    decisions = [(actor, payload) for kind, actor, payload in pool.connection.events if kind == "approval_dec"]
+    assert [payload["approval_id"] for _, payload in decisions] == [str(item) for item in APPROVALS]
+    for actor, payload in decisions:  # тот же вид, что у истечения по сроку (expire_approvals)
+        assert actor == "system"
+        assert payload == {"approval_id": payload["approval_id"], "decision": "expired", "remember": False, "client": "system"}
+    assert pool.connection.events[-1][0] == "status" and pool.connection.events[-1][2]["status"] == "error"
+
+
+async def test_turn_without_pending_approvals_closes_as_before(monkeypatch):
+    pool = make_approval_pool(TURNS[:1], {})
+    await make_app(monkeypatch, pool).state.recover_stale_turns()
+    assert [item[0] for item in pool.connection.committed] == ["turn", "bot", "seq", "event"]
+    assert [kind for kind, _, _ in pool.connection.events] == ["status"]
+
+
+async def test_approvals_of_each_stale_turn_expire_with_that_turn_only(monkeypatch):
+    pool = make_approval_pool(TURNS, {TURNS[0]: APPROVALS[:1], TURNS[1]: APPROVALS[1:]})
+    await make_app(monkeypatch, pool).state.recover_stale_turns()
+    decided = [payload["approval_id"] for kind, _, payload in pool.connection.events if kind == "approval_dec"]
+    assert decided == [str(item) for item in APPROVALS]
+    assert pool.connection.approvals == {}
+
+
+async def test_cancel_after_the_approvals_expired_leaves_none_of_the_writes(monkeypatch):
+    reached = asyncio.Event()
+    seen = []
+
+    async def hang_on_the_status_event(kind):
+        if kind == "event":
+            seen.append(kind)
+            if len(seen) == 2:  # approval_dec записано, status-событие нет
+                reached.set()
+                await asyncio.sleep(3600)
+
+    pool = make_approval_pool(TURNS[:1], {TURNS[0]: APPROVALS[:1]}, hang_on_the_status_event)
+    task = asyncio.create_task(make_app(monkeypatch, pool).state.recover_stale_turns())
+    await asyncio.wait_for(reached.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert pool.connection.committed == [], "одобрение не закрыто без закрытия turn'а"

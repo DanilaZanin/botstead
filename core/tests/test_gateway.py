@@ -466,7 +466,7 @@ async def test_parallel_limit_records_rejection():
         release.set()
         assert (await first).status_code == 200
     assert sorted(row[-1] for row in observed) == [200]
-    assert client.gateway_router.pre_route_counts[429] == 1
+    assert client.gateway_router.pre_route_counts == {(429, "gateway concurrency limit"): 1}
 
 
 @pytest.mark.asyncio
@@ -1084,7 +1084,8 @@ async def test_accounting_pre_route():
         put = await client.put("/gateway/p1/v1/responses", headers=auth)
     assert [missing.status_code, unsupported.status_code, wrong_method.status_code, put.status_code] == [401, 404, 404, 405]
     assert observed == []
-    assert client.gateway_router.pre_route_counts == {401: 1, 404: 2, 405: 1, 429: 0}
+    assert client.gateway_router.pre_route_counts == {(401, "one gateway token is required"): 1, (404, "unsupported gateway route"): 2,
+                                                      (405, "unsupported gateway method"): 1}
 
 @pytest.mark.asyncio
 async def test_owner_connection_limit_across_bots():
@@ -1124,7 +1125,7 @@ async def test_owner_connection_limit_across_bots():
             assert (await first).status_code == 200
     finally:
         await router.shutdown()
-    assert router.pre_route_counts[429] == 1
+    assert router.pre_route_counts == {(429, "gateway connection limit"): 1}
     assert len(usage) == 1
 
 @pytest.mark.asyncio

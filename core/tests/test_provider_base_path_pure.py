@@ -82,7 +82,8 @@ async def test_probe_uses_the_base_path(monkeypatch, kind, base, expected):
         return httpx.Response(200, json={'models': [{'name': 'models/g1'}]} if kind == 'google_api' else {'data': [{'id': 'm1'}]})
     monkeypatch.setattr('bothub.main.PROBE_TRANSPORT', httpx.MockTransport(upstream))
     names = await fetch_provider_models(kind, base, GOOD_KEY, resolver=public_resolver)
-    assert names and len(seen) == 1
+    assert names and len(seen) == (2 if kind.startswith('openai') else 1)  # у openai-совместимых второй запрос с неверным ключом
+    assert all(request.url.path == expected for request in seen)
     assert seen[0].url.path == expected and seen[0].url.host == '8.8.8.8' and seen[0].headers['host'] == 'api.example'
 
 

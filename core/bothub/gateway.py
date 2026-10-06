@@ -23,6 +23,14 @@ from .secrets import issue_gateway_token, verify_gateway_token, gateway_token_tu
 
 
 logger = logging.getLogger(__name__)
+PRE_ROUTE_LOG_INTERVAL = 60
+
+
+def pre_route_clock() -> float:
+    """Часы для интервала лога отказов: отдельная функция, чтобы тест подменял их, не трогая монотонные часы цикла событий."""
+    return time.monotonic()
+
+
 DEFAULT_ANTHROPIC_BETAS = ("claude-code-20250219",)
 MAX_UPSTREAM_USAGE_TOKENS = 1_000_000_000
 
@@ -547,15 +555,17 @@ def create_gateway_router(
     router = GatewayRouter(transport=transport, token_secret=token_secret, token_ttl=token_ttl)
     semaphores: dict[str, asyncio.Semaphore] = {}
     owner_semaphores: dict[str, asyncio.Semaphore] = {}
-    router.pre_route_counts = {401: 0, 404: 0, 405: 0, 429: 0}
-    last_pre_route_log = time.monotonic()
+    # Отказы до маршрутизации по паре (статус, detail): по одному коду 401 не понять, что именно не так (токен, ход, число токенов).
+    router.pre_route_counts = {}
+    last_pre_route_log = pre_route_clock()
 
     def pre_route(status: int, detail: str):
         nonlocal last_pre_route_log
-        router.pre_route_counts[status] += 1
-        now = time.monotonic()
-        if now - last_pre_route_log >= 60:
-            logger.info("gateway pre-route rejects: %s", router.pre_route_counts)
+        key = (status, detail)
+        router.pre_route_counts[key] = router.pre_route_counts.get(key, 0) + 1
+        now = pre_route_clock()
+        if now - last_pre_route_log >= PRE_ROUTE_LOG_INTERVAL:
+            logger.info("gateway pre-route rejects: %s", {f"{code} {text}": count for (code, text), count in router.pre_route_counts.items()})
             last_pre_route_log = now
         raise HTTPException(status, detail)
 
@@ -736,6 +746,10 @@ def create_gateway_router(
                 safe = {key: str(error[key]).replace(provider.api_key, "***").encode("utf-8")[:2048].decode("utf-8", "ignore")
                         for key in ("type", "code", "message")
                         if type(error.get(key)) in {str, int, float}}
+                if status in (401, 403):
+                    # Причина отказа апстрима видна только CLI в контейнере бота; в лог идёт очищенный текст без заголовков и ключа.
+                    reason = json.dumps(safe, ensure_ascii=False) if safe else bytes(raw_error).decode("utf-8", "replace").replace(provider.api_key, "***")
+                    logger.warning("gateway upstream rejected", extra={"provider_id": provider.id, "status": status, "body": reason[:200]})
                 return JSONResponse({"error": safe}, status_code=status)
             if content_type.lower().startswith("text/event-stream"):
                 async def events():

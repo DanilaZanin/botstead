@@ -29,7 +29,8 @@ def provider_env(monkeypatch):
     calls = []
 
     def upstream(request):
-        calls.append(request)
+        if not request.headers.get('authorization', '').startswith('Bearer invalid-'):
+            calls.append(request)  # считаем пробы с настоящим ключом; запрос с заведомо неверным ключом (key_verified) не в счёт
         if request.headers.get('authorization') == f'Bearer {KEY}' or 'good' in request.headers.get('authorization', ''):
             return httpx.Response(200, json={'data': [{'id': 'm1'}, {'id': 'm2'}]})
         return httpx.Response(401, json={'error': 'bad key'})
@@ -271,3 +272,40 @@ async def test_empty_base_url_patch_is_a_400_against_postgres():
                                           json={'secret': KEY, 'base_url': '', **extra})
             assert response.status_code == 400 and response.json()['error'] == 'invalid_base_url', response.text
         assert (await row_of(app, created.json()['id']))['base_url'] is None
+
+
+async def test_migration_024_adds_nullable_key_verified():
+    async with client_for() as (_, app):
+        async with app.state.pool.acquire() as con:
+            column = await con.fetchrow("select data_type, is_nullable from information_schema.columns "
+                                        "where table_schema='bothub' and table_name='providers' and column_name='key_verified'")
+            assert column['data_type'] == 'boolean' and column['is_nullable'] == 'YES'
+            owner = await con.fetchval("select id from bothub.users where email='fixture@example.com'")
+            row = await con.fetchrow("insert into bothub.providers(owner_id,kind,name,base_url,secret_encrypted,status) "
+                                     "values($1,'openai_compatible','old','https://x.example',decode('00','hex'),'ok') returning *", owner)
+            assert row['key_verified'] is None  # строки до миграции и подписочные провайдеры: не определено
+            assert await con.fetchval("select 1 from bothub.schema_migrations where name='024_provider_key_verified.sql'") == 1
+
+
+async def test_key_verified_is_stored_on_create_check_and_patch(monkeypatch):
+    async with client_for() as (client, app):
+        created = await client.post('/api/providers', headers=OWNER, json={
+            'kind': 'openai_compatible', 'name': 'Strict', 'base_url': 'https://api.example', 'secret': KEY})
+        assert created.status_code == 201, created.text
+        assert created.json()['key_verified'] is True  # неверный ключ сервер отверг (401)
+        assert (await row_of(app, created.json()['id']))['key_verified'] is True
+        # сервер, который отвечает 200 на любой ключ (как OpenRouter): статус ok, ключ не проверен
+        monkeypatch.setattr('bothub.main.PROBE_TRANSPORT', httpx.MockTransport(lambda request: httpx.Response(200, json={'data': [{'id': 'm1'}]})))
+        loose = await client.post('/api/providers', headers=OWNER, json={
+            'kind': 'openai_compatible', 'name': 'Loose', 'base_url': 'https://api.example', 'secret': KEY})
+        assert loose.status_code == 201 and loose.json()['status'] == 'ok' and loose.json()['key_verified'] is False
+        assert (await row_of(app, loose.json()['id']))['key_verified'] is False
+        listed = {item['name']: item['key_verified'] for item in (await client.get('/api/providers', headers=OWNER)).json()}
+        assert listed == {'Strict': True, 'Loose': False}
+        # force: проба не шла, значение сбрасывается в null
+        forced = await client.patch(f"/api/providers/{loose.json()['id']}", headers=OWNER, json={'secret': KEY, 'force': True})
+        assert forced.status_code == 200 and forced.json()['key_verified'] is None
+        assert (await row_of(app, loose.json()['id']))['key_verified'] is None
+        # повторная проверка (после force провайдер unchecked, кэша нет) снова определяет значение
+        checked = await client.post(f"/api/providers/{loose.json()['id']}/check", headers=OWNER)
+        assert checked.status_code == 200 and checked.json()['status'] == 'ok' and checked.json()['key_verified'] is False

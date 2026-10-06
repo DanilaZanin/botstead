@@ -153,16 +153,62 @@ def canonical_ip(item) -> str:
     return str(address)
 
 
+class ProbedModels(list):
+    """Имена моделей из пробного запроса плюс key_verified: True сервер отверг заведомо неверный ключ (или сам проверил
+    настоящий: anthropic, google), False принял его (ключ сервером не проверяется), None второй запрос не дал ответа."""
+    key_verified: bool | None = None
+
+
+async def probe_unkeyed(client, url: str, headers: dict, hostname: str, budget: float) -> bool | None:
+    """Тот же путь с заведомо неверным ключом (`Bearer invalid-` и 16 случайных символов), только у openai-совместимых серверов.
+
+    401/403: сервер ключ смотрит (True). 2xx: список моделей публичный, ключ не проверен (False, так у OpenRouter).
+    Сеть, таймаут, 5xx и остальные коды: None. Тело ответа не читается."""
+    if budget <= 0:
+        return None
+    request = client.build_request('GET', url, headers={**headers, 'authorization': 'Bearer invalid-' + secrets.token_hex(8)})
+    request.extensions['sni_hostname'] = hostname
+    try:
+        async with asyncio.timeout(budget):
+            response = await client.send(request, stream=True)
+            try:
+                status = response.status_code
+            finally:
+                await response.aclose()
+    except (httpx.HTTPError, OSError, TimeoutError):
+        return None
+    if status in (401, 403): return True
+    if 200 <= status < 300: return False
+    return None
+
+
+def model_names(kind: str, body: bytes | bytearray) -> list[str]:
+    """Имена моделей из тела ответа списка; ProbeError('incompatible'), если разобрать нечего."""
+    try:
+        payload = json.loads(body)
+        entries = payload.get('models' if kind == 'google_api' else 'data', [])
+        names = [item.get('name', '').removeprefix('models/') if kind == 'google_api' else item.get('id', '')
+                 for item in entries if isinstance(item, dict)]
+    except (ValueError, AttributeError, TypeError):
+        raise ProbeError('incompatible', 'provider returned an unexpected model list') from None
+    if not names: raise ProbeError('incompatible', 'provider returned no models')
+    return names
+
+
 async def fetch_provider_models(kind: str, base_url: str | None, key: str, *, allow_private: bool = False,
-                                approved_ips=None, forbidden=(), resolver=None) -> list[str]:
+                                approved_ips=None, forbidden=(), resolver=None) -> ProbedModels:
     """Один пробный запрос списка моделей через закреплённый проверенный IP. Бросает ProbeError(code, message).
 
     Разрешение DNS входит в PROVIDER_CHECK_TIMEOUT. approved_ips: одобренные администратором приватные IP (None: без ограничения).
-    base_path адреса (split_base) уже в `pinned`: https://host/api и https://host/api/v1 оба идут на /api/v1/models."""
+    base_path адреса (split_base) уже в `pinned`: https://host/api и https://host/api/v1 оба идут на /api/v1/models.
+
+    openai_compatible и openai_api после успешного ответа получают второй запрос с неверным ключом (ProbedModels.key_verified);
+    он делит с первым один PROVIDER_CHECK_TIMEOUT: на него остаётся то, что не потратил первый, за вычетом секунды запаса."""
     path = '/v1beta/models' if kind == 'google_api' else '/v1/models'
     body = bytearray()
+    key_verified = None
     try:
-        async with asyncio.timeout(PROVIDER_CHECK_TIMEOUT):
+        async with asyncio.timeout(PROVIDER_CHECK_TIMEOUT) as scope:
             try:
                 origin, pinned, hostname = await _validated_target(base_url or DEFAULT_PROVIDER_BASES[kind], private_allow_hosts(),
                                                                    resolver or _resolve_host, allow_private, approved_ips, forbidden)
@@ -191,19 +237,19 @@ async def fetch_provider_models(kind: str, base_url: str | None, key: str, *, al
                         if len(body) > 1024 * 1024: raise ProbeError('incompatible', 'model response too large')
                 finally:
                     await response.aclose()
+                names = model_names(kind, body)  # непригодный список: ProbeError до второго запроса
+                if kind in ('openai_compatible', 'openai_api'):
+                    budget = scope.when() - asyncio.get_running_loop().time() - 1
+                    key_verified = await probe_unkeyed(client, pinned + path, headers, hostname, budget)
+                else:
+                    key_verified = True  # anthropic и google отвечают 401 на неверный ключ: 200 на настоящем уже проверка
     except ProbeError:
         raise
     except (httpx.HTTPError, OSError, TimeoutError):
         raise ProbeError('unreachable', 'provider unreachable') from None
-    try:
-        payload = json.loads(body)
-        entries = payload.get('models' if kind == 'google_api' else 'data', [])
-        names = [item.get('name', '').removeprefix('models/') if kind == 'google_api' else item.get('id', '')
-                 for item in entries if isinstance(item, dict)]
-    except (ValueError, AttributeError, TypeError):
-        raise ProbeError('incompatible', 'provider returned an unexpected model list') from None
-    if not names: raise ProbeError('incompatible', 'provider returned no models')
-    return names
+    result = ProbedModels(names)
+    result.key_verified = key_verified
+    return result
 
 log = logging.getLogger('bothub')
 ACTIVE_STATUSES = ('running', 'waiting_approval', 'waiting_mac')
@@ -1238,6 +1284,14 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         background.add(retry)
         retry.add_done_callback(lambda task: (background.discard(task), stop_retries.pop(key, None)))
 
+    async def expire_turn_approvals(con, thread_id, turn_id, *, fanout=True):
+        """Закрывает все pending-одобрения turn'а как expired и пишет approval_dec в том же виде, что истечение по сроку
+        (expire_approvals). Возвращает события; при fanout=False их публикует вызывающий после коммита."""
+        events = []
+        for approval in await con.fetch("update bothub.approvals set status='expired',decided_at=now() where turn_id=$1 and status='pending' returning id", turn_id):
+            events.append(await append_event(con, thread_id, turn_id, 'approval_dec', 'system', {'approval_id': str(approval['id']), 'decision': 'expired', 'remember': False, 'client': 'system'}, fanout=fanout))
+        return events
+
     async def fail_turn(turn_id, reason, kind=None, payload=None, *, stop_runner=True):
         """Закрывает активный turn как неудавшийся (в схеме статус failed = 'error', CHECK
         миграции 001 не расширяем): останавливает раннер, закрывает висящие approval turn'а,
@@ -1263,8 +1317,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             if not changed:
                 return False
             await con.execute("update bothub.bots set status=$2,stop_retry_exec_id=$3 where id=$1 and status not in ('no_model','error_starting')", row['bot_id'], 'error_starting' if stop_failed else 'error',str(turn_id) if stop_failed else None)
-            for approval in await con.fetch("update bothub.approvals set status='expired',decided_at=now() where turn_id=$1 and status='pending' returning id", turn_id):
-                await append_event(con, row['thread_id'], turn_id, 'approval_dec', 'system', {'approval_id': str(approval['id']), 'decision': 'expired', 'remember': False, 'client': 'system'})
+            await expire_turn_approvals(con, row['thread_id'], turn_id)
             if kind:
                 await append_event(con, row['thread_id'], turn_id, kind, 'system', payload or {})
             if row['turn_type'] == 'compact':
@@ -1830,8 +1883,12 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                 async with con.transaction():
                     await con.execute("update bothub.turns set status='error',error=$2,finished_at=now(),lease_until=null where id=$1", row['id'], 'прервано рестартом ядра')
                     await con.execute("update bothub.bots set status='error' where id=$1 and status<>'no_model'", row['bot_id'])
-                    event = await append_event(con, row['thread_id'], row['id'], 'status', 'system', {'turn_id': str(row['id']), 'status': 'error'}, fanout=False)
-                publish(event)
+                    # Висящие одобрения закрываем вместе с turn'ом: иначе они остаются pending до expires_at, а PWA
+                    # показывает карточку, на которую ответ уже ничего не продолжит (409).
+                    events = await expire_turn_approvals(con, row['thread_id'], row['id'], fanout=False)
+                    events.append(await append_event(con, row['thread_id'], row['id'], 'status', 'system', {'turn_id': str(row['id']), 'status': 'error'}, fanout=False))
+                for event in events:
+                    publish(event)
         for bot_id in {row['bot_id'] for row in stale}:
             await recreate_pending_bot(bot_id)
 
@@ -2548,7 +2605,8 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                 if not current: error('not_found',404)
                 if any(current[key] != row[key] for key in ('kind','cli','base_url','secret_encrypted','status','allow_private','allow_private_ips')):
                     return public_provider(current)
-                await con.execute('update bothub.providers set status=$2,last_check_at=now(),last_error=$3 where id=$1 and owner_id=$4',provider_id,status,last_error,owner_id)
+                await con.execute('update bothub.providers set status=$2,last_check_at=now(),last_error=$3,key_verified=$5 where id=$1 and owner_id=$4',
+                    provider_id,status,last_error,owner_id,getattr(names,'key_verified',None) if status=='ok' else None)
                 if status=='ok': await sync_models(con,provider_id,names)
             return public_provider(await con.fetchrow('select * from bothub.providers where id=$1 and owner_id=$2',provider_id,owner_id))
 
@@ -2663,9 +2721,9 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         encrypted=encrypt_secret(body['secret'].encode(),provider_id.bytes)
         async with app.state.pool.acquire() as con:
             async with con.transaction():
-                row=await con.fetchrow('insert into bothub.providers(id,owner_id,kind,name,base_url,secret_encrypted,secret_tail,allow_private,allow_private_ips,status,last_check_at) '
-                    "values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,case when $10='ok' then now() end) returning *",
-                    provider_id,who['user_id'],kind,name.strip(),base or None,encrypted,secret_tail(body['secret']),allow,ips,status)
+                row=await con.fetchrow('insert into bothub.providers(id,owner_id,kind,name,base_url,secret_encrypted,secret_tail,allow_private,allow_private_ips,status,last_check_at,key_verified) '
+                    "values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,case when $10='ok' then now() end,$11) returning *",
+                    provider_id,who['user_id'],kind,name.strip(),base or None,encrypted,secret_tail(body['secret']),allow,ips,status,getattr(names,'key_verified',None))
                 if names is not None: await sync_models(con,provider_id,names)
         return public_provider(row)
 
@@ -2699,7 +2757,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             origin,status,names,ips=await verify_secret(row['kind'],base,body['secret'],user_id=who['user_id'],allow_private=allow,
                                                         approved_ips=approved,force=bool(body.get('force')))
             values.update(secret_encrypted=encrypt_secret(body['secret'].encode(),id.bytes),secret_tail=secret_tail(body['secret']),
-                          allow_private=allow,allow_private_ips=ips,last_error=None)
+                          allow_private=allow,allow_private_ips=ips,last_error=None,key_verified=getattr(names,'key_verified',None))
             if 'base_url' in body: values['base_url']=origin
             if row['status']!='disabled' and 'status' not in body:
                 values.update(status=status,last_check_at=datetime.now(NOW) if status=='ok' else None)
@@ -3707,7 +3765,9 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                                 await ws.close(code=4410); break
                             try:
                                 allowed=parser.feed(chunk,allow_input=state=='human')
-                            except RFBProtocolError:
+                            except RFBProtocolError as exc:
+                                # Причина в логе: без неё экран «теряет связь» молча (noVNC шлёт сообщение, которого фильтр не знает)
+                                log.warning('screen_rfb_rejected',extra={'bot_id':id,'reason':str(exc),'kind':chunk[0] if chunk else None,'phase':parser.phase})
                                 await ws.close(code=1003); break
                             if parser.framebuffer_requested:
                                 screen_ready.add(id)
@@ -3718,6 +3778,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                         try:
                             chunk=output.result()
                         except StopAsyncIteration:
+                            log.warning('screen_stream_ended',extra={'bot_id':id})
                             await ws.close(code=4410); break
                         await ws.send_bytes(chunk)
                         output=asyncio.create_task(anext(output_iter))

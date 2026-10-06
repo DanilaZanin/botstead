@@ -253,6 +253,12 @@ function pendingBlock(p, dependent) {
 }
 
 // Разрешённый администратором внутренний адрес: видно только администратору, с действием «Отозвать».
+// key_verified === false: сервер принял запрос без ключа (список моделей публичный, у OpenRouter так), статус «ok» ничего не доказывает.
+function keyUnverifiedBlock(p) {
+  if (p.status !== 'ok' || p.key_verified !== false) return '';
+  return `<div class="banner banner-attention" role="status" data-key-unverified><span class="banner-icon">${ICONS.alert}</span><span class="banner-text"><span class="banner-title">Ключ не проверен</span><span class="banner-sub">Сервер принял запрос без ключа: ключ не проверен. Если ключ неверный, бот получит отказ при первом запросе.</span></span></div>`;
+}
+
 function privateAllowedBlock(p) {
   if (!isAdmin() || !p.allow_private || p.status === 'pending_admin') return '';
   const ips = Array.isArray(p.allow_private_ips) && p.allow_private_ips.length ? `: ${p.allow_private_ips.join(', ')}` : '';
@@ -303,6 +309,7 @@ function detailHtml(p, allModels, bots) {
         ${pending ? '' : `<button type="button" class="btn btn-secondary" data-act="check">${checkIdle}</button>`}
       </div>
       ${recovery}
+      ${keyUnverifiedBlock(p)}
       ${privateAllowedBlock(p)}
     </section>
     ${cli && p.status === 'ok' ? `<a class="btn btn-secondary" href="${loginHref}">Войти заново</a>` : ''}

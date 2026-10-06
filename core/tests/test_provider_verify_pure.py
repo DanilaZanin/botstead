@@ -39,7 +39,7 @@ class FakeDB:
     def add(self, **fields):
         row = {'id': uuid.uuid4(), 'owner_id': ADMIN_ID, 'kind': 'openai_compatible', 'cli': None, 'name': 'P',
                'base_url': 'https://api.example', 'secret_encrypted': b'old', 'secret_tail': None, 'allow_private': False,
-               'allow_private_ips': [],
+               'allow_private_ips': [], 'key_verified': None,
                'status': 'ok', 'last_check_at': None, 'last_error': None, 'created_at': datetime.now(timezone.utc)}
         row.update(fields)
         self.providers[row['id']] = row
@@ -78,7 +78,7 @@ class Conn:
             return row and {**row, 'email': db.emails[row['owner_id']]}
         if query.startswith('insert into bothub.providers('):
             keys = ('id', 'owner_id', 'kind', 'name', 'base_url', 'secret_encrypted', 'secret_tail', 'allow_private',
-                    'allow_private_ips', 'status')
+                    'allow_private_ips', 'status', 'key_verified')
             row = db.add(**dict(zip(keys, args)))
             row['last_check_at'] = datetime.now(timezone.utc) if row['status'] == 'ok' else None
             return dict(row)
@@ -113,7 +113,8 @@ class Conn:
         elif query.startswith('update bothub.models set enabled=false'):
             self.db.models[args[0]] = {n for n in self.db.models.get(args[0], set()) if n in args[1]}
         elif query.startswith('update bothub.providers set status=$2,last_check_at=now(),last_error=$3'):
-            self.db.providers[args[0]].update(status=args[1], last_error=args[2], last_check_at=datetime.now(timezone.utc))
+            self.db.providers[args[0]].update(status=args[1], last_error=args[2], last_check_at=datetime.now(timezone.utc),
+                                              key_verified=args[4])
         elif query.startswith("update bothub.providers set status='pending_admin'"):
             row = self.db.providers[args[0]]
             if row['allow_private'] and row['status'] in ('ok', 'new', 'error', 'unchecked'):
@@ -136,14 +137,18 @@ class Pool:
 
 
 class Upstream:
-    """Provider API stand-in: counts requests and answers by the bearer key."""
+    """Provider API stand-in: counts requests and answers by the bearer key.
+
+    `requests` are the probes with the real key (one per check); the second request with a deliberately wrong key
+    (key_verified) is kept apart in `unkeyed`, so "one probe" tests stay about probes."""
 
     def __init__(self):
         self.requests: list[httpx.Request] = []
+        self.unkeyed: list[httpx.Request] = []
         self.behaviour = None  # callable(request) -> Response, or raises
 
     def __call__(self, request):
-        self.requests.append(request)
+        (self.unkeyed if request.headers.get('authorization', '').startswith('Bearer invalid-') else self.requests).append(request)
         if self.behaviour:
             return self.behaviour(request)  # may be a coroutine: httpx.MockTransport awaits it
         if request.headers.get('authorization') == f'Bearer {GOOD_KEY}' or 'good' in request.headers.get('authorization', ''):
