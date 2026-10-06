@@ -1,0 +1,22 @@
+# секреты и локальные данные
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+*.log
+.ai/*.log
+
+# зависимости и сборки
+node_modules/
+.venv/
+__pycache__/
+dist/
+build/
+.DS_Store
+.pytest_cache/
+*.egg-info/
+uv.lock.bak
+.ai/wt/
+.jevrouter/

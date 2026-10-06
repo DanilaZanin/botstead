@@ -1,0 +1,22 @@
+title = "botstead test values"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Known non-secret test and local development tokens"
+regexes = [
+  '''^(?:test-owner|test-secret|dev-owner)$''',
+]
+
+[[allowlists]]
+description = "Local development database credentials"
+condition = "AND"
+paths = [
+  '''^deploy/docker-compose\.dev\.yml$''',
+]
+regexTarget = "line"
+regexes = [
+  '''POSTGRES_(?:USER|PASSWORD|DB):\s*bothub''',
+  '''bothub(?::|/)bothub''',
+]

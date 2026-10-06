@@ -1,0 +1,19 @@
+{
+  "PasswordManagerEnabled": false,
+  "AutofillAddressEnabled": false,
+  "AutofillCreditCardEnabled": false,
+  "SearchSuggestEnabled": false,
+  "DefaultSearchProviderEnabled": false,
+  "MetricsReportingEnabled": false,
+  "SyncDisabled": true,
+  "BrowserSignin": 0,
+  "NewTabPageLocation": "about:blank",
+  "HomepageLocation": "about:blank",
+  "HomepageIsNewTabPage": false,
+  "RestoreOnStartup": 5,
+  "URLBlocklist": ["file://*", "chrome://*"],
+  "ExtensionInstallBlocklist": ["*"],
+  "NativeMessagingBlocklist": ["*"],
+  "DownloadRestrictions": 3,
+  "DefaultDownloadDirectory": "/home/browser/Downloads"
+}

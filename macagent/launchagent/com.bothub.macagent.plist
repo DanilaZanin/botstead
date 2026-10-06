@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Секретов (BOTHUB_URL, MAC_AGENT_TOKEN) здесь нет: агент читает их из
+  ~/Library/Application Support/BotHubMac/config.env (создать вручную, chmod 600,
+  вне git). См. macagent/bothub_mac/config.py.
+
+  Установка:
+    cd macagent && uv sync                                   # ставит .venv с websockets
+    sed -i '' "s#__BOTHUB_MAC_DIR__#$(pwd)#g" launchagent/com.bothub.macagent.plist
+    cp launchagent/com.bothub.macagent.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.bothub.macagent.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.bothub.macagent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BOTHUB_MAC_DIR__/.venv/bin/python3</string>
+        <string>-m</string>
+        <string>bothub_mac</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__BOTHUB_MAC_DIR__</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/bothub-macagent.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/bothub-macagent.log</string>
+</dict>
+</plist>

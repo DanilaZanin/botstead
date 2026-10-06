@@ -1,0 +1,38 @@
+<!-- @dsCard group="Forms" height=150 -->
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;600&family=Golos+Text:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+body{margin:0;background:var(--bg-canvas);color:var(--fg-default);font-family:var(--font-sans)}
+*{box-sizing:border-box}
+button{font:inherit;cursor:pointer}
+:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.row{display:flex;gap:var(--space-2);align-items:center;flex-wrap:wrap}
+.col{display:flex;flex-direction:column;gap:var(--space-3)}
+.pad{padding:var(--space-4)}
+.btn{min-height:var(--hit-min);padding:0 var(--space-4);border-radius:var(--radius-md);border:1px solid transparent;font-size:.9375rem;font-weight:500;display:inline-flex;align-items:center;justify-content:center;gap:var(--space-2)}
+.btn-primary{background:var(--bg-emphasis);color:var(--fg-on-emphasis)}
+.btn-secondary{background:var(--bg-surface);color:var(--fg-default);border-color:var(--border-control)}
+.btn-ghost{background:transparent;color:var(--fg-default)}
+.btn-danger{background:var(--danger-bg);color:var(--danger-fg)}
+.btn-approve{background:var(--attention-emphasis);color:var(--fg-on-attention)}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+.icon-btn{width:var(--hit-min);padding:0;border-radius:var(--radius-md)}
+.badge{display:inline-flex;align-items:center;gap:var(--space-1);padding:2px 7px;border-radius:var(--radius-sm);font-size:.75rem;font-weight:600;letter-spacing:.02em;line-height:1rem}
+.p-claude{background:var(--claude-bg);color:var(--claude-fg)}
+.p-codex{background:var(--codex-bg);color:var(--codex-fg)}
+.p-gemini{background:var(--gemini-bg);color:var(--gemini-fg)}
+.dot{width:8px;height:8px;border-radius:4px;display:inline-block}
+.muted{color:var(--fg-muted)}
+.mono{font-family:var(--font-mono);font-size:.8125rem;line-height:1.125rem}
+.card{background:var(--bg-surface);border:1px solid var(--border-default);border-radius:var(--radius-lg)}
+@media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div class="pad"><div style="max-width:480px;display:flex;flex-direction:column;gap:12px"><div role="radiogroup" aria-label="Вид провайдера" style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; padding: 4px; border-radius: 12px; background: var(--bg-sunken); flex-shrink: 0;"><button type="button" role="radio" aria-checked="true" style="min-height: 44px; padding: 0 6px; border-radius: 9px; border: 1px solid var(--border-default); background: var(--bg-surface); color: var(--fg-default); font: 600 14px/18px 'Golos Text', -apple-system, system-ui, sans-serif;">API-ключ</button><button type="button" role="radio" aria-checked="false" style="min-height: 44px; padding: 0 6px; border-radius: 9px; border: 1px solid transparent; background: transparent; color: var(--fg-default); font: 500 14px/18px 'Golos Text', -apple-system, system-ui, sans-serif;">Endpoint</button><button type="button" role="radio" aria-checked="false" style="min-height: 44px; padding: 0 6px; border-radius: 9px; border: 1px solid transparent; background: transparent; color: var(--fg-default); font: 500 14px/18px 'Golos Text', -apple-system, system-ui, sans-serif;">Подписка</button></div><div role="radiogroup" aria-label="Режим" style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; padding: 4px; border-radius: 12px; background: var(--bg-sunken); flex-shrink: 0;"><button type="button" role="radio" aria-checked="false" style="min-height: 44px; padding: 0 6px; border-radius: 9px; border: 1px solid transparent; background: transparent; color: var(--fg-default); font: 500 14px/18px 'Golos Text', -apple-system, system-ui, sans-serif;">Без вопроса</button><button type="button" role="radio" aria-checked="true" style="min-height: 44px; padding: 0 6px; border-radius: 9px; border: 1px solid var(--border-default); background: var(--bg-surface); color: var(--fg-default); font: 600 14px/18px 'Golos Text', -apple-system, system-ui, sans-serif;">Спросить</button><button type="button" role="radio" aria-checked="false" style="min-height: 44px; padding: 0 6px; border-radius: 9px; border: 1px solid transparent; background: transparent; color: var(--fg-default); font: 500 14px/18px 'Golos Text', -apple-system, system-ui, sans-serif;">По команде</button><button type="button" role="radio" aria-checked="false" style="min-height: 44px; padding: 0 6px; border-radius: 9px; border: 1px solid transparent; background: transparent; color: var(--fg-default); font: 500 14px/18px 'Golos Text', -apple-system, system-ui, sans-serif;">Запрещено</button></div></div></div>
+<script>document.documentElement.setAttribute("lang","ru");</script>
+</body>
+</html>

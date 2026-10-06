@@ -1,0 +1,38 @@
+<!-- @dsCard group="Agent" height=300 -->
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;600&family=Golos+Text:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+body{margin:0;background:var(--bg-canvas);color:var(--fg-default);font-family:var(--font-sans)}
+*{box-sizing:border-box}
+button{font:inherit;cursor:pointer}
+:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.row{display:flex;gap:var(--space-2);align-items:center;flex-wrap:wrap}
+.col{display:flex;flex-direction:column;gap:var(--space-3)}
+.pad{padding:var(--space-4)}
+.btn{min-height:var(--hit-min);padding:0 var(--space-4);border-radius:var(--radius-md);border:1px solid transparent;font-size:.9375rem;font-weight:500;display:inline-flex;align-items:center;justify-content:center;gap:var(--space-2)}
+.btn-primary{background:var(--bg-emphasis);color:var(--fg-on-emphasis)}
+.btn-secondary{background:var(--bg-surface);color:var(--fg-default);border-color:var(--border-control)}
+.btn-ghost{background:transparent;color:var(--fg-default)}
+.btn-danger{background:var(--danger-bg);color:var(--danger-fg)}
+.btn-approve{background:var(--attention-emphasis);color:var(--fg-on-attention)}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+.icon-btn{width:var(--hit-min);padding:0;border-radius:var(--radius-md)}
+.badge{display:inline-flex;align-items:center;gap:var(--space-1);padding:2px 7px;border-radius:var(--radius-sm);font-size:.75rem;font-weight:600;letter-spacing:.02em;line-height:1rem}
+.p-claude{background:var(--claude-bg);color:var(--claude-fg)}
+.p-codex{background:var(--codex-bg);color:var(--codex-fg)}
+.p-gemini{background:var(--gemini-bg);color:var(--gemini-fg)}
+.dot{width:8px;height:8px;border-radius:4px;display:inline-block}
+.muted{color:var(--fg-muted)}
+.mono{font-family:var(--font-mono);font-size:.8125rem;line-height:1.125rem}
+.card{background:var(--bg-surface);border:1px solid var(--border-default);border-radius:var(--radius-lg)}
+@media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div class="pad"><div style="max-width:377px;display:flex;flex-direction:column"><div role="log" aria-label="Терминал входа" tabindex="0" style="height: 190px; flex-shrink: 0; box-sizing: border-box; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--border-control); background: var(--bg-surface); font: 400 12px/18px 'JetBrains Mono', ui-monospace, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end;"><div style="color: var(--fg-muted);">$ claude login</div><div style="color: var(--fg-default);">Browser didn't open? Use the url below to sign in:</div><div style="color: var(--focus); text-decoration: underline;">https://claude.ai/oauth/authorize?code=true&amp;client_id=9d1c25&amp;scope=user:inference</div><div style="color: var(--fg-default);">Paste code here if prompted &gt; ****</div><div style="color: var(--success-fg);">Login successful.</div><div style="color: var(--danger-fg);">OAuth error: invalid_grant</div><div><span aria-hidden="true" style="display: inline-block; width: 7px; height: 15px; background: var(--fg-default); vertical-align: text-bottom;"></span></div></div><div style="height:8px"></div><div role="toolbar" aria-label="Клавиши терминала" style="flex-shrink: 0; display: flex; gap: 6px; padding: 6px 8px; background: var(--bg-surface); border-top: 1px solid var(--border-default); overflow: hidden;"><button type="button" style="min-width: 44px; height: 44px; padding: 0 10px; flex-shrink: 0; border-radius: 10px; border: 1px solid var(--border-control); background: var(--bg-surface); color: var(--fg-default); font: 500 13px/18px 'JetBrains Mono', ui-monospace, Menlo, monospace; display: inline-flex; align-items: center; justify-content: center; gap: 6px;">Esc</button><button type="button" style="min-width: 44px; height: 44px; padding: 0 10px; flex-shrink: 0; border-radius: 10px; border: 1px solid var(--border-control); background: var(--bg-surface); color: var(--fg-default); font: 500 13px/18px 'JetBrains Mono', ui-monospace, Menlo, monospace; display: inline-flex; align-items: center; justify-content: center; gap: 6px;">Tab</button><button type="button" style="min-width: 44px; height: 44px; padding: 0 10px; flex-shrink: 0; border-radius: 10px; border: 1px solid var(--border-control); background: var(--bg-surface); color: var(--fg-default); font: 500 13px/18px 'JetBrains Mono', ui-monospace, Menlo, monospace; display: inline-flex; align-items: center; justify-content: center; gap: 6px;">Ctrl</button><button type="button" aria-label="Стрелка вверх" style="min-width: 44px; height: 44px; padding: 0 10px; flex-shrink: 0; border-radius: 10px; border: 1px solid var(--border-control); background: var(--bg-surface); color: var(--fg-default); font: 500 13px/18px 'JetBrains Mono', ui-monospace, Menlo, monospace; display: inline-flex; align-items: center; justify-content: center; gap: 6px;">↑</button><button type="button" aria-label="Стрелка вниз" style="min-width: 44px; height: 44px; padding: 0 10px; flex-shrink: 0; border-radius: 10px; border: 1px solid var(--border-control); background: var(--bg-surface); color: var(--fg-default); font: 500 13px/18px 'JetBrains Mono', ui-monospace, Menlo, monospace; display: inline-flex; align-items: center; justify-content: center; gap: 6px;">↓</button><button type="button" style="min-width: 44px; height: 44px; padding: 0 10px; flex-shrink: 0; border-radius: 10px; border: 1px solid var(--border-control); background: var(--bg-surface); color: var(--fg-default); font: 500 13px/18px 'JetBrains Mono', ui-monospace, Menlo, monospace; display: inline-flex; align-items: center; justify-content: center; gap: 6px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex-shrink: 0;"><rect x="6" y="5" width="12" height="16" rx="2"></rect><path d="M9 5V3h6v2M9 12h6M9 16h4"></path></svg>Вставить</button></div></div></div>
+<script>document.documentElement.setAttribute("lang","ru");</script>
+</body>
+</html>
