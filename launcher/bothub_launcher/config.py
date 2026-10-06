@@ -24,7 +24,9 @@ DEFAULT_LOGIN_COMMANDS = {
     "shell": ("bash", "-l"),
     "claude": ("claude", "auth", "login"),
     "codex": ("codex", "login", "--device-auth"),
-    "agy": ("agy",),
+    # Голый agy открывает TUI на альтернативном экране; headless-промпт без входа печатает ссылку и ждёт код,
+    # после входа выполняет промпт и выходит с 0 (docs/contracts.md §12).
+    "agy": ("agy", "--mode", "plan", "-p", "Reply OK"),
     "claude_status": ("claude", "auth", "status"),
     "codex_status": ("codex", "login", "status"),
     "agy_status": ("agy", "--mode", "plan", "--output-format", "json", "-p", "Reply OK"),

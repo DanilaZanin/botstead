@@ -27,7 +27,7 @@ def test_default_login_commands():
     cmds = load_config(None, ENV).login_commands
     assert cmds["claude"] == ("claude", "auth", "login")
     assert cmds["codex"] == ("codex", "login", "--device-auth")
-    assert cmds["agy"] == ("agy",)
+    assert cmds["agy"] == ("agy", "--mode", "plan", "-p", "Reply OK")
     assert cmds["claude_status"] == ("claude", "auth", "status")
 
 
