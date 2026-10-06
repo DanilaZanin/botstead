@@ -19,6 +19,8 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from .browser_control import is_browser_tool, mask_browser_args, mask_input_values, url_forbidden, url_origin
+from . import delegation, wakeups
+from .mcp_policy import NOT_ALLOWED
 from .risk import classify
 
 log = logging.getLogger("bothub.mcp_server")
@@ -109,6 +111,12 @@ async def approve(tool_name: str, input: dict) -> dict:
 
     if approval.get("status") == "approved":
         return {"behavior": "allow", "updatedInput": input}
+    if approval.get("status") == "rejected" and approval.get("reason") == NOT_ALLOWED:
+        # чужой MCP-инструмент вне mcp_allow бота: ядро отклонило сразу, владельцу вопрос не ушёл
+        return {"behavior": "deny", "message": NOT_ALLOWED}
+    if approval.get("status") == "rejected" and approval.get("reason") == "checker_denied":
+        # проверяющая модель бота отклонила действие, владельцу вопрос не ушёл (раздел 20)
+        return {"behavior": "deny", "message": f"checker_denied: {str(approval.get('checker_reason') or '')[:200]}".rstrip(": ")}
     return {"behavior": "deny", "message": f"approval {approval.get('status', 'expired')}"}
 
 
@@ -398,6 +406,87 @@ async def remember(text: str, expires_at: str | None = None) -> dict:
         resp = await client.post("/api/memory", json=payload)
         resp.raise_for_status()
         return resp.json()
+
+
+@mcp.tool()
+async def schedule_wakeup(prompt: str, reason: str = "", at: str | None = None,
+                          in_minutes: int | None = None) -> dict:
+    """Wake yourself up later: the core starts a new turn with `prompt` at the given moment.
+
+    Give exactly one of `at` (ISO 8601 time, no zone means UTC) or `in_minutes`. Allowed range: from 1 minute
+    to 30 days from now. `prompt` (up to 2000 characters) is what you will be asked then, write it so that it
+    makes sense without this conversation. `reason` (up to 200 characters) is a short note the owner sees.
+    At most 20 wakeups can be active; asking twice for the same prompt within a minute of the same time returns
+    the existing one (`deduplicated: true`). A paused bot skips the wakeup. Refusals come back as
+    `{"ok": false, "error": <code>}`; a successful call returns the wakeup with its `id` and `scheduled_at`.
+    """
+    try:
+        wakeups.clean_prompt(prompt)
+        wakeups.clean_reason(reason)
+    except wakeups.WakeupError as exc:
+        return {"ok": False, "error": exc.code}
+    payload: dict = {"prompt": prompt, "reason": reason, "thread_id": os.environ["BOTHUB_THREAD_ID"]}
+    if at is not None:
+        payload["at"] = at
+    if in_minutes is not None:
+        payload["in_minutes"] = in_minutes
+    async with _client() as client:
+        resp = await client.post("/api/bots/wakeups", json=payload)
+    if resp.status_code >= 400:
+        try:
+            detail = resp.json().get("detail")
+        except ValueError:
+            detail = None
+        return {"ok": False, "error": detail if isinstance(detail, str) and detail else f"http_{resp.status_code}"}
+    return {"ok": True, **resp.json()}
+
+
+async def _core_error(resp) -> dict:
+    try:
+        detail = resp.json().get("detail")
+    except ValueError:
+        detail = None
+    if isinstance(detail, dict):
+        detail = detail.get("detail") or detail.get("error")
+    return {"ok": False, "error": detail if isinstance(detail, str) and detail else f"http_{resp.status_code}"}
+
+
+@mcp.tool()
+async def delegate_to_bot(bot: str, task: str) -> dict:
+    """Hand a task to another bot of the same owner. It runs in that bot's own thread; you do not wait for it.
+
+    `bot` is the other bot's name or id. `task` (1 to 4000 characters) must make sense without this conversation:
+    the other bot sees only this text, prefixed with who sent it. Returns at once with `turn_id` and `thread_id`;
+    call `delegation_result` with the `turn_id` later (when you have other work, or after a while) to get the answer.
+    Limits: not to yourself, not to a paused bot or one without a model, at most 5 unfinished delegations at a time,
+    and a bot that is itself working on a delegated task cannot delegate further. The owner approves this call like
+    other actions unless a rule allows it. Refusals come back as `{"ok": false, "error": <code>}`.
+    """
+    try:
+        delegation.clean_target(bot)
+        delegation.clean_task(task)
+    except delegation.DelegationError as exc:
+        return {"ok": False, "error": exc.code}
+    payload = {"bot": bot, "task": task, "turn_id": os.environ["BOTHUB_TURN_ID"]}
+    async with _client() as client:
+        resp = await client.post("/api/bots/delegations", json=payload)
+    if resp.status_code >= 400:
+        return await _core_error(resp)
+    return {"ok": True, **resp.json()}
+
+
+@mcp.tool()
+async def delegation_result(turn_id: str) -> dict:
+    """Check a task you handed over with `delegate_to_bot`. Only the bot that delegated it can read it.
+
+    Returns `status` (queued, running, waiting_approval, waiting_mac, done, stopped, error). When `status` is `done`,
+    `result` holds the other bot's final reply (up to 8000 characters); on `error`, `error` says why.
+    """
+    async with _client() as client:
+        resp = await client.get(f"/api/bots/delegations/{turn_id}")
+    if resp.status_code >= 400:
+        return await _core_error(resp)
+    return {"ok": True, **resp.json()}
 
 
 if __name__ == "__main__":

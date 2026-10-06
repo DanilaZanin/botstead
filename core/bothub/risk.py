@@ -59,6 +59,11 @@ _MAC_SAFE_TOOLS = MAC_READ_TOOLS
 READ_ONLY_TOOLS = frozenset({
     "Read", "Glob", "Grep", "TodoWrite", "WebSearch",
     "mcp__bothub__attach_file", "mcp__bothub__remember",
+    # пробуждение только ставит будущий ход этому же боту (до 20 штук, до 30 дней, видно в ленте и отменяется владельцем)
+    "mcp__bothub__schedule_wakeup",
+    # результат поручения читается только отправителем, ядро проверяет это по токену бота (раздел 20). Сама постановка
+    # поручения (`mcp__bothub__delegate_to_bot`) сюда не входит: она идёт по одобрению владельца или точному правилу auto_allow
+    "mcp__bothub__delegation_result",
 })
 # Write/Edit авто-разрешаются только внутри домашнего каталога бота (см. _home_path_ok).
 HOME_WRITE_TOOLS = frozenset({"Write", "Edit"})

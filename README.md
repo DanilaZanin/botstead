@@ -12,6 +12,9 @@ Access is strictly invite-only. The system supports a primary administrator and 
 - **Async Execution Engine**: Built with FastAPI and PostgreSQL 16. Manages asynchronous turn queues, thread events, and background workers.
 - **Spending and Budget Limits**: Enforces daily token budgets per bot and per user. Closes turns immediately when limits are exceeded.
 - **Schedules and Webhooks**: Triggers bot routines via cron schedules or authenticated external HTTP webhook payloads.
+- **Bot Self-Wakeup**: Bots schedule future turns using the `schedule_wakeup` MCP tool, with scheduler execution and operator cancellation.
+- **GitHub and Slack Event Triggers**: Dedicated webhook adapters verify HMAC signatures and convert repository events or chat messages into bot turns.
+- **Bot Templates**: Export and import complete bot configurations, schedules, and procedures as portable JSON files without secrets.
 - **Persistent Memory**: Stores both shared and per-bot facts with versioning and status lifecycle.
 - **Audit Outbox**: Append-only event log with reliable push notification deliveries via Web Push (VAPID).
 
@@ -19,14 +22,18 @@ Access is strictly invite-only. The system supports a primary administrator and 
 - **Least Privilege Execution**: Bot processes run under UID 1000 (`bot`) with dropped capabilities (`--cap-drop ALL`), `no-new-privileges`, read-only rootfs, and no host mounts.
 - **Dual-Layer Seccomp Filtering**: A custom Docker seccomp profile allows Chromium user namespaces while stripping dangerous syscalls. A static C binary (`bot-guard`) strips user namespace creation (`CLONE_NEWUSER`, `unshare`, `setns`) from all bot code.
 - **Strict Network Policies**: Dedicated bridge network per user (`bothub-u-<owner>`). Automatic iptables rules block bot access to host ports, PostgreSQL, private subnets (RFC 1918, CGNAT, link-local, cloud metadata), and other users' containers.
+- **Per-Bot MCP Allow-List**: Restricts external MCP tools per bot using exact names or patterns, enforced at core and runner layers.
 - **Privilege Separation Daemon**: The core application has no access to `docker.sock`. A dedicated daemon (`launcher`) manages containers and iptables over an authenticated local unix domain socket.
 - **Optional gVisor Support**: Native configuration flag to run bot containers under gVisor (`runsc`) for kernel-level sandboxing.
 
 ### Model API Gateway and CLI Subscriptions
 - **Zero-Trust API Key Storage**: Provider API keys are encrypted at rest using AES-256-GCM and never enter the bot container.
+- **Flexible Base URLs**: Supports OpenRouter and any OpenAI-compatible server with custom path prefixes in the base URL.
+- **Provider Key Verification**: Tests credentials before saving and runs probe requests to flag providers that ignore API keys.
 - **Turn-Scoped HMAC Tokens**: The core issues short-lived, signed gateway tokens for each turn. The internal gateway proxies requests, injects secrets, validates models, and logs token usage.
 - **SSRF and Rebinding Protection**: The gateway resolves upstream hostnames, pins validated IP addresses, blocks private networks, and requires administrator approval for private LAN targets.
 - **Interactive Subscription Login**: Ephemeral login containers with PTY streaming allow operators to authenticate subscription CLIs directly through the web interface.
+- **Self-Confirming Subscription Login**: Pre-checks authentication status when opening the login screen, confirming active sessions without launching a terminal.
 
 ### Headed Browser and Human Takeover
 - **Dedicated Headed Chromium**: Runs under UID 1001 (`browser`) on an internal Xvfb virtual display with a hardened Openbox window manager.

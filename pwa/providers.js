@@ -1180,6 +1180,60 @@ export async function mountBotModelCard(scope, bot, onSaved) {
 }
 
 // ---------------------------------------------------------------------------
+// Проверяющая модель бота (docs/contracts.md §19): вторая оценка рискованных действий до владельца. Необязательна.
+// Подписки (cli_subscription) не подходят: у них нет ключа для прямого запроса.
+// ---------------------------------------------------------------------------
+export function botCheckerCardHtml(bot) {
+  return `<div class="card card-pad stack gap-2" data-checker-card>
+    <label for="checker-model"><span class="t-headline" style="font-size:15px;">Проверяющая модель</span></label>
+    <span class="t-footnote" id="checker-hint">Необязательно. Перед тем как спросить вас про рискованное действие (оплата, отправка, удаление, вход, команды), эта модель даст второе мнение. Если она отклонит действие, оно отклонится само. Остальные ответы только подсказка в карточке: решаете вы.</span>
+    <div data-checker-picker aria-busy="true">${loadingHtml('Загружаю модели')}</div>
+    <div class="form-alert" data-checker-alert aria-live="polite"></div>
+  </div>`;
+}
+
+export async function mountBotCheckerCard(scope, bot, onSaved) {
+  const card = $('[data-checker-card]', scope);
+  if (!card) return;
+  const holder = $('[data-checker-picker]', card);
+  const alertBox = $('[data-checker-alert]', card);
+  let options;
+  try { options = await loadModelOptions(); } catch (err) {
+    holder.removeAttribute('aria-busy');
+    holder.innerHTML = '<span class="t-footnote">Модели не загрузились.</span>';
+    return;
+  }
+  holder.removeAttribute('aria-busy');
+  const groups = options.groups.map((g) => ({ provider: g.provider, models: g.models.filter((m) => m.usable && g.provider.kind !== 'cli_subscription') })).filter((g) => g.models.length);
+  const current = bot.checker_model_id || '';
+  const known = groups.some((g) => g.models.some((m) => m.model.id === current));
+  const optionHtml = (model, selected) => `<option value="${esc(model.id)}"${selected ? ' selected' : ''}>${esc(modelTitle(model.name, model.display_name))}</option>`;
+  holder.innerHTML = `<select id="checker-model" class="input" aria-describedby="checker-hint">
+    <option value=""${current ? '' : ' selected'}>Не задана</option>
+    ${current && !known ? `<option value="${esc(current)}" selected>Выбранная модель недоступна</option>` : ''}
+    ${groups.map((g) => `<optgroup label="${esc(g.provider.name)}">${g.models.map((m) => optionHtml(m.model, m.model.id === current)).join('')}</optgroup>`).join('')}
+  </select>`;
+  const select = $('#checker-model', holder);
+  let saved = current;
+  select.addEventListener('change', async () => {
+    const value = select.value;
+    alertBox.innerHTML = '';
+    select.disabled = true;
+    try {
+      const row = await api.patchBot(bot.id, { checker_model_id: value || null });
+      saved = row.checker_model_id ?? (value || null) ?? '';
+      bot.checker_model_id = row.checker_model_id ?? (value || null);
+      onSaved(row);
+    } catch (err) {
+      select.value = saved || '';
+      setAlert(alertBox, 'Проверяющая модель не изменена', err.status === 400 ? 'Модель недоступна: провайдер выключен или модель удалена. Выберите другую.' : failure(err).text);
+    } finally {
+      select.disabled = false;
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Состояния бота: нет модели, компьютер не запустился, перезапуск после задачи
 // ---------------------------------------------------------------------------
 export function botStateBanner(bot) {

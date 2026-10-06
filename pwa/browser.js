@@ -177,9 +177,11 @@ export function mountBrowser({ app, bot, botId, setCleanup }) {
   const kbd = el('br-kbd-input');
 
   const announce = (text) => { const live = el('br-announce'); if (live) live.textContent = text; };
+  // Отрисовка могла уйти на другой маршрут: её DOM уже нет, пишем в него молча и не рушим новую разметку.
+  const alive = () => document.contains(root);
   const flash = (title, text = '', kind = 'info') => {
     const box = el('br-flash');
-    if (!box) return;
+    if (!box || !alive()) return;
     box.innerHTML = title ? `<div class="banner banner-${kind}"${kind === 'danger' ? ' role="alert"' : ''}><span class="banner-icon">${kind === 'danger' ? ICONS.alert : ICONS.check}</span><span class="banner-text"><span class="banner-title">${esc(title)}</span>${text ? `<span class="banner-sub">${esc(text)}</span>` : ''}</span></div>` : '';
   };
 
@@ -962,4 +964,3 @@ export function mountBrowser({ app, bot, botId, setCleanup }) {
 
   init();
 }
-

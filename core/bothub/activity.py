@@ -158,6 +158,8 @@ APPROVAL_DECISION = {'approved': 'approval_approved', 'rejected': 'approval_reje
 def approval_item(row):
     # args в ленту не попадают совсем: только заголовок и имя инструмента, как их видит экран подтверждений
     code = 'approval_requested' if row['phase'] == 'req' else APPROVAL_DECISION.get(row['status'], 'approval_expired')
+    if row['phase'] != 'req' and row['status'] == 'rejected' and row.get('checker_verdict') == 'deny':
+        code = 'checker_denied'  # раздел 20: проверяющая модель отклонила действие сама
     return item(row, 'approval', code, {'tool': short(row.get('tool'), 120)},
                 detail=short(mask_browser_text(row.get('title'))), risk=row.get('risk'), status=row['status'])
 
@@ -217,12 +219,18 @@ def memory_item(row):
 def log_item(row):
     params = payload_of({'payload': row.get('params')})
     kind = row['log_kind']
-    safe = {key: params[key] for key in ('reason', 'count', 'paused', 'schedule_id', 'name', 'catch_up', 'by_all')
+    safe = {key: params[key] for key in ('reason', 'count', 'paused', 'schedule_id', 'name', 'catch_up', 'by_all',
+                                         'wakeup_id', 'scheduled_at', 'from_bot', 'to_bot', 'to_bot_id', 'turn_id', 'outcome')
             if key in params and isinstance(params[key], (str, int, bool))}
-    for key in ('reason', 'name'):
+    for key in ('reason', 'name', 'from_bot', 'to_bot'):
         if key in safe and isinstance(safe[key], str):
             safe[key] = short(safe[key], 120)
-    return item(row, kind, row['code'], safe)
+    # Самопробуждение (раздел 17): зачем бот его запросил (`note`, свободный текст бота) идёт в detail, как текст памяти
+    detail = short(params.get('note')) if str(row['code']).startswith('wakeup_') else None
+    # Поручение боту (раздел 19): текст задачи, который отправитель дал получателю, идёт в detail
+    if row['code'] == 'delegation_sent':
+        detail = short(params.get('task'))
+    return item(row, kind, row['code'], safe, detail=detail)
 
 
 BUILDERS = {
@@ -330,13 +338,13 @@ SQL = {
         "where th.owner_id = $1 and ($2::text is null or th.bot_id = $2)"),
     'approval': _branch(
         "select 'approval:' || a.id::text || ':req' as id, a.created_at as at, a.bot_id, a.thread_id, a.turn_id, "
-        "'req'::text as phase, a.status, a.risk, a.title, a.tool "
+        "'req'::text as phase, a.status, a.risk, a.title, a.tool, null::text as checker_verdict "
         "from bothub.threads th cross join lateral ("
         + _probe('approvals', 'x.thread_id = th.id and ($2::text is null or x.bot_id = $2)', KEY_APPROVAL_REQ) + ") a "
         "where th.owner_id = $1") +
         ' union all ' + _branch(
         "select 'approval:' || a.id::text || ':dec' as id, coalesce(a.decided_at, a.expires_at) as at, a.bot_id, "
-        "a.thread_id, a.turn_id, 'dec'::text as phase, a.status, a.risk, a.title, a.tool "
+        "a.thread_id, a.turn_id, 'dec'::text as phase, a.status, a.risk, a.title, a.tool, a.checker_verdict "
         "from bothub.threads th cross join lateral ("
         + _probe('approvals', "x.thread_id = th.id and ($2::text is null or x.bot_id = $2) "
                               "and x.status in ('approved','rejected','expired')", KEY_APPROVAL_DEC) + ") a "

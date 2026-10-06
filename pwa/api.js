@@ -111,7 +111,7 @@ const mockBots = [
     provider: 'codex', model: 'GPT-6 Sol', executor: 'container', mac_full_control: false,
     status: 'error', location: 'Сервер',
     summary: 'Остановлен предохранителем: 3 одинаковые ошибки',
-    status_label: 'Стоп', status_kind: 'danger',
+    status_label: 'Ошибка', status_kind: 'danger',
     auto_allow: [],
     budget_daily_tokens: 200000,
   },
@@ -215,6 +215,7 @@ for (const bot of mockBots) {
   if (bot.provider_id) bot.model = name;
   bot.need_restart = false;
   bot.auto_compact_percent = 80;
+  bot.checker_model_id = null;  // раздел 20: проверяющая модель, null выключает
 }
 if (MOCK_PROVIDERS_MODE === 'private') {
   // Архив на провайдере, который ждёт одобрения; Кодер на провайдере с изменившимся адресом.
@@ -279,7 +280,7 @@ const mockEvents = {
     ] } },
     { seq: 3, kind: 'assistant_msg', actor: 'bot:sre', payload: { text: 'Причина почти наверняка в памяти: после деплоя 08:55 контейнер упирается в лимит 1 ГБ, ядро убивает процесс 4 раза.', final: true } },
     { seq: 4, kind: 'usage', actor: 'bot:sre', payload: { tokens_in: 42000, tokens_out: 16000, model: 'Opus 5.5', seconds: 124 } },
-    { seq: 5, kind: 'approval_req', actor: 'bot:sre', payload: { approval_id: 'ap2', risk: 'other', title: 'Поднять лимит до 2 ГБ и перезапустить webapp', tool: 'mac_shell', expires_at: minutesAgo(-40) } },
+    { seq: 5, kind: 'approval_req', actor: 'bot:sre', payload: { approval_id: 'ap2', risk: 'other', title: 'Поднять лимит до 2 ГБ и перезапустить webapp', tool: 'mac_shell', expires_at: minutesAgo(-40) , checker: { verdict: 'ask', reason: 'Перезапуск webapp не просили, подтвердите сами' } } },
   ],
   't-coder': [
     { seq: 1, kind: 'user_msg', actor: 'owner', client: 'mac', payload: { text: 'Обнови зависимости и прогоняй тесты' } },
@@ -292,6 +293,8 @@ const mockEvents = {
   't-archive': [
     { seq: 1, kind: 'system', actor: 'system', payload: { text: 'Наблюдение за ~/BotHub/inbox' } },
     { seq: 2, kind: 'assistant_msg', actor: 'bot:archive', payload: { text: 'Вчера разложил 4 скана по папкам. Сейчас папка пуста, жду новые файлы.', final: true } },
+    { seq: 3, kind: 'user_msg', actor: 'bot:scout', client: 'delegate', payload: { text: 'Поручение от бота Скаут:\n\nРазложи скан договора из inbox по папкам', delegated_from: { bot_id: 'scout', name: 'Скаут' } } },
+    { seq: 4, kind: 'assistant_msg', actor: 'bot:archive', payload: { text: 'Скан договора лежит в «Квартира/2025».', final: true } },
   ],
 };
 
@@ -432,7 +435,7 @@ if (MOCK) {
 
 const mockApprovals = [
   { id: 'ap1', thread_id: 't-scout', turn_id: 'tu1', bot_id: 'scout', risk: 'send', title: 'Отправить отклик на «Senior SRE, Belgrade/remote»', tool: 'browser.submit_form', args: { url: 'jobs.example.eu/812', data: 'Резюме EN, email' }, args_hash: '4f2a9c1', status: 'pending', expires_at: minutesAgo(-27) },
-  { id: 'ap2', thread_id: 't-sre', turn_id: 'tu2', bot_id: 'sre', risk: 'other', title: 'Поднять лимит до 2 ГБ и перезапустить webapp', tool: 'mac_shell', args: { cmd: 'docker update --memory=2g webapp && docker restart webapp' }, args_hash: '9b1e73d', status: 'pending', expires_at: minutesAgo(-40) },
+  { id: 'ap2', thread_id: 't-sre', turn_id: 'tu2', bot_id: 'sre', risk: 'other', title: 'Поднять лимит до 2 ГБ и перезапустить webapp', tool: 'mac_shell', args: { cmd: 'docker update --memory=2g webapp && docker restart webapp' }, args_hash: '9b1e73d', checker_verdict: 'ask', checker_reason: 'Перезапуск webapp не просили, подтвердите сами', status: 'pending', expires_at: minutesAgo(-40) },
 ];
 
 let mockMemorySeq = 10;
@@ -452,7 +455,7 @@ const mockSchedules = [
   { id: 's1', bot_id: 'sre', name: 'Проверка серверов', kind: 'cron', cron: '0 3 * * *', prompt: 'Проверить здоровье серверов', enabled: true, next_run_at: minutesAgo(-17 * 60), last_run: { ok: true, at: 'сегодня 03:00', seconds: 120 },
     catch_up: false, skipped_count: 6, last_skipped_at: minutesAgo(30), last_skip_reason: 'executor_unavailable', paused_by_unavailable: true },
   { id: 's2', bot_id: 'archive', name: 'Разбор почты', kind: 'cron', cron: '30 8 * * 1-5', prompt: 'Разобрать почту', enabled: false, paused_since: '20 сен', catch_up: false, skipped_count: 0, paused_by_unavailable: false },
-  { id: 's3', bot_id: 'sre', name: 'Алерт → диагностика', kind: 'hook', prompt: 'Диагностировать алерт', enabled: true, last_run: { at: 'сегодня 09:12', detail: '502 на webapp' },
+  { id: 's3', bot_id: 'sre', name: 'Алерт → диагностика', kind: 'hook', has_slack_signing_secret: false, prompt: 'Диагностировать алерт', enabled: true, last_run: { at: 'сегодня 09:12', detail: '502 на webapp' },
     catch_up: false, skipped_count: 2, last_skipped_at: minutesAgo(45), last_skip_reason: 'bot_paused', paused_by_unavailable: false },
   { id: 's4', bot_id: 'archive', name: 'Папка ~/BotHub/inbox', kind: 'mac_folder', prompt: 'Разложить новые файлы', enabled: true, last_run: { at: 'вчера', detail: '4 скана разложены по папкам' } },
 ];
@@ -503,6 +506,8 @@ if (MOCK_ACTIVITY_MODE !== 'none') {
   mockLog(20, 'turn', 'turn_started', 'sre', { thread_id: 't-sre', turn_id: 'tu2', status: 'running', params: { client: 'hook' } });
   mockLog(21, 'schedule', 'hook_run', 'sre', { thread_id: 't-sre', turn_id: 'tu2', status: 'running', params: { name: 'Алерт → диагностика', schedule_id: 's3' } });
   mockLog(18, 'approval', 'approval_requested', 'sre', { thread_id: 't-sre', turn_id: 'tu2', risk: 'other', status: 'pending', params: { tool: 'mac_shell' }, detail: 'Поднять лимит до 2 ГБ и перезапустить webapp' });
+  mockLog(9, 'schedule', 'delegation_sent', 'scout', { thread_id: 't-archive', params: { from_bot: 'Скаут', to_bot: 'Архив', to_bot_id: 'archive', turn_id: 'tu-deleg' }, detail: 'Разложи скан договора из inbox по папкам' });
+  mockLog(8, 'schedule', 'delegation_done', 'scout', { thread_id: 't-archive', params: { from_bot: 'Скаут', to_bot: 'Архив', to_bot_id: 'archive', turn_id: 'tu-deleg', outcome: 'done' } });
   mockLog(30, 'schedule', 'schedule_skipped', 'sre', { params: { reason: 'executor_unavailable', count: 5, paused: true, schedule_id: 's1', name: 'Проверка серверов' } });
   mockLog(75, 'takeover', 'takeover_started', 'scout', { thread_id: 't-scout', params: { from: 'bot', to: 'human' } });
   mockLog(66, 'takeover', 'takeover_returned', 'scout', { thread_id: 't-scout', params: { from: 'human', to: 'returning' } });
@@ -1648,6 +1653,18 @@ export async function patchBot(id, body) {
     if (!b) mockFail(404, 'not_found');
     const { provider_id: providerId, model_id: modelId, ...rest } = body;
     if ('auto_compact_percent' in rest && rest.auto_compact_percent !== null && !(Number.isInteger(rest.auto_compact_percent) && rest.auto_compact_percent >= 50 && rest.auto_compact_percent <= 95)) mockFail(400, 'invalid', 'auto_compact_percent: 50..95 or null');
+    // Как в ядре (check_mcp_allow): до 200 строк по 1..200 символов без пробелов внутри, края обрезаются, повторы убираются
+    if ('mcp_allow' in rest) {
+      const items = rest.mcp_allow;
+      if (!(Array.isArray(items) && items.length <= 200 && items.every((name) => typeof name === 'string' && name.trim().length >= 1 && name.trim().length <= 200 && !/\s/.test(name.trim())))) mockFail(422, 'invalid', 'mcp_allow: up to 200 items of 1..200 characters without spaces');
+      rest.mcp_allow = [...new Set(items.map((name) => name.trim()))];
+    }
+    // Как в ядре (require_checker_model): включённая модель API-провайдера, не подписка; null выключает проверку
+    if ('checker_model_id' in rest && rest.checker_model_id !== null) {
+      const m = mockModels.find((x) => x.id === rest.checker_model_id);
+      const p = m && mockProviders.find((x) => x.id === m.provider_id);
+      if (!m || !m.enabled || !p || p.kind === 'cli_subscription') mockFail(400, 'invalid', 'checker model unavailable');
+    }
     if (providerId !== undefined || modelId !== undefined) mockBind(b, providerId ?? b.provider_id, modelId ?? b.model_id);
     Object.assign(b, rest);
     // Как на сервере: при смене провайдера модель становится моделью этого провайдера по умолчанию.
@@ -1665,6 +1682,128 @@ export async function deleteBot(id) {
 export async function recreateBot(id) {
   if (MOCK) return mockRecreateBot(id);
   return request(`/bots/${encodeURIComponent(id)}/recreate`, { method: 'POST' });
+}
+
+// Шаблон бота (docs/contracts.md §9): GET → JSON, POST /bots/import → бот. Мок-режим зовёт те же обработчики, что и процедуры.
+const BOT_TEMPLATE_FORMAT = 'botstead-bot';
+const BOT_TEMPLATE_MAX = 256 * 1024;
+function mockBotTemplateField(name, value, max) {
+  if (typeof value !== 'string') mockFail(422, 'invalid', `${name}: type: must be a string`);
+  if (!value.trim()) mockFail(422, 'invalid', `${name}: empty: is empty`);
+  if (value.length > max) mockFail(422, 'invalid', `${name}: too_long: exceeds ${max} characters`);
+  return value;
+}
+async function mockBotTemplateValidate(doc) {
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) mockFail(422, 'invalid', 'body: type: must be an object');
+  if (doc.format !== undefined && doc.format !== BOT_TEMPLATE_FORMAT) mockFail(422, 'invalid', 'format: unsupported: unsupported format');
+  if (doc.version !== undefined && doc.version !== 1) mockFail(422, 'invalid', `version: unsupported: unsupported version: ${doc.version}`);
+  mockBotTemplateField('name', doc.name ?? '', 80);
+  if (doc.role !== undefined && typeof doc.role !== 'string') mockFail(422, 'invalid', 'role: type: must be a string');
+  // Необязательные поля, как в parse_bot_template: нет ключа значит значение по умолчанию.
+  for (const key of ['instructions', 'avatar', 'executor']) {
+    if (doc[key] !== undefined && typeof doc[key] !== 'string') mockFail(422, 'invalid', `${key}: type: must be a string`);
+  }
+  for (const key of ['auto_allow', 'mcp_allow', 'schedules', 'procedures']) {
+    if (doc[key] !== undefined && !Array.isArray(doc[key])) mockFail(422, 'invalid', `${key}: type: must be an array`);
+  }
+  if (doc.budget_daily_tokens !== undefined && (!Number.isInteger(doc.budget_daily_tokens) || doc.budget_daily_tokens < 0 || doc.budget_daily_tokens > 1e12)) {
+    mockFail(422, 'invalid', 'budget_daily_tokens: out_of_range: expected 0..1000000000000');
+  }
+  const known = new Set(['format', 'version', 'name', 'role', 'instructions', 'avatar', 'executor', 'auto_allow', 'mcp_allow', 'budget_daily_tokens', 'auto_compact_percent', 'schedules', 'procedures']);
+  for (const key of Object.keys(doc)) if (!known.has(key)) mockFail(422, 'invalid', 'body: unknown_field: unknown field');
+  if (doc.auto_compact_percent !== null && doc.auto_compact_percent !== undefined) {
+    if (!Number.isInteger(doc.auto_compact_percent) || doc.auto_compact_percent < 50 || doc.auto_compact_percent > 95) {
+      mockFail(422, 'invalid', 'auto_compact_percent: out_of_range: expected 50..95 or null');
+    }
+  }
+  for (let i = 0; i < (doc.schedules || []).length; i += 1) {
+    const s = doc.schedules[i];
+    if (!s || typeof s !== 'object') mockFail(422, 'invalid', `schedules[${i}]: type: must be an object`);
+    const allowed = new Set(['cron', 'timezone', 'prompt', 'enabled', 'name']);
+    for (const k of Object.keys(s)) if (!allowed.has(k)) mockFail(422, 'invalid', `schedules[${i}]: unknown_field: unknown field`);
+    if (typeof s.cron !== 'string' || !s.cron.trim()) mockFail(422, 'invalid', `schedules[${i}].cron: empty: is empty`);
+    if (typeof s.timezone !== 'string' || !s.timezone.trim()) mockFail(422, 'invalid', `schedules[${i}].timezone: empty: is empty`);
+    if (typeof s.prompt !== 'string' || !s.prompt.trim()) mockFail(422, 'invalid', `schedules[${i}].prompt: empty: is empty`);
+  }
+  for (let i = 0; i < (doc.procedures || []).length; i += 1) {
+    const raw = doc.procedures[i];
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) mockFail(422, 'invalid', `procedures[${i}]: type: must be an object`);
+    if (raw.format !== undefined && raw.format !== PROC_FORMAT) mockFail(422, 'invalid', `procedures[${i}]: format: unsupported: unsupported format`);
+    if (typeof raw.name !== 'string' || !raw.name.trim()) mockFail(422, 'invalid', `procedures[${i}]: name: empty: is empty`);
+    if (!Array.isArray(raw.steps) || !raw.steps.length) mockFail(422, 'invalid', `procedures[${i}]: steps: empty: no steps`);
+  }
+}
+// GET /api/bots/{id}/export → JSON-документ шаблона. Без id, owner, provider/model, секретов и памяти.
+export async function exportBotTemplate(id) {
+  if (MOCK) {
+    await delay();
+    (window.__botTemplateCalls = window.__botTemplateCalls || []).push({ name: 'export', id });
+    const b = mockBots.find((x) => x.id === id);
+    if (!b) mockFail(404, 'not_found', 'бот не найден');
+    return {
+      format: BOT_TEMPLATE_FORMAT, version: 1, name: b.name, role: b.role || '', instructions: b.instructions || '',
+      avatar: b.avatar || 'robot', executor: b.executor || 'container',
+      auto_allow: clone(b.auto_allow || []), mcp_allow: [...(b.mcp_allow || [])],
+      budget_daily_tokens: b.budget_daily_tokens || 200000,
+      auto_compact_percent: b.auto_compact_percent === undefined ? 80 : b.auto_compact_percent,
+      schedules: (b.schedules || []).map((s) => ({ cron: s.cron, timezone: s.timezone, prompt: s.prompt, enabled: s.enabled !== false, ...(s.name ? { name: s.name } : {}) })),
+      procedures: (b.procedures || []).map((p) => ({ format: PROC_FORMAT, name: p.name, description: p.description || '', params: clone(p.params || []), steps: clone(p.steps || []) })),
+    };
+  }
+  return request(`/bots/${encodeURIComponent(id)}/export`);
+}
+// POST /api/bots/import: документ шаблона + provider_id/model_id. 256 КБ. Имя при коллизии получает « (2)», « (3)».
+export async function importBotTemplate(body) {
+  if (MOCK) {
+    await delay();
+    const call = { name: 'import', body: clone(body) };
+    (window.__botTemplateCalls = window.__botTemplateCalls || []).push(call);
+    const raw = JSON.stringify(body || {});
+    if (raw.length > BOT_TEMPLATE_MAX) mockFail(413, 'invalid', 'body exceeds 256 KiB');
+    const { provider_id, model_id, ...doc } = body || {};
+    await mockBotTemplateValidate(doc);
+    if ((provider_id === undefined) !== (model_id === undefined)) mockFail(400, 'invalid', 'provider_id and model_id must be set together');
+    const chosenName = (() => {
+      for (const suffix of ['', ' (2)', ' (3)', ' (4)', ' (5)']) {
+        const candidate = (doc.name || '').trim() + suffix;
+        if (!mockBots.some((x) => x.name === candidate)) return candidate;
+      }
+      mockFail(409, 'conflict', 'name: too many collisions');
+    })();
+    call.created_name = chosenName;
+    const procedures = [];
+    for (let i = 0; i < (doc.procedures || []).length; i += 1) {
+      const raw = doc.procedures[i];
+      const id = `pr${++mockProcSeq}`;
+      const p = {
+        id, bot_id: null, name: raw.name.trim(), description: raw.description || '', source: 'import', status: 'draft', version: 1,
+        created_at: new Date().toISOString(), updated_at: new Date().toISOString(), params: clone(raw.params || []),
+        steps: (raw.steps || []).map((st) => { const { computed_risk: _drop, ...rest } = st; return { ...rest, risk: mockStepRisk(rest) }; }),
+      };
+      procedures.push(p);
+      mockProcs.push(p);
+    }
+    const bot = {
+      status: 'idle', status_label: 'Готово', status_kind: 'neutral', summary: '',
+      location: doc.executor === 'mac' ? 'Mac' : 'Сервер',
+      budget_daily_tokens: doc.budget_daily_tokens === undefined ? 200000 : doc.budget_daily_tokens,
+      auto_allow: clone(doc.auto_allow || []), mcp_allow: [...(doc.mcp_allow || [])], role: doc.role || '',
+      need_restart: false, auto_compact_percent: doc.auto_compact_percent === undefined ? 80 : doc.auto_compact_percent,
+      created_at: new Date().toISOString(),
+      name: chosenName, role: doc.role || '', instructions: doc.instructions || '', avatar: doc.avatar || 'robot',
+      executor: doc.executor || 'container', mac_full_control: false,
+      provider: 'fake',
+      model: chosenName.slice(0, 80),
+      provider_id: provider_id || null, model_id: model_id || null,
+      container: 'skipped', recreate_url: null,
+      schedules: clone(doc.schedules || []),
+      procedures: procedures.map((p) => ({ id: p.id, name: p.name, description: p.description })),
+    };
+    if (provider_id) mockBind(bot, provider_id, model_id);
+    mockBots.push(bot);
+    return clone(bot);
+  }
+  return request('/bots/import', { method: 'POST', body });
 }
 
 // ---------------------------------------------------------------------------
@@ -2126,7 +2265,12 @@ export async function patchSchedule(id, body) {
   if (MOCK) {
     await delay();
     const s = mockSchedules.find((x) => x.id === id);
-    if (s) Object.assign(s, body);
+    if (s) {
+      const { slack_signing_secret: secret, ...rest } = body;
+      Object.assign(s, rest);
+      // как на сервере: секрет только на запись, наружу идёт признак; null очищает
+      if ('slack_signing_secret' in body) s.has_slack_signing_secret = secret !== null && secret !== undefined && String(secret).trim() !== '';
+    }
     return clone(s);
   }
   return request(`/schedules/${id}`, { method: 'PATCH', body });
@@ -2134,6 +2278,39 @@ export async function patchSchedule(id, body) {
 export async function runSchedule(id) {
   if (MOCK) { await delay(200); return { ok: true }; }
   return request(`/schedules/${id}/run`, { method: 'POST' });
+}
+
+// ---------------------------------------------------------------------------
+// Самопробуждение бота (docs/contracts.md §17): список пробуждений бота и отмена активного.
+// Мок: &wakeups=fail даёт один сбой загрузки, повтор проходит.
+// ---------------------------------------------------------------------------
+const MOCK_WAKEUPS_FAIL = params.get('wakeups') === 'fail';
+let mockWakeupsFailed = false;
+const mockWakeups = [
+  { id: 'w1', bot_id: 'scout', thread_id: 't-scout', scheduled_at: minutesAhead(180), status: 'active', prompt: 'Открыть почту и проверить отклики на вакансии', reason: 'Проверить отклики на вакансии', skip_reason: null, created_at: minutesAgo(10), fired_at: null },
+  { id: 'w2', bot_id: 'scout', thread_id: 't-scout', scheduled_at: minutesAhead(2 * 24 * 60), status: 'active', prompt: 'Напомнить владельцу про собеседование', reason: 'Напомнить про собеседование', skip_reason: null, created_at: minutesAgo(9), fired_at: null },
+];
+export async function listWakeups(botId) {
+  if (MOCK) {
+    await delay(120);
+    if (MOCK_WAKEUPS_FAIL && !mockWakeupsFailed) { mockWakeupsFailed = true; mockFail(500, 'internal', 'internal'); }
+    if (!mockBots.some((b) => b.id === botId)) mockFail(404, 'not_found');
+    return clone(mockWakeups.filter((w) => w.bot_id === botId).sort((a, b) =>
+      (a.status === 'active') !== (b.status === 'active') ? (a.status === 'active' ? -1 : 1)
+        : a.status === 'active' ? a.scheduled_at.localeCompare(b.scheduled_at) : b.scheduled_at.localeCompare(a.scheduled_at)));
+  }
+  return request(`/bots/${encodeURIComponent(botId)}/wakeups`);
+}
+export async function cancelWakeup(id) {
+  if (MOCK) {
+    await delay(150);
+    const index = mockWakeups.findIndex((w) => w.id === id);
+    if (index < 0) mockFail(404, 'not_found');
+    if (mockWakeups[index].status !== 'active') mockFail(409, 'conflict', 'wakeup_not_active');
+    mockWakeups.splice(index, 1);
+    return { ok: true, id };
+  }
+  return request(`/wakeups/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
 // ---------------------------------------------------------------------------

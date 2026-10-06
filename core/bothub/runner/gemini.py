@@ -10,6 +10,8 @@
 следующий токен как промпт). Поэтому промпт собирается в command(), а prompt()
 переопределён, чтобы SubprocessRunner ничего лишнего не писал в stdin agy.
 """
+from bothub.mcp_policy import McpAllowUnsupported
+
 from .base import RunnerEvent, TurnContext
 from .subprocess import SubprocessRunner, token_count, usage_event, with_context
 
@@ -22,6 +24,10 @@ class GeminiRunner(SubprocessRunner):
         self._step_usage: dict[str, dict] = {}  # conversation_id -> usage последнего шага
 
     def command(self, turn: TurnContext) -> list[str]:
+        # agy не отдаёт tool_call (см. TODO в parse), поэтому mcp_allow он не применяет и не видит, что вызвал бот.
+        # Молча запустить ход с непустым списком значило бы обещать то, чего нет: отказываем. Ход сжатия список не касается.
+        if turn.bot.get("mcp_allow") and not turn.compact:
+            raise McpAllowUnsupported(self.provider)
         command = ["agy", "--output-format", "stream-json"]
         if turn.bot.get("model"):
             command += ["--model", turn.bot["model"]]

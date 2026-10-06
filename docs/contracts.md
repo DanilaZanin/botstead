@@ -137,6 +137,7 @@ create table schedules (
   timezone text not null default 'Europe/Moscow',
   prompt text not null,
   hook_token text,                                 -- для kind=hook, случайный
+  slack_signing_secret bytea,                      -- для kind=hook: Signing Secret приложения Slack, зашифрован (encrypt_secret, AAD = id), наружу не отдаётся (раздел 18)
   enabled boolean not null default true,
   next_run_at timestamptz,
   last_turn_id uuid,
@@ -216,8 +217,13 @@ create table mac_status (
 | POST /api/usage | [bot] | `{"thread_id","turn_id","provider","model","tokens_in","tokens_out"}` |
 | GET /api/schedules | owner | `[Schedule]` |
 | POST /api/schedules | owner | ScheduleIn → Schedule (для hook генерирует hook_token) |
-| PATCH /api/schedules/{id} | owner | `{"enabled"?,"cron"?,"prompt"?,"catch_up"?}` |
+| PATCH /api/schedules/{id} | owner | `{"enabled"?,"cron"?,"prompt"?,"catch_up"?,"slack_signing_secret"?}`; секрет Slack только для kind=hook, строка до 256 символов или `null` (очистка), в ответах нет, вместо него `has_slack_signing_secret` (раздел 18) |
 | POST /api/schedules/{id}/run | owner | создаёт тред kind=routine (или последний) и turn client=schedule; бот на паузе: 409 `bot_paused` |
+| POST /api/bots/wakeups | [bot] | `{"at"?,"in_minutes"?,"prompt","reason"?,"thread_id"?}` → Wakeup и `deduplicated` (201, повтор 200), раздел 17 |
+| GET /api/bots/{id}/wakeups?status= | owner | `[Wakeup]` бота: активные по близости срока, затем история, до 100 (раздел 17) |
+| POST /api/bots/delegations | [bot] | `{"bot","task","turn_id"}` → `{"turn_id","thread_id"}` (201), раздел 19 |
+| GET /api/bots/delegations/{turn_id} | [bot] | `{"turn_id","thread_id","to_bot","status","result","error"}`; читает только бот, который поручил, иначе 404 (раздел 19) |
+| DELETE /api/wakeups/{id} | owner | `{"ok":true,"id"}`; чужое или несуществующее 404, не активное 409 `wakeup_not_active` (раздел 17) |
 | POST /hooks/{schedule_id}?token=T | внешний | тело любое JSON до 64 КБ, добавляется к prompt; всегда 202 `{"status":"accepted"}` без turn и без `id`: создан turn или запуск пропущен (бот на паузе, исполнитель недоступен, сбой проверки), по ответу не видно; пропуск записан (раздел 16) |
 | POST /api/files | [bot], mac-агент через ядро | multipart: file, thread_id, origin → File |
 | GET /api/files/{id} | owner | отдаёт файл (Content-Disposition) |
@@ -252,19 +258,21 @@ create table mac_status (
 | tool_call | `{"call_id","tool","args"}` |
 | tool_result | `{"call_id","ok": bool,"summary","data"?}` |
 | file | `{"file_id","name","size","mime","origin"}` |
-| approval_req | `{"approval_id","risk","title","tool","expires_at"}` |
-| approval_dec | `{"approval_id","decision","remember","client"}` |
+| approval_req | `{"approval_id","risk","title","tool","expires_at","checker"?}` |
+| approval_dec | `{"approval_id","decision","remember","client","reason"?,"checker"?}` |
 | usage | `{"tokens_in","tokens_out","model","seconds"}` в конце turn |
 | status | `{"turn_id","status"}` при смене статуса turn |
 | interrupted | `{"done_steps":[...],"saved":[...],"cancelled":[...]}` |
-| guard | `{"reason":"repeat_error|budget|timeout|runner_lost|runner_exited","detail"}` |
+| guard | `{"reason":"repeat_error|budget|timeout|runner_lost|runner_exited|mcp_not_allowed|mcp_allow_unsupported","detail"}` |
 | approval_expired | `{"turn_id","approval_id","tool","detail"}` approval истёк, turn закрыт (status `error`) |
+| checker_denied | `{"approval_id","tool","reason"}` проверяющая модель отклонила approval сама, раздел 19 |
 | budget_exceeded | `{"turn_id","spent","budget","tokens_in","tokens_out","detail"}` дневной бюджет исчерпан по ходу turn, turn закрыт (status `error`) |
 | system | `{"text"}` (смена устройства, смена модели, пробуждение Mac) |
 | compacted | `{"tokens_before","tokens_after","auto","reduction_percent","summary_chars"}` тред сжат, раздел 15 |
 | compact_failed | `{"detail"}`, при отказе от инструмента ещё `reason` и `tool`: ход сжатия не удался, тред не изменён, раздел 15 |
 | auto_compact_disabled | `{"reduction_percent"}` автосжатие треда выключено: сжатие дало меньше 30 процентов, раздел 15 |
 | proof | `{"check":"file_exists|http_ok|screenshot","ok": bool,"detail"}` |
+- Codex: при пустом `mcp_allow` раннер запускает codex с `--ignore-user-config`: `~/.codex/config.toml` бота не читается, сервер `bothub` задаётся только флагами `-c`. При непустом списке файл читается (там сторонние серверы владельца), и бот, который может его переписать, способен подменить или добавить сервер; вызов вне списка останавливает ход уже после старта вызова. Элементы `bothub*` и маски после точки (`github.*`) в списке отклоняются (422). Сервер `bothub` объявлен обязательным (`-c mcp_servers.bothub.required=true`): codex 0.156 иначе не ждёт его запуска перед первым запросом к модели, и инструменты то появлялись, то нет; сбой запуска теперь проваливает ход явно.
 
 Event JSON наружу: `{"thread_id","seq","ts","turn_id","kind","actor","client","payload"}`.
 
@@ -282,6 +290,13 @@ Event JSON наружу: `{"thread_id","seq","ts","turn_id","kind","actor","clie
 Никогда не проходят ни по правилам, ни по `mac_full_control`, ни по «запомнить»: риски `pay`, `delete`, `login`; установка ПО и запуск интерпретаторов или скриптов с возможностью записи (в том числе `python3 file.py`, `npm run`, `perl -e`, `python -W ... -c`, `sed -i`, `find -exec`, `awk system()`, `docker -v /`); отправка данных наружу из Bash (`curl`, `wget`, `dig`, `nc`, `scp`, `ssh`, `rsync`); команды, которые не удалось классифицировать (обфускация, `$(...)`, backticks, base64, eval, heredoc, незакрытые кавычки); не-словарные аргументы; `mac_delegate` и его alias; для Mac всё, кроме читающих инструментов и shell-команды, целиком состоящей из читающих программ (`git` в этом списке отсутствует). `mac_shell` с относительным, скрытым или непроверяемым `cwd` и чтением секретов требует подтверждения.
 
 `remember=true` при approve добавляет правило `{"tool": tool, "match": {все аргументы, точно}, "op_hash": "<SHA256>"}` и не добавляет ничего для действий из списка выше (в ответе `remember: false`).
+
+`bots.mcp_allow` (2026-10-06) = список разрешённых чужих MCP-инструментов; пусто = у бота только сервер `bothub`. Чужой инструмент (`mcp__<сервер>__<инструмент>`, сервер не `bothub`; у codex в событиях `<сервер>.<инструмент>`, имя приводится к тому же виду) проходит, только если подходит под элемент списка: точное имя, glob (`mcp__github__*`), `<сервер>.<инструмент>` или голое имя сервера (`github` = `mcp__github__*`). Список не авто-одобряет: разрешённый инструмент идёт по обычным правилам этого раздела (неизвестному нужно точное правило с непустым `match`), а `auto_allow` инструмент вне списка не открывает. Свои инструменты (`mcp__bothub__*`) и встроенные инструменты CLI (`Bash`, `Read`) списку не подчиняются. Свой сервер только ровно `bothub`: `bothub_`, `bothub_x`, `Bothub` и `mcp__bothub___x` (лишний `_` отходит серверу, это сервер `bothub_`) чужие. Сервер и инструмент сравниваются с маской по отдельности: `mcp__github__*` не открывает сервер `github_`. Имя, похожее на MCP-инструмент, но не разобравшееся (`mcp__github`, `mcp_tool_call`, имя с точкой и пробелом), считается чужим и не открывается никаким списком, в том числе `*`. Три слоя (`bothub/mcp_policy.py`):
+- ядро, `POST /api/approvals`: инструмент вне списка сразу получает `rejected`, в ответе поле `reason: "mcp_not_allowed"`, в тред пишется `approval_dec` от `system` с тем же `reason`; владельцу вопрос не приходит, одобрить такой вызов нельзя (как запрещённый адрес, раздел 13). Это единственный слой, который решает; остальные его дублируют;
+- `approve` в `mcp_server.py` (Claude): ответ ядра `rejected` с `reason: "mcp_not_allowed"` превращается в `{"behavior":"deny","message":"mcp_not_allowed"}`, ход продолжается. Раннер Claude при пустом списке добавляет `--strict-mcp-config`: серверы из настроек CLI в контейнере не поднимаются, работает только `bothub`; при непустом списке флага нет, инструменты чужих серверов режет `approve`;
+- раннеры codex и agy не спрашивают подтверждение: `SubprocessRunner.guard` видит `tool_call` чужого инструмента вне списка в потоке событий, останавливает процесс (`stop_exec` в контейнере) и бросает `McpNotAllowed`; ядро закрывает ход как `error` с событием `guard` `{"reason":"mcp_not_allowed","detail":"<инструмент>"}`. Вызов к этому моменту уже начат, поэтому это остановка, а не предотвращение. Сервер `bothub` codex получает флагами `-c mcp_servers.bothub.*` (адрес и токен берутся из окружения через `env_vars`, не из argv), а не из `~/.codex/config.toml`. Сам `-c` сливается с `config.toml`, а не заменяет его (проверено `codex mcp get` на 0.159), поэтому чужие серверы из `config.toml` остаются и их вызовы ловит `guard`. Флаг `--ignore-user-config` есть в 0.159, но не проверен в закреплённом в образе 0.156.1, поэтому не используется. Ход сжатия (раздел 15) в эту проверку не входит: его останавливает ядро первым же `tool_call`.
+- agy список не применяет: парсер не отдаёт `tool_call` (формат шагов инструментов не снят живьём). Ход с непустым `mcp_allow` не запускается: `GeminiRunner.command` бросает `McpAllowUnsupported`, ядро закрывает ход как `error` с событием `guard` `{"reason":"mcp_allow_unsupported","detail":"gemini"}` до запуска процесса. Пустой список для agy не гарантия: серверы из настроек agy не отключаются. Ход сжатия отказом не затрагивается.
+- Проверка тела (`POST`/`PATCH /api/bots`): до 200 элементов, 1–200 символов после обрезки краёв, без пробелов и непечатных символов внутри (иначе 422); пробелы по краям обрезаются, повторы убираются, порядок сохраняется.
 
 Для Claude: `--permission-prompt-tool mcp__bothub__approve`. Инструмент `approve` MCP-сервера получает `{"tool_name","input"}` и возвращает `{"behavior":"allow","updatedInput":input}` или `{"behavior":"deny","message":"..."}`. Риск определяется по таблице в `bothub/risk.py` (владелец: runner): имя инструмента и аргументы → risk. Чтение, поиск, скриншот = `other` и разрешены при `mac_full_control` или по правилам.
 
@@ -346,7 +361,7 @@ class RunnerEvent:
 - Ядро выбирает раннер по `bots.provider`, пишет RunnerEvent в events, сохраняет cli_session_id, считает шаги и повторы ошибок (guard).
 
 MCP-сервер `bothub` (stdio, `python -m bothub.mcp_server`, env `BOTHUB_URL`, `BOTHUB_TOKEN`, `BOTHUB_THREAD_ID`, `BOTHUB_TURN_ID`) даёт инструменты:
-`approve` (раздел 4), `mac_<tool>` для каждого инструмента Mac (через POST /api/mac/call), `attach_file` (путь в контейнере → POST /api/files), `remember` (POST /api/memory, статус proposed).
+`approve` (раздел 4), `mac_<tool>` для каждого инструмента Mac (через POST /api/mac/call), `attach_file` (путь в контейнере → POST /api/files), `remember` (POST /api/memory, статус proposed), `schedule_wakeup` (POST /api/bots/wakeups, раздел 17), `delegate_to_bot` и `delegation_result` (POST и GET /api/bots/delegations, раздел 19).
 
 `mac_delegate` требует подтверждения операции. При 409 он сразу отдаёт модели ошибку «Mac не в сети, выполни сам» без повтора. Таймаут вызова `/api/mac/call` = `args.timeout` (по умолчанию 900, максимум 1800) + запас 60 с, чтобы ядро дождалось ответа агента или таймаута.
 
@@ -435,6 +450,27 @@ PWA: экран «Новый бот» = поле описания + «Собра
 - PWA: на сетевую ошибку, 502 и 504 при создании бота экран не показывает ошибку, а перечитывает список ботов и ищет бота по имени и времени создания (не раньше начала запроса); найден: открывает его; нет: ошибка с кнопкой «Повторить». Бот в `starting` показан как «Запускается» (ввод доступен, под полем пояснение: сообщение подождёт запуска); список ботов перечитывается, пока есть бот в `starting`.
 
 Расписание и запуск процедуры (раздел 14): расписание `cron` бота, у которого есть неконечный запуск процедуры (`queued`, `running`, `waiting_approval`, `waiting_model`, `waiting_human`), планировщик пропускает. `next_run_at` не сдвигается, расписание срабатывает одним turn'ом на первом проходе после освобождения бота; сроки, пропущенные за время запуска, не копятся. Ожидание человека ограничено `BOTHUB_PROCEDURE_WAIT_HOURS` (по умолчанию 24 ч), так что откладывание не бесконечно.
+
+### Шаблон бота: экспорт и импорт файлом (2026-10-06, этап 11)
+
+Файл шаблона нужен, чтобы перенести бота на другую установку или поделиться настройками без истории. Формат задаёт ядро, клиент отдаёт его как есть.
+
+`GET /api/bots/{id}/export` (owner бота, чужой бот 404) — JSON-документ:
+```json
+{"format": "botstead-bot", "version": 1, "name": "Скаут", "role": "…", "instructions": "…",
+ "avatar": "scout", "executor": "container", "auto_allow": [{"tool": "…"}], "mcp_allow": ["…"],
+ "budget_daily_tokens": 200000, "auto_compact_percent": 80,
+ "schedules": [{"cron": "0 9 * * 1-5", "timezone": "Europe/Moscow", "prompt": "…", "enabled": true, "name": "…"}],
+ "procedures": [{"format": "bothub-procedure/1", "name": "Вход", "description": "…", "params": […], "steps": […]}]}
+```
+
+В экспорте нет: `id`, `owner_id`, `provider_id`/`model_id`, провайдера и модели строками, секретов, памяти, тредов, токенов, расхода, статуса, времени создания, контейнера. `auto_allow` и `mcp_allow` валидируются как обычные правила. Процедуры проходят через `procedures.export_document` (раздел 14), расписания — через `SELECT cron, timezone, prompt, enabled, name FROM bothub.schedules WHERE bot_id=$1 AND kind='cron'` (только cron, без hook и mac_folder).
+
+`POST /api/bots/import` (owner) — тело: тот же документ + опциональные `provider_id` и `model_id` (оба вместе или ни одного, UUID-строкой). Тело ≤ 256 КиБ (`Content-Length` больше — 413). Поля документа: только перечисленные выше; лишний ключ отдаёт 422 `{"error":"invalid","detail":"body: unknown_field: unknown field"}` (значение ключа в ответ не попадает). Каждое поле проверяет тот же валидатор, что у `BotIn`/`ScheduleIn`/`procedures.parse_import` (`name`, `role`, `instructions`, `avatar`, `executor`, `auto_allow`, `mcp_allow`, `budget_daily_tokens`, `auto_compact_percent`); `procedures` — `procedures.parse_import` для каждого, расписания — `check_timezone` и `croniter`. `provider_id`/`model_id` валидируются как UUID-строки; в БД ядро проверяет связку «провайдер владельца и включённая модель» тем же запросом, что в `POST /api/bots`.
+
+Импорт создаёт нового бота, его расписания и процедуры в одной транзакции: ошибка на любом шаге не оставляет полубота. Имя бота и имена процедур (у процедур `unique (owner_id, name)`) при коллизии получают ` (2)`, ` (3)` и так далее, база укорачивается под предел длины. `executor` только `container` или `mac` (иначе 422 `executor: unsupported`). Бот создаётся общей функцией `insert_bot`, той же, что у `POST /api/bots`: связка `provider_id`/`model_id` проверяется тем же запросом (`runner_provider`/`binding.name`). Без `provider_id` раннер получается `fake`, как у `provider: "fake"` в `POST /api/bots`: PWA всегда передаёт выбранную модель, прямой вызов без неё создаёт бота без рабочей модели. Процедуры привязываются к новому боту (`bot_id` ставится при вставке), источник `'import'`. `mac_full_control` всегда `false`. Контейнер стартует так же, как после `POST /api/bots` (`BOTHUB_RUNNER_EXEC=docker`: ответ `"container": "starting"`, запуск фоном после коммита); без docker ответ `"container": "skipped"`. Ответ: запись бота + `recreate_url: null`, статус 201.
+
+PWA: в настройках бота карточка «Экспорт шаблона» (файл `<name>.botstead.json`); на экране `#/bots/new` рядом с «Собрать» кнопка «Создать из файла» (`.botstead.json` или `.json`, до 1 МБ; при разборе показывает имя, роль, число расписаний и процедур, дальше тот же шаг выбора модели и кнопка «Создать»).
 
 ## 10. Пользователи, инвайты, сессии (2026-10-04, миграция `004_users_providers.sql`)
 
@@ -913,10 +949,10 @@ procedure_runs (id uuid pk, procedure_id → procedures on delete cascade, proce
 | kind | Источник | codes (`title.code`) и params |
 | --- | --- | --- |
 | `turn` | `turns` | `turn_started`, `turn_done`, `turn_error`, `turn_stopped`; `client`. Служебный ход сжатия (`turn_type=compact`, раздел 15) даёт `compact_started`, `compact_done`, `compact_failed` (`auto`: сжатие поставило ядро), кодов `turn_*` у него нет |
-| `approval` | `approvals` | `approval_requested`, `approval_approved`, `approval_rejected`, `approval_expired`; `tool`; в `detail` заголовок |
+| `approval` | `approvals` | `approval_requested`, `approval_approved`, `approval_rejected`, `checker_denied` (раздел 19), `approval_expired`; `tool`; в `detail` заголовок |
 | `browser` | `events.kind='browser_step'` | `browser_step`; `action`, `target`, `url` (схема://хост/путь, без query и логина) |
 | `takeover` | `events.kind='browser_control'` | `takeover_started` (на `human`), `takeover_returned` (на `returning`), `takeover_bot`; `from`, `to` |
-| `schedule` | `turns.client in ('schedule','hook')`, `activity_log` | `schedule_run`, `hook_run` (`name`, `schedule_id`), `schedule_skipped` (`reason`, `count`, `paused`, `schedule_id`, `name`), `schedule_resumed` |
+| `schedule` | `turns.client in ('schedule','hook')`, `activity_log` | `schedule_run`, `hook_run` (`name`, `schedule_id`), `schedule_skipped` (`reason`, `count`, `paused`, `schedule_id`, `name`), `schedule_resumed`, `wakeup_scheduled`, `wakeup_fired`, `wakeup_skipped` (`wakeup_id`, `scheduled_at`, у пропуска `reason`; в `detail` причина, которую назвал бот; раздел 17), `delegation_sent`, `delegation_done` (`from_bot`, `to_bot`, `to_bot_id`, `turn_id`, у завершения `outcome`; в `detail` текст задачи; раздел 19) |
 | `procedure` | `procedure_runs` | `procedure_started`, `procedure_finished`; `name`, `procedure_id`, `run_id` |
 | `memory` | `memory` с `source like 'bot:%'` | `memory_proposed`; `memory_id`, в `detail` текст |
 | `pause` | `activity_log` | `bot_paused` (`reason?`, `by_all?`), `bot_resumed` |
@@ -957,3 +993,174 @@ procedure_runs (id uuid pk, procedure_id → procedures on delete cascade, proce
 - Исполнитель снова доступен: если были пропуски или пауза, пишется `schedule_resumed` (лента и тред), счётчик и флаг сбрасываются. Расписание вне паузы запускается как обычно (его срок настал). Расписание в `paused_by_unavailable` проверялось не по cron, поэтому запускает turn один раз только при `catch_up=true`, иначе ждёт своего cron. Пропущенные запуски пачкой не догоняются. Для hook `catch_up` не действует: любой следующий принятый hook запускает turn.
 - Hook: ответ всегда `202 {"status":"accepted"}`, и при созданном turn, и при пропуске (пауза, исполнитель, провайдер, сбой проверки). Идентификатора turn в ответе нет, поэтому внешний отправитель по коду, телу и заголовкам не узнаёт состояние бота. Порядок действий один: проверка и постановка в очередь (или запись пропуска) идут до ответа в обоих случаях, так что и по времени ответа разница небольшая (создание turn пишет чуть больше строк, чем запись пропуска). Созданный turn владелец видит в треде расписания (событие `user_msg` с промптом). Идентификатор turn из ответа hook в продукте не использовался (PWA, Mac-агент, e2e его не читают); если понадобится, отдавать его можно только маршруту, который аутентифицирован владельцем. Бот, который сломался между проверкой и постановкой (`require_available_bot`, 409), тоже даёт пропуск и тот же 202. Неверный токен по-прежнему 403 и пропуском не считается. Пять пропусков подряд помечают расписание `paused_by_unavailable` (для отображения), первый принятый hook после возвращения исполнителя пишет `schedule_resumed`.
 - Решения (причина, счётчик, троттлинг, возобновление) это чистые функции `activity.skip_reason`, `plan_skip`, `plan_resume`; ядро только выполняет их.
+
+## 17. Самопробуждение бота (миграция `025_wakeups.sql`)
+
+Бот сам просит ядро разбудить его позже: MCP-инструмент `schedule_wakeup` кладёт строку в `bothub.wakeups`, планировщик расписаний в нужный момент создаёт turn. Владелец видит запланированное в настройках бота, отменяет его и находит срабатывания в ленте. Чистая логика в `core/bothub/wakeups.py`, маршруты и исполнение в `main.py`, инструмент в `mcp_server.py`.
+
+### Таблица `bothub.wakeups`
+
+`id uuid`, `bot_id` (внешний ключ на `bots`, `on delete cascade`), `scheduled_at timestamptz`, `status` (`active|fired|skipped`), `prompt` (1–2000 символов), `reason` (до 200, по умолчанию пусто), `created_at`, `fired_at`. Сверх обязательных колонок две служебные: `thread_id` (тред, из которого бот попросил пробуждение; внешний ключ `on delete set null`) и `skip_reason` (`executor_unavailable|bot_paused|provider_unavailable|check_failed`, как у пауз триггеров, раздел 16). Отдельного `owner_id` нет: владелец определяется через `bots.owner_id`, как у `turns` и `approvals`. Индексы: `wakeups_due_idx(scheduled_at) where status='active'` для планировщика и `wakeups_bot_idx(bot_id, scheduled_at desc)` для списка бота. Миграция расширяет и `activity_log_code_check` тремя кодами событий.
+
+### MCP-инструмент `schedule_wakeup`
+
+Вызов не требует одобрения владельца (как `remember`): он только ставит будущий ход этому же боту, пробуждения видны в ленте и отменяются в настройках бота. Пробуждение, которое не удалось запустить в течение 15 минут, закрывается пропуском с причиной `fire_failed`.
+
+
+`schedule_wakeup(prompt, reason?, at?, in_minutes?)`: ровно одно из `at` (ISO 8601; без пояса считается UTC, как остальные даты от клиента) и `in_minutes` (целое). Инструмент шлёт `POST /api/bots/wakeups` с токеном бота и `thread_id` текущего треда (`BOTHUB_THREAD_ID`). Ответ ядра возвращается как `{"ok": true, ...Wakeup, "deduplicated": bool}`; отказ ядра как `{"ok": false, "error": "<код>"}`, чтобы модель видела причину и могла исправить вызов. `prompt` и `reason` инструмент проверяет сам, до запроса. По `risk.classify` инструмент не из списка «только чтение»: без правила `auto_allow` он просит подтверждение владельца, как любое другое действие, меняющее состояние.
+
+### `POST /api/bots/wakeups`
+
+Только токен бота (владелец, Mac-агент: 403; без входа 401). Тело (`extra=forbid`): `at`, `in_minutes`, `prompt`, `reason`, `thread_id` (свой тред бота, иначе 404 или 403 как у других маршрутов бота).
+
+| Правило | Значение | Отказ |
+| --- | --- | --- |
+| Срок | не раньше чем через 1 минуту и не позже чем через 30 дней от момента запроса, границы включены (`in_minutes` от 1 до 43200) | 400 `invalid`, detail `too_soon` или `too_far` |
+| Способ задать срок | ровно одно из `at` и `in_minutes` | 400, detail `time_required` или `time_conflict` |
+| Формат | `at` разбирается как ISO 8601, `in_minutes` целое (не строка, не булево) | 400, detail `at_invalid` или 400 `invalid` на схеме тела |
+| `prompt` | непустой (пробелы не считаются), до 2000 символов | 400 `prompt_empty`, 422 `prompt_too_long` |
+| `reason` | до 200 символов | 422 `reason_too_long` |
+| Активные | не больше 20 на бота | 409 `{"error":"conflict","detail":"wakeup_limit"}` |
+| Идемпотентность | активное пробуждение этого бота с тем же `prompt` и сроком в пределах ±1 минуты возвращается как есть | 200 вместо 201, `deduplicated: true` |
+
+Повтор проверяется раньше предела: бот с 20 активными пробуждениями, повторивший свой вызов, получает то же пробуждение, а не отказ. Разные `prompt` в ту же минуту это разные пробуждения. Строка бота берётся `for update`, поэтому два параллельных вызова не обходят предел и не плодят дубли. Ответ 201: `{id, bot_id, thread_id, scheduled_at, status, prompt, reason, skip_reason, created_at, fired_at, deduplicated}`. При создании пишется `wakeup_scheduled` в ленту и системное событие `{"text","code":"wakeup_scheduled","wakeup_id"}` в тред (если он передан).
+
+### Исполнение
+
+Тот же цикл `scheduler` (интервал `BOTHUB_SCHEDULER_INTERVAL`, 30 с): `scheduler_tick` сначала вызывает `run_due_schedules`, затем `run_due_wakeups`; сбой первого не отменяет второй. `run_due_wakeups` выбирает активные строки со сроком не позже `now()` у активных пользователей (`for update of w skip locked`) и, как расписание, откладывает бота с неконечным запуском процедуры (строка остаётся `active` и срабатывает на первом проходе после освобождения). Исполнитель проверяет та же `trigger_block` (раздел 16), решение принимает чистая `wakeups.decide(block, scheduled_at, now)`:
+
+- причины нет: `fire`. Тред: тред бота, из которого пришёл запрос, если он ещё `active`; иначе новый тред `kind=routine` с названием «Пробуждение: <причина>» (до 80 символов). В тред ставится turn `client='wakeup'` (событие `user_msg` с `actor = "bot:<bot_id>"`: сообщение от самого бота, не от владельца) с текстом «Самопробуждение: ты сам запланировал этот запуск. Причина: <reason>» и `prompt` через пустую строку. Строка получает `status='fired'`, `fired_at`, `thread_id`; в ленту идёт `wakeup_fired`. Опоздание не ограничено: если ядро лежало, пробуждение срабатывает при первом проходе, пока исполнитель доступен;
+- `bot_paused`: `skip` сразу (пауза это явное решение владельца): `status='skipped'`, `skip_reason`, событие `wakeup_skipped` в ленту и системное событие `{"text","code":"wakeup_skipped","reason"}` в тред;
+- остальные причины (`executor_unavailable`, `provider_unavailable`, `check_failed`): `wait` (строка остаётся `active`, проверка на следующем проходе), а через 15 минут после срока (`wakeups.GRACE`) `skip` с той же записью. Так перезапуск контейнера на минуту пробуждения не съедает, а исполнитель, который не вернулся, не держит его бесконечно.
+
+Сбой одного пробуждения (исключение внутри savepoint) пишется в журнал и не откатывает остальные; строка остаётся `active` и пробуется снова.
+
+### Маршруты владельца
+
+- `GET /api/bots/{id}/wakeups?status=active|fired|skipped`: только свой бот (чужой или несуществующий 404; токен бота 403; неизвестный `status` 422 `invalid`, detail `status`). Ответ: массив `Wakeup`, не больше 100: активные по возрастанию `scheduled_at`, за ними история от новых к старым.
+- `DELETE /api/wakeups/{id}`: отмена удаляет строку. Чужое и несуществующее 404, токен бота 403. Уже сработавшее или пропущенное не удаляется: 409 `{"error":"conflict","detail":"wakeup_not_active"}`. Гонка с планировщиком решается условным `delete ... where status='active'`. Отдельного события отмены нет.
+
+Изменяющие запросы по cookie требуют `X-CSRF` и `Origin`, как везде.
+
+### События активности
+
+Журнал `activity_log` вида `schedule` (фильтр `kind=schedule` в `GET /api/activity` их показывает): `wakeup_scheduled`, `wakeup_fired`, `wakeup_skipped`. Параметры: `wakeup_id`, `scheduled_at` (ISO, UTC), у пропуска `reason` (код причины); текст, который бот назвал в `reason`, лента отдаёт полем `detail` (до 200 символов, PWA помечает его `data-i18n-skip`). Срабатывание ещё и обычный turn в ленте (`turn_started`, `client: "wakeup"`).
+
+### PWA
+
+В настройках бота (`#/bots/<id>`, телефон и Mac) карточка «Пробуждения бота» (`[data-wakeups]`): активные пробуждения со сроком, причиной и кнопкой «Отменить» (`DELETE /api/wakeups/{id}`), пустое состояние, ошибка загрузки с кнопкой «Повторить». Мок-режим: `?mock=1`, `&wakeups=fail` ломает загрузку.
+
+## 18. Адаптеры вебхуков GitHub и Slack (этап 10, 2026-10-06)
+
+Для расписаний типа `hook` (`schedules.kind = 'hook'`) поверх универсального вызова `POST /hooks/{id}` добавлены два специализированных адаптера:
+
+- `POST /hooks/{id}/github`: адаптер вебхуков GitHub.
+- `POST /hooks/{id}/slack`: адаптер Events API Slack.
+
+Оба адаптера сохраняют общий предел тела запроса 64 КиБ (при превышении 413 `invalid`), проверку активности пользователя и включённого состояния расписания (иначе 404), а также правило ответа 202 `{"status":"accepted"}` для принятых в очередь и пропущенных событий. При неверной или отсутствующей подписи возвращается 403 `forbidden`. Подпись сырого тела проверяется до разбора JSON (невалидный JSON с неверной подписью даёт 403, с верной 400 `invalid`); предел 64 КиБ применяется по `Content-Length` и по ходу чтения потока; сравнение подписи идёт по байтам, не-ASCII в заголовке даёт 403.
+
+#### Адаптер GitHub (`POST /hooks/{id}/github`)
+
+1. **Заголовки и проверка подписи.**
+   - `X-Hub-Signature-256`: заголовок подписи в формате `sha256=<hex>` (HMAC-SHA256 сырого тела запроса с секретом `hook_token` расписания). Сравнение выполняется за постоянное время (`hmac.compare_digest`). Неверная или отсутствующая подпись даёт 403.
+   - `X-GitHub-Event`: тип события GitHub.
+2. **Обработка событий.**
+   - Событие `ping`: отвечает 202 `{"status":"accepted"}` без постановки turn в очередь.
+   - Поддерживаемые события: `issues`, `issue_comment`, `pull_request`, `pull_request_review`, `push`, `workflow_run`. Для них формируется короткий русскоязычный текст промпта с полями: событие, репозиторий (`full_name`), действие (`action`), заголовок и номер задачи или PR (либо ref для push), логин автора, ссылка (`html_url`) и первые 2000 символов описания, комментария или сообщений коммитов. Этот текст добавляется к базовому `schedule.prompt` и ставится в очередь turn бота через общую логику ядра.
+   - Остальные события: отвечают 202 `{"status":"accepted"}` и пропускаются без создания turn.
+3. **Настройка в GitHub.**
+   - В настройках репозитория или организации открыть раздел Webhooks и нажать «Add webhook».
+   - Payload URL: `https://<домен>/bots/hooks/<schedule_id>/github`.
+   - Content type: `application/json`.
+   - Secret: скопировать значение `hook_token` из параметров расписания в Bothub.
+   - Which events would you like to trigger this webhook: выбрать «Let me select individual events» и отметить нужные события (Issues, Issue comments, Pull requests, Pull request reviews, Pushes, Workflow runs).
+   - Нажать «Add webhook». GitHub отправит пинг, ядро ответит 202.
+
+#### Адаптер Slack (`POST /hooks/{id}/slack`)
+
+1. **Заголовки и проверка подписи.**
+   - `X-Slack-Request-Timestamp`: unix-время отправки запроса в секундах. Если разница с текущим временем сервера превышает 5 минут (300 секунд), запрос отклоняется с 403.
+   - `X-Slack-Signature`: сигнатура в формате `v0=<hex>`, вычисляемая как HMAC-SHA256 от строки `v0:{X-Slack-Request-Timestamp}:{сырое тело}` с Signing Secret приложения Slack, сохранённым в расписании (`schedules.slack_signing_secret`, миграция `028_slack_signing_secret.sql`). `hook_token` для Slack не используется: Slack подписывает своим секретом, который владелец выбрать не может. Если секрет не задан, адаптер отвечает 403. Сравнение выполняется за постоянное время.
+2. **Обработка событий.**
+   - Подтверждение адреса (`url_verification`): если тело запроса содержит `{"type": "url_verification", "challenge": "..."}`, ядро возвращает `{"challenge": "..."}` со статусом HTTP 200.
+   - Обратные вызовы (`event_callback`): для событий `app_mention` и `message` (без `bot_id` и без `subtype`, чтобы игнорировать сообщения ботов и системные события) формируется промпт с каналом, пользователем и текстом сообщения (до 2000 символов). Промпт ставится в очередь turn бота через общую логику ядра.
+   - Другие события и типы вызовов: отвечают 202 `{"status":"accepted"}` без постановки задачи в очередь.
+3. **Настройка в Slack.**
+   - В консоли управления приложением Slack (api.slack.com/apps) открыть раздел «Event Subscriptions» и включить переключатель «Enable Events».
+   - В поле «Request URL» ввести адрес `https://<домен>/bots/hooks/<schedule_id>/slack`.
+   - В разделе «Basic Information -> App Credentials» скопировать «Signing Secret» и вставить его в поле «Секрет подписи Slack» расписания Bothub (`PATCH /api/schedules/{id}` с `{"slack_signing_secret": "..."}`; `null` очищает). Секрет хранится зашифрованным (AES-GCM, AAD = id расписания), только на запись: API возвращает лишь `has_slack_signing_secret: true|false`. Без заданного секрета подписанные запросы Slack, включая `url_verification`, получают 403.
+   - Slack автоматически отправит запрос `url_verification`. Ядро ответит вызовом challenge (200 OK), и статус адреса сменится на «Verified».
+   - В подразделе «Subscribe to bot events» добавить необходимые события: `app_mention` и `message.channels`.
+   - Сохранить изменения и выполнить установку приложения в нужное рабочее пространство Slack.
+
+
+## 19. Поручения бота боту (этап 11, миграция `027_delegation.sql`)
+
+Бот передаёт задачу другому боту того же владельца: MCP-инструмент `delegate_to_bot` ставит turn получателю и сразу возвращает его id, результат бот читает позже инструментом `delegation_result`. Чистая логика (пределы, выбор получателя, текст результата) в `core/bothub/delegation.py`, маршруты в `core/bothub/main.py` рядом с самопробуждением.
+
+### Колонки `bothub.turns`
+
+`delegated_from_turn uuid` (turn бота-отправителя, внешний ключ на `turns`, `on delete set null`) и `delegated_by_bot text` (id бота-отправителя, без внешнего ключа: запись переживает удаление бота). У обычных turn'ов обе колонки `null`. Индекс `turns_delegated_by_idx (delegated_by_bot, status)` обслуживает счётчик активных поручений. Та же миграция расширяет CHECK `activity_log_code_check` кодами `delegation_sent` и `delegation_done`.
+
+### MCP-инструменты
+
+- `delegate_to_bot(bot, task)`: `bot` имя (без учёта регистра) или id бота того же владельца, `task` от 1 до 4000 символов. Шлёт `POST /api/bots/delegations` с токеном бота и `turn_id` текущего хода (`BOTHUB_TURN_ID`). Возвращает `{"ok": true, "turn_id", "thread_id"}` сразу, не дожидаясь выполнения; отказ приходит данными: `{"ok": false, "error": <код>}`. Длину `task` и пустой `bot` инструмент проверяет до запроса теми же функциями `delegation.clean_*`.
+- `delegation_result(turn_id)`: `GET /api/bots/delegations/{turn_id}`. Возвращает `{"ok": true, "turn_id", "thread_id", "to_bot", "status", "result", "error"}`.
+
+Одобрение. `delegate_to_bot` не входит в `READ_ONLY_TOOLS`: `risk.classify` даёт ему метку `other`, `permission_class` равен `unknown`, поэтому `decide` разрешает вызов без владельца только по точному правилу `auto_allow` (имя инструмента без glob, непустой `match`, закреплённый `op_hash`, как у правила после «запомнить»). Без такого правила вызов уходит владельцу на одобрение, как другие записи. `delegation_result` только читает и входит в `READ_ONLY_TOOLS` (`mcp__bothub__delegation_result`), но у ядра есть своя проверка: результат видит лишь бот, который поручил.
+
+### `POST /api/bots/delegations`
+
+Только токен бота (владелец, Mac-агент: 403; без входа 401). Тело (`extra=forbid`): `bot`, `task`, `turn_id` (turn этого бота, иначе 404 `turn_not_found`). Ответ 201: `{"turn_id", "thread_id"}`.
+
+| Правило | Значение | Отказ |
+| --- | --- | --- |
+| `task` | непустой (пробелы не считаются), до 4000 символов | 422 `invalid`, detail `task_empty` или `task_too_long` |
+| `bot` | строка до 200 символов: id, иначе имя без учёта регистра среди ботов того же владельца | 422 `bot_invalid`; не найден (в том числе бот чужого владельца) 404 `bot_not_found`; два бота с одним именем 409 `bot_ambiguous` |
+| Себе | отправитель и получатель разные боты | 409 `conflict`, detail `self_delegation` |
+| Получатель | не на паузе, не `no_model`, не `error_starting` | 409 `target_paused`, `target_no_model`, `target_error_starting` |
+| Глубина | turn, созданный поручением (`delegated_by_bot is not null`, `delegated_from_turn is not null` или `client='delegate'`), поручать дальше не может | 409 `delegation_depth` |
+| Активные | не больше 5 turn'ов с `delegated_by_bot = отправитель` в статусах `queued`, `running`, `waiting_approval`, `waiting_mac` | 409 `delegation_limit` |
+
+Строка бота-отправителя берётся `for update`, поэтому параллельные вызовы не обходят предел. Всё делается одной транзакцией.
+
+Тред получателя: самый свежий (по последнему событию, иначе по созданию) активный тред `kind='direct'` без `dry_run`; если такого нет, создаётся новый `direct` с названием «Поручения от <имя отправителя>». В нём создаётся turn `client='delegate'` с `delegated_from_turn` и `delegated_by_bot` и событие `user_msg`: `actor = "bot:<id отправителя>"`, `client='delegate'`, `payload = {"text": "Поручение от бота <имя>:\n\n<task>", "delegated_from": {"bot_id", "name"}}`. Событие уходит подписчикам треда после коммита. Дальше turn идёт обычной очередью: если в треде уже идёт другой turn, поручение ждёт.
+
+### `GET /api/bots/delegations/{turn_id}`
+
+Только токен бота. Читает бот, который поручил: чужой, несуществующий и обычный turn дают 404 (получатель тоже читать не может). Ответ: `{"turn_id", "thread_id", "to_bot", "status", "result", "error"}`. `status` это статус turn'а (`queued|running|waiting_approval|waiting_mac|done|stopped|error`). `result` непустое только при `done`: текст `assistant_msg` после последнего вызова инструмента этого turn'а (промежуточные реплики перед инструментами не берутся; если после инструментов текста нет, берётся весь текст), склеенный как ответ бота (`context.join_assistant`), не больше 8000 символов. `error` заполнено при `status='error'`.
+
+### События активности
+
+Журнал `activity_log` вида `schedule` (фильтр `kind=schedule` в `GET /api/activity`), строки пишутся на имя бота-отправителя (`bot_id`), `thread_id` это тред получателя:
+
+- `delegation_sent`: при постановке. Параметры `from_bot`, `to_bot` (имена), `to_bot_id`, `turn_id`; текст задачи (до 200 символов) лента отдаёт полем `detail`.
+- `delegation_done`: когда turn поручения закончился. Те же параметры и `outcome` (`done`, `error` или `stopped`). Событие пишет `append_event` при записи события `status` с конечным статусом, поэтому оно одно на turn и не зависит от того, как turn закрылся (штатно, остановка, ошибка, перезапуск ядра).
+
+### PWA
+
+В треде получателя сообщение с `payload.delegated_from` рисуется в обёртке `.msg-user-wrap` с меткой `[data-delegated-from]` «От бота <имя>» над пузырём `.msg-user`; имя бота и текст поручения это данные (`data-i18n-skip`), слово «От бота» переводится. В ленте активности строки «Бот передал задачу другому боту» и «Поручение выполнено» (у ошибки и остановки свои подписи) с подписью «<от> → <кому>». Мок-режим `?mock=1`: Скаут поручил Архиву разложить скан договора (тред `t-archive`).
+
+## 20. Проверяющая модель действий (этап 11, миграция `029_action_checker.sql`)
+
+Вторая оценка рискованного действия бота до того, как его увидит владелец. Необязательна: без настройки ничего не меняется.
+
+**Настройка.** `bots.checker_model_id` (uuid, nullable, внешний ключ на `models(id)`, `on delete set null`): модель из реестра владельца (раздел 11). Задаётся в `POST /api/bots` и `PATCH /api/bots/{id}` (`null` выключает). Модель должна быть включённой моделью провайдера того же владельца и не подписки (`cli_subscription`): у подписки нет ключа для прямого запроса. Иначе 400 `invalid`, `detail: "checker model unavailable"`. В шаблон бота (раздел 9) поле не экспортируется. В PWA: настройки бота, поле «Проверяющая модель» (выбор из включённых моделей API-провайдеров, пустое значение «Не задана»).
+
+**Когда проверяется.** В `POST /api/approvals`, если после `decide_permission` approval остаётся `pending`, у бота задана проверяющая модель и риск один из `pay`, `send`, `delete`, `login`, `push`, `exec` (всё, кроме `other`: чтение и прочее не проверяются). Approval с отказом по `forbidden_reason`/`mcp_allow` и авторазрешённые модель не видит. Запросы процедур (раздел 14) идут мимо этого маршрута и не проверяются.
+
+**Запрос.** Один прямой HTTP-запрос к API провайдера модели (`bothub/checker.py`) на закреплённый проверенный IP: та же проверка адреса, `host` и SNI исходного имени, одобренные администратором приватные IP, запрет редиректов, что у пробного запроса списка моделей (раздел 11). Ключ провайдера идёт только в заголовок аутентификации. Не больше одного запроса на approval, таймаут 20 с (вместе с DNS), ответ не больше 256 КиБ, выход до 300 токенов. Формат запроса по типу провайдера: `anthropic_api` `POST /v1/messages`, `openai_api` и `openai_compatible` `POST /v1/chat/completions`, `google_api` `POST /v1beta/models/<модель>:generateContent`.
+
+Фиксированный системный промпт (английский, в `checker.SYSTEM_PROMPT`) требует ответ строго одним JSON `{"verdict":"allow|deny|ask","reason":"<=200 chars"}` и объявляет всё внутри тегов `<role>`, `<request>`, `<action>` недоверенными данными. Сообщение пользователя: `<role>` роль бота (до 512 символов), `<request>` последнее сообщение владельца в ходе (`user_msg` этого `turn_id`, при его отсутствии последнее в треде; первые 2000 символов), `<action>` имя инструмента и аргументы. Аргументы берутся из approval уже после маскирования браузера (`mask_browser_args`), затем ещё раз: значения полей с именами `password`, `secret`, `token`, `api_key`, `authorization`, `cookie` и подобных заменяются на `[скрыто]`, строки, похожие на ключи и токены (`sk-…`, `Bearer …`, `ghp_…`, `xox…`, `AKIA…`), тоже, управляющие и невидимые символы убираются, JSON обрезается до 4000 символов.
+
+**Разбор ответа.** Берётся первый JSON-объект в тексте (допускается обёртка в markdown). `verdict` без учёта регистра и пробелов; причина обрезается до 200 символов, переводы строк склеиваются. Неизвестный или отсутствующий `verdict`, не JSON, пустой ответ, сетевая ошибка, ответ не 200, редирект, превышение размера, недоступный адрес, нет модели или ключа, таймаут: `verdict: "ask"` с причиной «проверяющая модель не ответила вовремя», «проверяющая модель недоступна» или «проверяющая модель ответила не по формату». Сбой проверки никогда не отклоняет и не разрешает действие.
+
+**Эффект.**
+- `deny`: approval создаётся сразу в `rejected` (`decided_from='checker'`, `decided_at` заполнен), ответ `POST /api/approvals` несёт `reason: "checker_denied"`, `checker_verdict`, `checker_reason`. Владельцу вопрос не приходит (в `GET /api/approvals?status=pending` его нет). В тред пишутся события `approval_req` (с полем `checker`, чтобы в ленте была карточка), `approval_dec` от `system` с `decision: "rejected"`, `reason: "checker_denied"`, `checker`, и `checker_denied`. Бот получает отказ как обычно: `approve` в `mcp_server.py` возвращает `{"behavior":"deny","message":"checker_denied: <причина>"}`, ход продолжается.
+- `allow` и `ask`: approval остаётся `pending` и ждёт владельца. `allow` ничего не разрешает сам. Вердикт и причина лежат в `approvals.checker_verdict` и `checker_reason` (видны в `GET /api/approvals`) и в `approval_req.payload.checker`.
+
+**Данные.** `approvals.checker_verdict` (`allow|deny|ask`, null: проверки не было), `approvals.checker_reason` (до 200 символов).
+
+**События.** `approval_req.payload.checker` = `{"verdict","reason"}` (необязательное поле), `approval_dec.payload.reason = "checker_denied"` и `checker`, новый вид `checker_denied` с `payload` `{"approval_id","tool","reason"}`. Лента активности (раздел 16): запись вида `approval` с кодом `checker_denied` вместо `approval_rejected`, если approval закрыла проверяющая модель.
+
+**PWA.** Карточка подтверждения (тред, экран «Решения»): строка «Проверка: <вердикт> · <причина>» под заголовком; автоотказ показывается как «Отклонено проверяющей моделью» без кнопок. Мок `?mock=1`: `ap2` несёт подсказку `ask`.

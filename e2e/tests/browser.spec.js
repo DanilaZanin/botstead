@@ -473,6 +473,16 @@ test.describe('6. состояния экрана', () => {
 });
 
 test.describe('7. входы и перенаправление', () => {
+  test('смена hash с экрана браузера открывает тред без перезагрузки', async ({ page }) => {
+    await openBrowser(page, '&browser=refused');
+    await expect(page.getByRole('heading', { name: 'Экран не открылся' })).toBeVisible({ timeout: 10_000 });
+    await page.evaluate(() => { location.hash = '#/threads/t-sre'; });
+    await ready(page);
+    await expect(page.locator('#composer-input')).toBeVisible();
+    await expect(page.locator('#composer-input')).toBeEnabled();
+    await expect(page.getByRole('heading', { name: /Браузер · SRE/ })).toHaveCount(0);
+  });
+
   test('из треда: «Экран» ведёт на экран браузера', async ({ page }, testInfo) => {
     await page.goto('/?mock=1#/threads/t-sre');
     await ready(page);

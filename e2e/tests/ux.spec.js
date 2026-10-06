@@ -532,3 +532,25 @@ test.describe('вход по подписке: проверка при откр�
     await expect(page.locator('#cl-idle')).toContainText('The terminal opens if you need to sign in again.');
   });
 });
+
+test('ошибка в коде страницы не выдаётся за обрыв связи', async ({ page }) => {
+  await page.goto('/?mock=1');
+  const out = await page.evaluate(async () => {
+    const { failure } = await import('/account.js');
+    return {
+      net: failure(new TypeError('Failed to fetch')).title,
+      safari: failure(new TypeError('Load failed')).title,
+      bug: failure(new TypeError("Cannot read properties of undefined (reading 'x')")).title,
+      server: failure({ status: 500 }).title,
+    };
+  });
+  expect(out).toEqual({ net: 'Сервер не отвечает', safari: 'Сервер не отвечает', bug: 'Ошибка в приложении', server: 'Ошибка сервера' });
+});
+
+test('статус error у бота подписан словом «Ошибка», а не «Стоп»', async ({ page, isMobile }) => {
+  test.skip(isMobile, 'боковая панель только на Mac');
+  await page.goto('/?mock=1#/');
+  const row = page.locator('.desktop-bot-row[data-bot-status="error"]').first();
+  await expect(row.locator('.status-line')).toHaveText('Ошибка');
+  await expect(page.locator('.desktop-bot-row .status-line', { hasText: 'Стоп' })).toHaveCount(0);
+});

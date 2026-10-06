@@ -342,4 +342,16 @@ export default {
   'Не удалось скопировать ссылку: откройте её кнопкой выше.': 'Could not copy the link: open it with the button above.',
   'Код скопирован.': 'Code copied.',
   'Не удалось скопировать код: выделите его на экране вручную.': 'Could not copy the code: select it on screen manually.',
+
+  // 2026-10-06 audit
+  'Компьютер бота не запущен': 'Bot computer is not running',
+  'Процедура с таким названием уже есть': 'Procedure with this name already exists',
+  'Сервер компьютеров не ответил. Попробуйте ещё раз.': 'Computer server did not respond. Try again.',
+  'Ссылка скопирована.': 'Link copied.',
+  'Укажите значение': 'Specify a value',
+  'Управление не передано, бот продолжает работать.': 'Control not transferred, bot continues running.',
+  'аккаунт Google': 'Google account',
+  'подписка ChatGPT': 'ChatGPT subscription',
+  'подписка Claude': 'Claude subscription',
+  'только что': 'just now',
 };

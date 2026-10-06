@@ -59,6 +59,8 @@ def test_route_authorization_inventory():
         ("GET", "/api/invites/check"),
         ("POST", "/api/invites/accept"),
         ("POST", "/hooks/{id}"),
+        ("POST", "/hooks/{id}/github"),
+        ("POST", "/hooks/{id}/slack"),
     }
     protected = {
         ("GET", "/api/auth/me"), ("POST", "/api/auth/logout"),
@@ -90,6 +92,7 @@ def test_route_authorization_inventory():
         ("GET", "/api/models"), ("PATCH", "/api/models/{id}"),
         ("POST", "/api/models/refresh"),
         ("DELETE", "/api/bots/{id}"), ("POST", "/api/bots/{id}/recreate"),
+        ("POST", "/api/bots/import"), ("GET", "/api/bots/{id}/export"),
         ("GET", "/api/bots/{id}/browser"),
         ("POST", "/api/bots/{id}/browser/takeover"),
         ("POST", "/api/bots/{id}/browser/return"),
@@ -104,6 +107,8 @@ def test_route_authorization_inventory():
         ("GET", "/api/secrets"),
         ("GET", "/api/activity"), ("POST", "/api/bots/{id}/pause"), ("POST", "/api/bots/{id}/resume"),
         ("POST", "/api/bots/pause-all"), ("POST", "/api/bots/resume-all"),
+        ("POST", "/api/bots/wakeups"), ("GET", "/api/bots/{id}/wakeups"), ("DELETE", "/api/wakeups/{id}"),
+        ("POST", "/api/bots/delegations"), ("GET", "/api/bots/delegations/{turn_id}"),
     }
     def walk(routes):
         for route in routes:

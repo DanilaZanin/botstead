@@ -10,6 +10,7 @@ from .subprocess import SubprocessRunner, token_count, usage_event, with_context
 
 class ClaudeRunner(SubprocessRunner):
     provider = "claude"
+    stream_guard = False  # чужой MCP-инструмент вне mcp_allow отклоняет approve, ход продолжается
 
     def __init__(self) -> None:
         super().__init__()
@@ -33,6 +34,8 @@ class ClaudeRunner(SubprocessRunner):
             command += ["--tools", "", "--strict-mcp-config"]
         else:
             command += ["--mcp-config", json.dumps(config), "--permission-prompt-tool", "mcp__bothub__approve"]
+            if not turn.bot.get("mcp_allow"):
+                command += ["--strict-mcp-config"]  # пустой mcp_allow: только сервер bothub, чужие серверы из настроек CLI не поднимаются
         command += ["--append-system-prompt", "\n\n".join(filter(None, (
             turn.bot.get("instructions", ""), turn.memory_md)))]
         if turn.dry_run:

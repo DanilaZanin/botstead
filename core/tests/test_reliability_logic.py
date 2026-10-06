@@ -214,6 +214,10 @@ async def test_background_loops_survive_exception_in_one_pass(monkeypatch, caplo
         return None
 
     setattr(app.state, hook, flaky)
+    if loop_name == "scheduler":
+        async def no_wakeups():  # в этом тесте нет пула; пробуждения проверяются отдельно (test_wakeups_*)
+            return None
+        app.state.run_due_wakeups = no_wakeups
     caplog.set_level(logging.ERROR, logger="bothub")
     task = asyncio.create_task(getattr(app.state, loop_name)())
     await asyncio.sleep(0.2)

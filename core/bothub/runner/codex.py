@@ -5,6 +5,23 @@ from .base import RunnerEvent, TurnContext
 from .subprocess import SubprocessRunner, token_count, usage_event, with_context
 
 
+# MCP-сервер bothub для codex через -c, значения из окружения процесса (env_vars): токен не попадает в argv.
+# -c сливается с ~/.codex/config.toml, а не заменяет его (проверено на codex 0.159), и файл бот может переписать:
+# подменить `cwd` или `env` сервера bothub, добавить свои серверы. Поэтому при пустом mcp_allow файл не читается
+# вовсе (`--ignore-user-config`, есть у exec и exec resume в 0.156.1 из образа; авторизация всё равно из CODEX_HOME).
+# При непустом списке владелец сам подключил сторонние серверы из config.toml: файл читается, чужие вызовы
+# останавливает SubprocessRunner.guard уже после старта вызова (docs/contracts.md, раздел 4).
+# `required=true`: без него codex 0.156 не ждёт старта MCP-сервера (python + импорт ~1 с) перед первым запросом к модели,
+# и в части ходов (на стенде ~3 из 4) инструментов bothub в запросе нет: модель отвечает «такого инструмента нет».
+# С required=true первый запрос уходит только после старта сервера (6 из 6 на стенде), а сбой старта валит ход громко.
+BOTHUB_MCP_FLAGS = [
+    "-c", 'mcp_servers.bothub.command="python"',
+    "-c", 'mcp_servers.bothub.args=["-m","bothub.mcp_server"]',
+    "-c", "mcp_servers.bothub.required=true",
+    "-c", 'mcp_servers.bothub.env_vars=["BOTHUB_URL","BOTHUB_TOKEN","BOTHUB_THREAD_ID","BOTHUB_TURN_ID"]',
+]
+
+
 class CodexRunner(SubprocessRunner):
     provider = "codex"
 
@@ -30,6 +47,10 @@ class CodexRunner(SubprocessRunner):
             # оболочку и unified exec (`--disable <FEATURE>`, `codex features list`), остальное запрещает слой ядра:
             # первый же tool_call хода сжатия его останавливает.
             command += ["--disable", "shell_tool", "--disable", "unified_exec"]
+        if not turn.bot.get("mcp_allow"):
+            command += ["--ignore-user-config"]
+        if not turn.compact:
+            command += BOTHUB_MCP_FLAGS
         if turn.bot.get("model"):
             command += ["-m", turn.bot["model"]]
         if turn.bot.get('_gateway_kind') in ('openai_api','openai_compatible'):
@@ -39,6 +60,10 @@ class CodexRunner(SubprocessRunner):
                         '-c','model_providers.bothub.env_key="BOTHUB_GATEWAY_TOKEN"',
                         '-c','model_providers.bothub.wire_api="responses"',
                         '-c','model_providers.bothub.supports_websockets=false']
+            ctx_win = turn.bot.get('_context_window')
+            if ctx_win:
+                command += ['-c', f'model_context_window={ctx_win}',
+                            '-c', f'model_auto_compact_token_limit={int(ctx_win * 0.8)}']
         command += ["-"]
         return command
 
@@ -76,6 +101,8 @@ class CodexRunner(SubprocessRunner):
             tool = item.get("tool") or item.get("type", "")
             if item.get("server") and item.get("tool"):
                 tool = f"{item['server']}.{tool}"
+            elif item.get("type") == "mcp_tool_call":
+                tool = "mcp_tool_call"  # MCP-вызов без сервера: имя, которое политика считает чужим (fail-closed)
             return [RunnerEvent("tool_call", self._browser.call({
                 "call_id": item.get("id", ""),
                 "tool": tool,

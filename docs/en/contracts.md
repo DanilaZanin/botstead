@@ -137,6 +137,7 @@ create table schedules (
   timezone text not null default 'Europe/Moscow',
   prompt text not null,
   hook_token text,                                 -- for kind=hook, random
+  slack_signing_secret bytea,                      -- for kind=hook: Slack app Signing Secret, encrypted (encrypt_secret, AAD = id), never returned (section 18)
   enabled boolean not null default true,
   next_run_at timestamptz,
   last_turn_id uuid,
@@ -216,8 +217,13 @@ Authorization: header `Authorization: Bearer <token>`.
 | POST /api/usage | [bot] | `{"thread_id","turn_id","provider","model","tokens_in","tokens_out"}` |
 | GET /api/schedules | owner | `[Schedule]` |
 | POST /api/schedules | owner | ScheduleIn → Schedule (generates hook_token for hook) |
-| PATCH /api/schedules/{id} | owner | `{"enabled"?,"cron"?,"prompt"?,"catch_up"?}` |
+| PATCH /api/schedules/{id} | owner | `{"enabled"?,"cron"?,"prompt"?,"catch_up"?,"slack_signing_secret"?}`; the Slack secret is for kind=hook only, a string up to 256 chars or `null` (clear), never returned: responses carry `has_slack_signing_secret` instead (section 18) |
 | POST /api/schedules/{id}/run | owner | creates thread kind=routine (or last one) and turn client=schedule; bot paused: 409 `bot_paused` |
+| POST /api/bots/wakeups | [bot] | `{"at"?,"in_minutes"?,"prompt","reason"?,"thread_id"?}` → Wakeup and `deduplicated` (201, repeat 200), section 17 |
+| GET /api/bots/{id}/wakeups?status= | owner | `[Wakeup]` of the bot: active ones by nearest time, then history, up to 100 (section 17) |
+| POST /api/bots/delegations | [bot] | `{"bot","task","turn_id"}` → `{"turn_id","thread_id"}` (201), section 19 |
+| GET /api/bots/delegations/{turn_id} | [bot] | `{"turn_id","thread_id","to_bot","status","result","error"}`; only the delegating bot reads it, otherwise 404 (section 19) |
+| DELETE /api/wakeups/{id} | owner | `{"ok":true,"id"}`; another owner's or missing 404, not active 409 `wakeup_not_active` (section 17) |
 | POST /hooks/{schedule_id}?token=T | external | any JSON body up to 64 KB, appended to prompt; always 202 `{"status":"accepted"}` without turn and without `id`: whether a turn was created or the run was skipped (bot paused, executor unavailable, check failure) cannot be told from the response; skip recorded (section 16) |
 | POST /api/files | [bot], Mac agent via core | multipart: file, thread_id, origin → File |
 | GET /api/files/{id} | owner | serves file (Content-Disposition) |
@@ -252,19 +258,21 @@ There is no `guard` field in the response: the route does not return it now or p
 | tool_call | `{"call_id","tool","args"}` |
 | tool_result | `{"call_id","ok": bool,"summary","data"?}` |
 | file | `{"file_id","name","size","mime","origin"}` |
-| approval_req | `{"approval_id","risk","title","tool","expires_at"}` |
-| approval_dec | `{"approval_id","decision","remember","client"}` |
+| approval_req | `{"approval_id","risk","title","tool","expires_at","checker"?}` |
+| approval_dec | `{"approval_id","decision","remember","client","reason"?,"checker"?}` |
 | usage | `{"tokens_in","tokens_out","model","seconds"}` at end of turn |
 | status | `{"turn_id","status"}` on turn status change |
 | interrupted | `{"done_steps":[...],"saved":[...],"cancelled":[...]}` |
-| guard | `{"reason":"repeat_error\|budget\|timeout\|runner_lost\|runner_exited","detail"}` |
+| guard | `{"reason":"repeat_error\|budget\|timeout\|runner_lost\|runner_exited\|mcp_not_allowed\|mcp_allow_unsupported","detail"}` |
 | approval_expired | `{"turn_id","approval_id","tool","detail"}` approval expired, turn closed (status `error`) |
+| checker_denied | `{"approval_id","tool","reason"}` the checker model rejected the approval on its own, section 19 |
 | budget_exceeded | `{"turn_id","spent","budget","tokens_in","tokens_out","detail"}` daily budget exceeded during turn, turn closed (status `error`) |
 | system | `{"text"}` (device change, model change, Mac wakeup) |
 | compacted | `{"tokens_before","tokens_after","auto","reduction_percent","summary_chars"}` thread compacted, section 15 |
 | compact_failed | `{"detail"}`, plus `reason` and `tool` when a tool was refused: compaction turn failed, thread unchanged, section 15 |
 | auto_compact_disabled | `{"reduction_percent"}` thread auto-compaction disabled: compaction yielded less than 30 percent, section 15 |
 | proof | `{"check":"file_exists\|http_ok\|screenshot","ok": bool,"detail"}` |
+- Codex: with an empty `mcp_allow` the runner starts codex with `--ignore-user-config`: the bot's `~/.codex/config.toml` is not read and the `bothub` server is defined only by `-c` flags. With a non-empty list the file is read (it holds the owner's third-party servers), so a bot that can rewrite it can replace or add a server; a call outside the list stops the turn only after the call has started. List items `bothub*` and dotted masks (`github.*`) are rejected (422). The `bothub` server is declared required (`-c mcp_servers.bothub.required=true`): otherwise codex 0.156 does not wait for it to start before the first model request and the tools appeared only sometimes; a failed start now fails the turn explicitly.
 
 Outgoing Event JSON: `{"thread_id","seq","ts","turn_id","kind","actor","client","payload"}`.
 
@@ -282,6 +290,13 @@ An action is allowed without asking if a rule matched and the tool is classified
 Never pass under rules, under `mac_full_control`, or under "remember": risks `pay`, `delete`, `login`; software installation and running interpreters or scripts with write capability (including `python3 file.py`, `npm run`, `perl -e`, `python -W ... -c`, `sed -i`, `find -exec`, `awk system()`, `docker -v /`); outbound data transmission from Bash (`curl`, `wget`, `dig`, `nc`, `scp`, `ssh`, `rsync`); commands that could not be classified (obfuscation, `$(...)`, backticks, base64, eval, heredoc, unclosed quotes); non-dictionary arguments; `mac_delegate` and its aliases; for Mac, everything except read-only tools and a shell command composed entirely of read-only programs (`git` is absent from this list). `mac_shell` with relative, hidden, or unverifiable `cwd` and reading secrets requires approval.
 
 `remember=true` on approve adds rule `{"tool": tool, "match": {all arguments, exact}, "op_hash": "<SHA256>"}` and adds nothing for actions from the list above (in response `remember: false`).
+
+`bots.mcp_allow` (2026-10-06) = list of allowed third-party MCP tools; empty = the bot only has the `bothub` server. A third-party tool (`mcp__<server>__<tool>`, server is not `bothub`; codex events carry `<server>.<tool>`, normalized to the same form) passes only if it matches a list item: an exact name, a glob (`mcp__github__*`), `<server>.<tool>`, or a bare server name (`github` = `mcp__github__*`). The list does not auto-approve: an allowed tool follows the usual rules of this section (an unknown tool needs an exact rule with a non-empty `match`), and `auto_allow` does not open a tool outside the list. The bot's own tools (`mcp__bothub__*`) and the CLI's built-in tools (`Bash`, `Read`) are not subject to the list. The own server is exactly `bothub`: `bothub_`, `bothub_x`, `Bothub` and `mcp__bothub___x` (the extra `_` goes to the server, so it is server `bothub_`) are third-party. Server and tool are compared with the mask separately: `mcp__github__*` does not open server `github_`. A name that looks like an MCP tool but did not parse (`mcp__github`, `mcp_tool_call`, a name with a dot and a space) counts as third-party and no list opens it, `*` included. Three layers (`bothub/mcp_policy.py`):
+- core, `POST /api/approvals`: a tool outside the list gets `rejected` at once, the response carries `reason: "mcp_not_allowed"`, and an `approval_dec` event from `system` with the same `reason` is written to the thread; the owner is not asked, and such a call cannot be approved (like a forbidden address, section 13). This is the only layer that decides; the others duplicate it;
+- `approve` in `mcp_server.py` (Claude): the core's `rejected` with `reason: "mcp_not_allowed"` becomes `{"behavior":"deny","message":"mcp_not_allowed"}`, the turn goes on. With an empty list the Claude runner adds `--strict-mcp-config`: servers from the CLI settings in the container do not start, only `bothub` runs; with a non-empty list there is no flag and `approve` blocks tools of other servers;
+- the codex and agy runners do not ask for approval: `SubprocessRunner.guard` sees a `tool_call` of a third-party tool outside the list in the event stream, stops the process (`stop_exec` in the container) and raises `McpNotAllowed`; the core closes the turn as `error` with a `guard` event `{"reason":"mcp_not_allowed","detail":"<tool>"}`. The call has already started by then, so this is a stop, not prevention. codex gets the `bothub` server from `-c mcp_servers.bothub.*` flags (address and token come from the environment through `env_vars`, not from argv), not from `~/.codex/config.toml`. `-c` merges with `config.toml` and does not replace it (checked with `codex mcp get` on 0.159), so third-party servers from `config.toml` stay and their calls are caught by `guard`. The `--ignore-user-config` flag exists in 0.159 but is not verified in the 0.156.1 pinned in the image, so it is not used. The compaction turn (section 15) is not covered: the core stops it on the first `tool_call`.
+- agy does not apply the list: its parser does not emit `tool_call` (the tool step format has not been captured live). A turn with a non-empty `mcp_allow` does not start: `GeminiRunner.command` raises `McpAllowUnsupported`, and the core closes the turn as `error` with a `guard` event `{"reason":"mcp_allow_unsupported","detail":"gemini"}` before any process starts. An empty list is no guarantee for agy: servers from the agy settings are not disabled. The compaction turn is not affected by the refusal.
+- Body check (`POST`/`PATCH /api/bots`): up to 200 items, 1-200 characters after trimming, no spaces or non-printable characters inside (otherwise 422); edge whitespace is trimmed, duplicates are removed, order is kept.
 
 For Claude: `--permission-prompt-tool mcp__bothub__approve`. The MCP server's `approve` tool receives `{"tool_name","input"}` and returns `{"behavior":"allow","updatedInput":input}` or `{"behavior":"deny","message":"..."}`. Risk is determined by table in `bothub/risk.py` (owner: runner): tool name and arguments → risk. Read, search, screenshot = `other` and are allowed under `mac_full_control` or by rules.
 
@@ -346,7 +361,7 @@ class RunnerEvent:
 - Core selects runner by `bots.provider`, writes RunnerEvent into events, saves cli_session_id, counts steps and error repetitions (guard).
 
 MCP server `bothub` (stdio, `python -m bothub.mcp_server`, env `BOTHUB_URL`, `BOTHUB_TOKEN`, `BOTHUB_THREAD_ID`, `BOTHUB_TURN_ID`) provides tools:
-`approve` (section 4), `mac_<tool>` for each Mac tool (via POST /api/mac/call), `attach_file` (path in container → POST /api/files), `remember` (POST /api/memory, status proposed).
+`approve` (section 4), `mac_<tool>` for each Mac tool (via POST /api/mac/call), `attach_file` (path in container → POST /api/files), `remember` (POST /api/memory, status proposed), `schedule_wakeup` (POST /api/bots/wakeups, section 17), `delegate_to_bot` and `delegation_result` (POST and GET /api/bots/delegations, section 19).
 
 `mac_delegate` requires operation approval. On 409 it immediately returns to the model the error "Mac is offline, execute yourself" without retry. Timeout of `/api/mac/call` = `args.timeout` (default 900, maximum 1800) + 60 s margin so that core waits for agent response or timeout.
 
@@ -435,6 +450,27 @@ The user's first bot created the network `bothub-u-<owner>` and connected core t
 - PWA: on network error, 502, and 504 during bot creation screen does not display error, but re-reads bot list and searches for bot by name and creation time (not earlier than request start); found: opens it; not found: error with "Retry" button. Bot in `starting` is displayed as "Starting" (input available, explanation below field: message will wait for startup); bot list is re-read while any bot is in `starting`.
 
 Schedule and procedure run (section 14): scheduler skips `cron` schedule of a bot that has a non-terminal procedure run (`queued`, `running`, `waiting_approval`, `waiting_model`, `waiting_human`). `next_run_at` does not advance; schedule fires as a single turn on the first pass after bot is freed; deadlines missed during the run do not accumulate. Human waiting is limited to `BOTHUB_PROCEDURE_WAIT_HOURS` (default 24 h), so postponement is not infinite.
+
+### Bot template: file export and import (2026-10-06, stage 11)
+
+A template file moves a bot to another installation or shares its settings without history. The format is defined by the core; the client serves it as-is.
+
+`GET /api/bots/{id}/export` (bot owner; another owner's bot is 404) — JSON document:
+```json
+{"format": "botstead-bot", "version": 1, "name": "Scout", "role": "...", "instructions": "...",
+ "avatar": "scout", "executor": "container", "auto_allow": [{"tool": "..."}], "mcp_allow": ["..."],
+ "budget_daily_tokens": 200000, "auto_compact_percent": 80,
+ "schedules": [{"cron": "0 9 * * 1-5", "timezone": "Europe/Moscow", "prompt": "...", "enabled": true, "name": "..."}],
+ "procedures": [{"format": "bothub-procedure/1", "name": "Login", "description": "...", "params": [...], "steps": [...]}]}
+```
+
+The export omits: `id`, `owner_id`, `provider_id`/`model_id`, provider/model as strings, secrets, memory, threads, tokens, usage, status, created/updated timestamps, container. `auto_allow` and `mcp_allow` are validated as regular rules. Procedures go through `procedures.export_document` (section 14); schedules through `SELECT cron, timezone, prompt, enabled, name FROM bothub.schedules WHERE bot_id=$1 AND kind='cron'` (cron only, no hook or mac_folder).
+
+`POST /api/bots/import` (owner) — body: the same document plus optional `provider_id` and `model_id` (both or neither, UUID strings). Body ≤ 256 KiB (`Content-Length` over the limit → 413). Document fields are exactly the ones listed above; an unknown key returns 422 `{"error":"invalid","detail":"body: unknown_field: unknown field"}` (the key value is not included in the response). Each field uses the same validator as `BotIn`/`ScheduleIn`/`procedures.parse_import` (`name`, `role`, `instructions`, `avatar`, `executor`, `auto_allow`, `mcp_allow`, `budget_daily_tokens`, `auto_compact_percent`); `procedures` — `procedures.parse_import` per item; schedules — `check_timezone` and `croniter`. `provider_id`/`model_id` are validated as UUID strings; in the DB the core verifies the "owner's provider and enabled model" pair with the same query as in `POST /api/bots`.
+
+The import creates a new bot, its schedules, and procedures in one transaction: a failure at any step leaves no half-created bot. The bot name and procedure names (procedures have `unique (owner_id, name)`) get ` (2)`, ` (3)` and so on on collision; the base is shortened to fit the length limit. `executor` is `container` or `mac` only (otherwise 422 `executor: unsupported`). The bot is created by the shared `insert_bot` function, the same one `POST /api/bots` uses: the `provider_id`/`model_id` pair is checked with the same query (`runner_provider`/`binding.name`). Without `provider_id` the runner is `fake`, as with `provider: "fake"` in `POST /api/bots`: the PWA always sends the chosen model, a direct call without one creates a bot with no working model. Procedures are bound to the new bot (`bot_id` is set at insert), source `'import'`. `mac_full_control` is always `false`. The container starts the same way as after `POST /api/bots` (`BOTHUB_RUNNER_EXEC=docker`: response `"container": "starting"`, started in the background after commit); without docker the response is `"container": "skipped"`. The response is the bot row plus `recreate_url: null`, status 201.
+
+PWA: a "Export template" card on bot settings (file `<name>.botstead.json`); on the `#/bots/new` screen a "Create from file" button next to "Build" (`.botstead.json` or `.json`, up to 1 MB; after parsing it shows name, role, schedule and procedure counts, then the same model picker and "Create" button).
 
 ## 10. Users, Invites, Sessions (2026-10-04, migration `004_users_providers.sql`)
 
@@ -916,10 +952,10 @@ Item: `{id, at, bot_id, thread_id, turn_id?, kind, title, detail?, risk?, status
 | kind | Source | codes (`title.code`) and params |
 | --- | --- | --- |
 | `turn` | `turns` | `turn_started`, `turn_done`, `turn_error`, `turn_stopped`; `client`. A service compaction turn (`turn_type=compact`, section 15) yields `compact_started`, `compact_done`, `compact_failed` (`auto`: compaction queued by core) and has no `turn_*` codes |
-| `approval` | `approvals` | `approval_requested`, `approval_approved`, `approval_rejected`, `approval_expired`; `tool`; in `detail` title |
+| `approval` | `approvals` | `approval_requested`, `approval_approved`, `approval_rejected`, `checker_denied` (section 19), `approval_expired`; `tool`; in `detail` title |
 | `browser` | `events.kind='browser_step'` | `browser_step`; `action`, `target`, `url` (scheme://host/path, without query and login) |
 | `takeover` | `events.kind='browser_control'` | `takeover_started` (to `human`), `takeover_returned` (to `returning`), `takeover_bot`; `from`, `to` |
-| `schedule` | `turns.client in ('schedule','hook')`, `activity_log` | `schedule_run`, `hook_run` (`name`, `schedule_id`), `schedule_skipped` (`reason`, `count`, `paused`, `schedule_id`, `name`), `schedule_resumed` |
+| `schedule` | `turns.client in ('schedule','hook')`, `activity_log` | `schedule_run`, `hook_run` (`name`, `schedule_id`), `schedule_skipped` (`reason`, `count`, `paused`, `schedule_id`, `name`), `schedule_resumed`, `wakeup_scheduled`, `wakeup_fired`, `wakeup_skipped` (`wakeup_id`, `scheduled_at`, for a skip also `reason`; `detail` holds the reason the bot gave; section 17), `delegation_sent`, `delegation_done` (`from_bot`, `to_bot`, `to_bot_id`, `turn_id`, `outcome` on completion; `detail` holds the task text; section 19) |
 | `procedure` | `procedure_runs` | `procedure_started`, `procedure_finished`; `name`, `procedure_id`, `run_id` |
 | `memory` | `memory` with `source like 'bot:%'` | `memory_proposed`; `memory_id`, in `detail` text |
 | `pause` | `activity_log` | `bot_paused` (`reason?`, `by_all?`), `bot_resumed` |
@@ -960,3 +996,174 @@ If the check itself raised an exception (database or launcher failure), the trig
 - Executor available again: if there were skips or pause, `schedule_resumed` is written (feed and thread), counter and flag are reset. Schedule not in pause executes as normal (its time has arrived). Schedule in `paused_by_unavailable` was not checked on cron, so it runs turn once only if `catch_up=true`, otherwise waits for its cron. Missed runs are not caught up in batch. For hook, `catch_up` does not apply: any subsequent accepted hook launches turn.
 - Hook: response is always `202 {"status":"accepted"}`, both when a turn is created and on a skip (pause, executor, provider, check failure). The response has no turn id, so an external sender cannot learn bot state from code, body, or headers. The order of actions is the same: the check and queueing (or recording the skip) happen before the response in both cases, so response time differs little (creating a turn writes a few more rows than recording a skip). The owner sees the created turn in the schedule thread (`user_msg` event with the prompt). The turn id from the hook response was not used by the product (PWA, Mac agent, e2e do not read it); if it is ever needed, it may be returned only by a route authenticated as the owner. A bot that broke between the check and queueing (`require_available_bot`, 409) also yields a skip and the same 202. Invalid token remains 403 and is not considered skip. Five consecutive skips mark schedule `paused_by_unavailable` (for display), first accepted hook after executor returns writes `schedule_resumed`.
 - Decisions (reason, counter, throttling, resumption) are pure functions `activity.skip_reason`, `plan_skip`, `plan_resume`; core only executes them.
+
+## 17. Bot self-wakeup (migration `025_wakeups.sql`)
+
+A bot asks the core to wake it up later: the MCP tool `schedule_wakeup` puts a row into `bothub.wakeups`, and at the right moment the schedule scheduler creates a turn. The owner sees what is planned in the bot settings, cancels it, and finds the firings in the feed. Pure logic is in `core/bothub/wakeups.py`, routes and execution in `main.py`, the tool in `mcp_server.py`.
+
+### Table `bothub.wakeups`
+
+`id uuid`, `bot_id` (foreign key to `bots`, `on delete cascade`), `scheduled_at timestamptz`, `status` (`active|fired|skipped`), `prompt` (1–2000 characters), `reason` (up to 200, empty by default), `created_at`, `fired_at`. Two columns beyond the required ones: `thread_id` (the thread the bot asked from; foreign key `on delete set null`) and `skip_reason` (`executor_unavailable|bot_paused|provider_unavailable|check_failed`, the same as trigger pauses, section 16). There is no separate `owner_id`: the owner is found through `bots.owner_id`, as for `turns` and `approvals`. Indexes: `wakeups_due_idx(scheduled_at) where status='active'` for the scheduler and `wakeups_bot_idx(bot_id, scheduled_at desc)` for the bot's list. The migration also extends `activity_log_code_check` with three event codes.
+
+### MCP tool `schedule_wakeup`
+
+The call needs no owner approval (like `remember`): it only queues a future turn for the same bot; wakeups show up in the activity feed and can be cancelled in the bot settings. A wakeup that could not start within 15 minutes is closed as skipped with reason `fire_failed`.
+
+
+`schedule_wakeup(prompt, reason?, at?, in_minutes?)`: exactly one of `at` (ISO 8601; without a zone it is UTC, like other client dates) and `in_minutes` (integer). The tool sends `POST /api/bots/wakeups` with the bot token and the `thread_id` of the current thread (`BOTHUB_THREAD_ID`). The core answer is returned as `{"ok": true, ...Wakeup, "deduplicated": bool}`; a core refusal as `{"ok": false, "error": "<code>"}`, so the model sees the cause and can fix the call. The tool checks `prompt` and `reason` itself, before the request. By `risk.classify` the tool is not on the read-only list: without an `auto_allow` rule it asks the owner for approval, like any other state-changing action.
+
+### `POST /api/bots/wakeups`
+
+Bot token only (owner, Mac agent: 403; no login 401). Body (`extra=forbid`): `at`, `in_minutes`, `prompt`, `reason`, `thread_id` (the bot's own thread, otherwise 404 or 403 as for other bot routes).
+
+| Rule | Value | Refusal |
+| --- | --- | --- |
+| Time | no sooner than 1 minute and no later than 30 days from the moment of the request, bounds included (`in_minutes` from 1 to 43200) | 400 `invalid`, detail `too_soon` or `too_far` |
+| Way to set the time | exactly one of `at` and `in_minutes` | 400, detail `time_required` or `time_conflict` |
+| Format | `at` is parsed as ISO 8601, `in_minutes` is an integer (not a string, not a boolean) | 400, detail `at_invalid`, or 400 `invalid` from the body schema |
+| `prompt` | not empty (whitespace does not count), up to 2000 characters | 400 `prompt_empty`, 422 `prompt_too_long` |
+| `reason` | up to 200 characters | 422 `reason_too_long` |
+| Active | at most 20 per bot | 409 `{"error":"conflict","detail":"wakeup_limit"}` |
+| Idempotency | an active wakeup of this bot with the same `prompt` and a time within ±1 minute is returned as is | 200 instead of 201, `deduplicated: true` |
+
+The repeat is checked before the limit: a bot with 20 active wakeups that repeats its call gets the same wakeup, not a refusal. Different `prompt` values in the same minute are different wakeups. The bot row is taken `for update`, so two parallel calls neither bypass the limit nor create duplicates. Response 201: `{id, bot_id, thread_id, scheduled_at, status, prompt, reason, skip_reason, created_at, fired_at, deduplicated}`. On creation `wakeup_scheduled` is written to the feed and a system event `{"text","code":"wakeup_scheduled","wakeup_id"}` to the thread (if one was passed).
+
+### Execution
+
+The same `scheduler` loop (interval `BOTHUB_SCHEDULER_INTERVAL`, 30 s): `scheduler_tick` first calls `run_due_schedules`, then `run_due_wakeups`; a failure of the first does not cancel the second. `run_due_wakeups` selects active rows due at or before `now()` for active users (`for update of w skip locked`) and, like a schedule, defers a bot with a non-terminal procedure run (the row stays `active` and fires on the first pass after the bot is free). The executor is checked by the same `trigger_block` (section 16); the decision is made by the pure `wakeups.decide(block, scheduled_at, now)`:
+
+- no cause: `fire`. Thread: the bot thread the request came from, if it is still `active`; otherwise a new thread `kind=routine` titled "Пробуждение: <reason>" (up to 80 characters). A turn with `client='wakeup'` is put into the thread (the `user_msg` event has `actor = "bot:<bot_id>"`: a message from the bot itself, not from the owner) with the text "Самопробуждение: ты сам запланировал этот запуск. Причина: <reason>" and the `prompt` after a blank line. The row gets `status='fired'`, `fired_at`, `thread_id`; `wakeup_fired` goes to the feed. Lateness is not limited: if the core was down, the wakeup fires on the first pass while the executor is available;
+- `bot_paused`: `skip` at once (a pause is an explicit owner decision): `status='skipped'`, `skip_reason`, a `wakeup_skipped` event to the feed and a system event `{"text","code":"wakeup_skipped","reason"}` to the thread;
+- other causes (`executor_unavailable`, `provider_unavailable`, `check_failed`): `wait` (the row stays `active`, rechecked on the next pass), and 15 minutes after the due time (`wakeups.GRACE`) `skip` with the same record. So a container restart of a minute does not eat the wakeup, and an executor that never came back does not hold it forever.
+
+A failure of one wakeup (exception inside the savepoint) is logged and does not roll back the others; the row stays `active` and is tried again.
+
+### Owner routes
+
+- `GET /api/bots/{id}/wakeups?status=active|fired|skipped`: own bot only (another owner's or missing 404; bot token 403; unknown `status` 422 `invalid`, detail `status`). Response: an array of `Wakeup`, at most 100: active by ascending `scheduled_at`, then history from newest to oldest.
+- `DELETE /api/wakeups/{id}`: cancel deletes the row. Another owner's and missing 404, bot token 403. An already fired or skipped one is not deleted: 409 `{"error":"conflict","detail":"wakeup_not_active"}`. The race with the scheduler is settled by the conditional `delete ... where status='active'`. There is no separate cancel event.
+
+State-changing requests by cookie need `X-CSRF` and `Origin`, as everywhere.
+
+### Activity events
+
+`activity_log` of kind `schedule` (the `kind=schedule` filter of `GET /api/activity` shows them): `wakeup_scheduled`, `wakeup_fired`, `wakeup_skipped`. Parameters: `wakeup_id`, `scheduled_at` (ISO, UTC), for a skip `reason` (cause code); the text the bot gave in `reason` is returned by the feed in the `detail` field (up to 200 characters, the PWA marks it `data-i18n-skip`). A firing is also an ordinary turn in the feed (`turn_started`, `client: "wakeup"`).
+
+### PWA
+
+In the bot settings (`#/bots/<id>`, phone and Mac) the card "Пробуждения бота" (`[data-wakeups]`, "Bot wakeups"): active wakeups with time, reason and a "Cancel" button (`DELETE /api/wakeups/{id}`), an empty state, a load error with a "Retry" button. Mock mode: `?mock=1`, `&wakeups=fail` breaks the load.
+
+## 18. GitHub and Slack webhook adapters (stage 10, 2026-10-06)
+
+For schedules of kind `hook` (`schedules.kind = 'hook'`), two specialized adapters are provided alongside generic `POST /hooks/{id}`:
+
+- `POST /hooks/{id}/github`: GitHub webhook adapter.
+- `POST /hooks/{id}/slack`: Slack Events API adapter.
+
+Both adapters maintain the 64 KiB request body limit (413 `invalid` if exceeded), schedule enabled and active owner validation (otherwise 404), and the uniform 202 `{"status":"accepted"}` response rule for queued and skipped events. Missing or invalid signature responds with 403 `forbidden`. The signature over the raw body is verified before any JSON parsing (invalid JSON with a bad signature gives 403, with a valid one 400 `invalid`); the 64 KiB limit is enforced from `Content-Length` and while streaming the body; the signature is compared as bytes, so non-ASCII in the header gives 403.
+
+#### GitHub adapter (`POST /hooks/{id}/github`)
+
+1. **Headers and signature verification.**
+   - `X-Hub-Signature-256`: signature header formatted as `sha256=<hex>` (HMAC-SHA256 of the raw body with schedule `hook_token` as secret). Comparison runs in constant time (`hmac.compare_digest`). Missing or invalid signature returns 403.
+   - `X-GitHub-Event`: GitHub event name.
+2. **Event handling.**
+   - `ping` event: responds 202 `{"status":"accepted"}` without queuing a turn.
+   - Supported events: `issues`, `issue_comment`, `pull_request`, `pull_request_review`, `push`, `workflow_run`. Formats a short prompt text with event name, repository (`full_name`), action (`action`), title and number (or ref for push), author login, URL (`html_url`), and the first 2000 characters of the description, comment, or commit messages. Appends this text to base `schedule.prompt` and queues a bot turn via shared core dispatch logic.
+   - Other events: respond 202 `{"status":"accepted"}` and are silently skipped without creating a turn.
+3. **GitHub setup.**
+   - In repository or organization Settings -> Webhooks, click "Add webhook".
+   - Payload URL: `https://<domain>/bots/hooks/<schedule_id>/github`.
+   - Content type: `application/json`.
+   - Secret: copy the `hook_token` from Bothub schedule.
+   - Which events would you like to trigger this webhook: select "Let me select individual events" and choose required events (Issues, Issue comments, Pull requests, Pull request reviews, Pushes, Workflow runs).
+   - Click "Add webhook". GitHub sends a ping request, core answers 202.
+
+#### Slack adapter (`POST /hooks/{id}/slack`)
+
+1. **Headers and signature verification.**
+   - `X-Slack-Request-Timestamp`: unix timestamp of request creation. If older or newer than 5 minutes (300 seconds), request is rejected with 403.
+   - `X-Slack-Signature`: signature formatted as `v0=<hex>`, computed as HMAC-SHA256 of `v0:{X-Slack-Request-Timestamp}:{raw body}` using the Slack app Signing Secret stored on the schedule (`schedules.slack_signing_secret`, migration `028_slack_signing_secret.sql`). `hook_token` is not used for Slack: Slack signs with its own secret, which the owner cannot choose. If no secret is set, the adapter answers 403. Compared in constant time.
+2. **Event handling.**
+   - URL verification (`url_verification`): if payload is `{"type": "url_verification", "challenge": "..."}`, core returns `{"challenge": "..."}` with HTTP status 200.
+   - Event callbacks (`event_callback`): for `app_mention` and `message` (without `bot_id` and without `subtype` to ignore bot and system messages), formats a prompt with channel, user, and text (up to 2000 characters), queuing a bot turn via shared core dispatch logic.
+   - Other events: respond 202 `{"status":"accepted"}` without queuing a turn.
+3. **Slack setup.**
+   - In Slack App configuration (api.slack.com/apps), navigate to "Event Subscriptions" and enable the toggle.
+   - In Request URL, enter `https://<domain>/bots/hooks/<schedule_id>/slack`.
+   - Under "Basic Information -> App Credentials", copy "Signing Secret" and paste it into the "Slack signing secret" field of the Bothub schedule (`PATCH /api/schedules/{id}` with `{"slack_signing_secret": "..."}`; `null` clears it). The secret is stored encrypted (AES-GCM, AAD = schedule id) and is write-only: the API returns only `has_slack_signing_secret: true|false`. Without a secret, signed Slack requests, including `url_verification`, get 403.
+   - Slack sends a `url_verification` request. Core responds with the challenge (200 OK), and URL status becomes "Verified".
+   - Under "Subscribe to bot events", add required events: `app_mention` and `message.channels`.
+   - Save changes and reinstall the app into the target Slack workspace.
+
+
+## 19. Bot-to-bot delegation (stage 11, migration `027_delegation.sql`)
+
+A bot hands a task to another bot of the same owner: the MCP tool `delegate_to_bot` queues a turn for the target and returns its id at once, and the bot reads the outcome later with `delegation_result`. Pure logic (limits, target choice, result text) is in `core/bothub/delegation.py`, the routes are in `core/bothub/main.py` next to self-wakeup.
+
+### Columns of `bothub.turns`
+
+`delegated_from_turn uuid` (the sender's turn, foreign key to `turns`, `on delete set null`) and `delegated_by_bot text` (id of the sending bot, no foreign key: the record outlives the bot). Both are `null` for ordinary turns. The index `turns_delegated_by_idx (delegated_by_bot, status)` serves the active-delegation counter. The same migration extends the CHECK `activity_log_code_check` with the codes `delegation_sent` and `delegation_done`.
+
+### MCP tools
+
+- `delegate_to_bot(bot, task)`: `bot` is the name (case-insensitive) or id of a bot of the same owner, `task` is 1 to 4000 characters. Sends `POST /api/bots/delegations` with the bot token and the `turn_id` of the current turn (`BOTHUB_TURN_ID`). Returns `{"ok": true, "turn_id", "thread_id"}` immediately without waiting for the work; refusals come back as data: `{"ok": false, "error": <code>}`. The tool checks the `task` length and an empty `bot` before the request with the same `delegation.clean_*` functions.
+- `delegation_result(turn_id)`: `GET /api/bots/delegations/{turn_id}`. Returns `{"ok": true, "turn_id", "thread_id", "to_bot", "status", "result", "error"}`.
+
+Approval. `delegate_to_bot` is not in `READ_ONLY_TOOLS`: `risk.classify` labels it `other`, `permission_class` is `unknown`, so `decide` allows the call without the owner only through an exact `auto_allow` rule (tool name without glob, non-empty `match`, pinned `op_hash`, like a rule created by "remember"). Without such a rule the call goes to the owner for approval, like other writes. `delegation_result` only reads and is in `READ_ONLY_TOOLS` (`mcp__bothub__delegation_result`), but the core has its own check: only the bot that delegated sees the result.
+
+### `POST /api/bots/delegations`
+
+Bot token only (owner, Mac agent: 403; no sign-in 401). Body (`extra=forbid`): `bot`, `task`, `turn_id` (a turn of this bot, otherwise 404 `turn_not_found`). Response 201: `{"turn_id", "thread_id"}`.
+
+| Rule | Value | Refusal |
+| --- | --- | --- |
+| `task` | non-empty (whitespace does not count), up to 4000 characters | 422 `invalid`, detail `task_empty` or `task_too_long` |
+| `bot` | string up to 200 characters: id first, otherwise name (case-insensitive) among the same owner's bots | 422 `bot_invalid`; not found (including another owner's bot) 404 `bot_not_found`; two bots with the same name 409 `bot_ambiguous` |
+| Self | sender and target are different bots | 409 `conflict`, detail `self_delegation` |
+| Target | not paused, not `no_model`, not `error_starting` | 409 `target_paused`, `target_no_model`, `target_error_starting` |
+| Depth | a turn created by delegation (`delegated_by_bot is not null`, `delegated_from_turn is not null` or `client='delegate'`) cannot delegate further | 409 `delegation_depth` |
+| Active | at most 5 turns with `delegated_by_bot = sender` in the statuses `queued`, `running`, `waiting_approval`, `waiting_mac` | 409 `delegation_limit` |
+
+The sender's bot row is taken `for update`, so parallel calls cannot get around the limit. Everything runs in one transaction.
+
+Target thread: the most recent (by last event, otherwise by creation) active `kind='direct'` thread without `dry_run`; if there is none, a new `direct` thread titled "Поручения от <sender name>" is created. In it the core creates a turn with `client='delegate'`, `delegated_from_turn` and `delegated_by_bot`, and a `user_msg` event: `actor = "bot:<sender id>"`, `client='delegate'`, `payload = {"text": "Поручение от бота <name>:\n\n<task>", "delegated_from": {"bot_id", "name"}}`. The event goes to thread subscribers after the commit. The turn then follows the normal queue: if another turn is running in that thread, the delegation waits.
+
+### `GET /api/bots/delegations/{turn_id}`
+
+Bot token only. Only the bot that delegated reads it: another bot's, a missing, and an ordinary turn all give 404 (the target cannot read it either). Response: `{"turn_id", "thread_id", "to_bot", "status", "result", "error"}`. `status` is the turn status (`queued|running|waiting_approval|waiting_mac|done|stopped|error`). `result` is non-empty only at `done`: the `assistant_msg` text after the last tool call of that turn (interim remarks before tools are skipped; if there is no text after the tools, all text is used), joined as a bot reply (`context.join_assistant`), at most 8000 characters. `error` is set when `status='error'`.
+
+### Activity events
+
+`activity_log` of kind `schedule` (filter `kind=schedule` in `GET /api/activity`), rows are written under the sender bot (`bot_id`), `thread_id` is the target thread:
+
+- `delegation_sent`: on queueing. Parameters `from_bot`, `to_bot` (names), `to_bot_id`, `turn_id`; the task text (up to 200 characters) is returned by the feed as `detail`.
+- `delegation_done`: when the delegated turn has ended. The same parameters plus `outcome` (`done`, `error` or `stopped`). The event is written by `append_event` when a `status` event with a final status is recorded, so it fires once per turn regardless of how the turn closed (normally, stop, failure, core restart).
+
+### PWA
+
+In the target thread a message with `payload.delegated_from` is drawn inside `.msg-user-wrap` with a `[data-delegated-from]` label "От бота <name>" (shown as "From bot" in English) above the `.msg-user` bubble; the bot name and the task text are data (`data-i18n-skip`). The activity feed shows "Бот передал задачу другому боту" and "Поручение выполнено" (error and stop have their own captions) with a "<from> → <to>" line. Mock mode `?mock=1`: Scout handed Archive a contract-scan sorting task (thread `t-archive`).
+
+## 20. Action checker model (stage 11, migration `029_action_checker.sql`)
+
+A second opinion on a risky bot action before the owner sees it. Optional: nothing changes unless it is set.
+
+**Setting.** `bots.checker_model_id` (uuid, nullable, foreign key to `models(id)`, `on delete set null`): a model from the owner's registry (section 11). Set in `POST /api/bots` and `PATCH /api/bots/{id}` (`null` turns it off). It must be an enabled model of a provider of the same owner and not a subscription (`cli_subscription`): a subscription has no key for a direct call. Otherwise 400 `invalid`, `detail: "checker model unavailable"`. The field is not exported to the bot template (section 9). PWA: bot settings, the "Проверяющая модель" field (a choice among enabled models of API providers, empty value "Не задана").
+
+**When it runs.** In `POST /api/approvals`, when after `decide_permission` the approval is still `pending`, the bot has a checker model and the risk is one of `pay`, `send`, `delete`, `login`, `push`, `exec` (everything except `other`: reads and the rest are not checked). Approvals refused by `forbidden_reason`/`mcp_allow` and auto-allowed ones never reach the model. Procedure approvals (section 14) bypass this route and are not checked.
+
+**Request.** One direct HTTP call to the provider API of the model (`bothub/checker.py`) at the pinned validated IP: the same address validation, `host` and SNI of the original name, administrator-approved private IPs and no redirects as the model-list probe (section 11). The provider key goes only into the authentication header. At most one call per approval, 20 s timeout (DNS included), response at most 256 KiB, output up to 300 tokens. Request shape by provider kind: `anthropic_api` `POST /v1/messages`, `openai_api` and `openai_compatible` `POST /v1/chat/completions`, `google_api` `POST /v1beta/models/<model>:generateContent`.
+
+The fixed system prompt (English, `checker.SYSTEM_PROMPT`) demands one strict JSON object `{"verdict":"allow|deny|ask","reason":"<=200 chars"}` and declares everything inside `<role>`, `<request>`, `<action>` untrusted data. The user message: `<role>` is the bot role (up to 512 characters), `<request>` is the owner's last message of the turn (`user_msg` of this `turn_id`, else the latest in the thread; first 2000 characters), `<action>` is the tool name and arguments. Arguments come from the approval after browser masking (`mask_browser_args`), then once more: values of fields named `password`, `secret`, `token`, `api_key`, `authorization`, `cookie` and alike become `[скрыто]`, strings that look like keys and tokens (`sk-…`, `Bearer …`, `ghp_…`, `xox…`, `AKIA…`) too, control and invisible characters are dropped, the JSON is cut to 4000 characters.
+
+**Parsing.** The first JSON object in the text is used (a markdown wrapper is fine). `verdict` is case- and space-insensitive; the reason is cut to 200 characters and newlines are collapsed. An unknown or missing `verdict`, not JSON, an empty answer, a network error, a non-200 answer, a redirect, an oversized answer, an unreachable address, no model or key, a timeout: `verdict: "ask"` with the reason "the checker model did not answer in time", "the checker model is unavailable" or "the checker model answered in the wrong format" (shown in Russian). A failed check never rejects or allows the action.
+
+**Effect.**
+- `deny`: the approval is created as `rejected` at once (`decided_from='checker'`, `decided_at` set), the `POST /api/approvals` response carries `reason: "checker_denied"`, `checker_verdict`, `checker_reason`. The owner is not asked (it is not in `GET /api/approvals?status=pending`). The thread gets `approval_req` (with the `checker` field so the feed has a card), `approval_dec` from `system` with `decision: "rejected"`, `reason: "checker_denied"`, `checker`, and `checker_denied`. The bot sees a normal refusal: `approve` in `mcp_server.py` returns `{"behavior":"deny","message":"checker_denied: <reason>"}` and the turn goes on.
+- `allow` and `ask`: the approval stays `pending` for the owner. `allow` allows nothing by itself. The verdict and the reason are in `approvals.checker_verdict` and `checker_reason` (visible in `GET /api/approvals`) and in `approval_req.payload.checker`.
+
+**Data.** `approvals.checker_verdict` (`allow|deny|ask`, null: no check ran), `approvals.checker_reason` (up to 200 characters).
+
+**Events.** `approval_req.payload.checker` = `{"verdict","reason"}` (optional), `approval_dec.payload.reason = "checker_denied"` and `checker`, a new kind `checker_denied` with payload `{"approval_id","tool","reason"}`. Activity feed (section 16): an `approval` item with code `checker_denied` instead of `approval_rejected` when the checker closed the approval.
+
+**PWA.** The approval card (thread, "Решения" screen): a line "Проверка: <verdict> · <reason>" under the title; an auto-rejection reads "Отклонено проверяющей моделью" with no buttons. Mock `?mock=1`: `ap2` carries an `ask` hint.

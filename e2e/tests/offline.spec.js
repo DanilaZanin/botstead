@@ -1,9 +1,9 @@
 import { expect, test } from '@playwright/test';
 
 // Офлайн-сценарий: нужен настоящий service worker и сервер с обычными заголовками кэширования
-// (второй webServer в playwright.config.js, порт 4174, STATIC_CACHE=1). Основной сервер отдаёт no-store.
+// (второй webServer в playwright.config.js, порт E2E_PORT+1, STATIC_CACHE=1). Основной сервер отдаёт no-store.
 // Мок не используем: он отвечает из памяти и без сети.
-test.use({ baseURL: 'http://127.0.0.1:4174', serviceWorkers: 'allow' });
+test.use({ baseURL: `http://127.0.0.1:${Number(process.env.E2E_PORT || 4173) + 1}`, serviceWorkers: 'allow' });
 
 async function waitForShellCache(page) {
   await page.evaluate(() => navigator.serviceWorker.ready);

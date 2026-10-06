@@ -8,11 +8,15 @@ from collections.abc import AsyncIterator
 
 from .base import RunnerEvent, TurnContext
 from bothub.context import usable_window
+from bothub.mcp_policy import McpNotAllowed, mcp_allowed
 from bothub.launcher_client import ExecChunk, ExecExit, LineSplitter
 
 
 class SubprocessRunner:
     provider = ""
+    # У CLI без permission-prompt (codex, agy) чужой MCP-инструмент вне mcp_allow ловится в потоке событий: ход
+    # останавливается с mcp_not_allowed. У Claude отказ даёт approve (mcp_server), ход продолжается: там False.
+    stream_guard = True
 
     def __init__(self) -> None:
         self._processes: dict[str, asyncio.subprocess.Process] = {}
@@ -24,6 +28,12 @@ class SubprocessRunner:
 
     def parse(self, message: dict) -> list[RunnerEvent]:
         raise NotImplementedError
+
+    def guard(self, turn: TurnContext, event: RunnerEvent) -> None:
+        """McpNotAllowed на tool_call чужого MCP-инструмента вне bots.mcp_allow. Ход сжатия не трогаем: его останавливает ядро."""
+        if self.stream_guard and not turn.compact and event.kind == "tool_call" \
+                and not mcp_allowed(turn.bot.get("mcp_allow"), event.payload.get("tool")):
+            raise McpNotAllowed(str(event.payload.get("tool")))
 
     async def run(self, turn: TurnContext) -> AsyncIterator[RunnerEvent]:
         if turn.turn_id in self._processes or turn.turn_id in self._launchers:
@@ -67,6 +77,7 @@ class SubprocessRunner:
                                     if event.kind == 'usage':
                                         event.payload['model'] = event.payload.get('model') or turn.bot.get('model', '')
                                         event.payload['seconds'] = round(asyncio.get_running_loop().time() - started, 3)
+                                    self.guard(turn, event)
                                     yield event
                 tail = lines.flush()
                 if tail:
@@ -79,10 +90,18 @@ class SubprocessRunner:
                             if event.kind == 'usage':
                                 event.payload['model'] = event.payload.get('model') or turn.bot.get('model', '')
                                 event.payload['seconds'] = round(asyncio.get_running_loop().time() - started, 3)
+                            self.guard(turn, event)
                             yield event
                 if exit_code and turn.turn_id not in self._stopped:
                     detail = ' '.join(stderr_tail.decode('utf-8', 'replace').split())[-300:]
                     raise RuntimeError(f'{self.provider} exited with status {exit_code}' + (f': {detail}' if detail else ''))
+            except McpNotAllowed:
+                # закрытие потока не гарантирует остановку процесса в контейнере: убиваем явно, вызов уже не должен идти дальше
+                try:
+                    await turn.launcher.stop_exec(turn.turn_id, bot_id=turn.bot_container_id)
+                except Exception:
+                    logging.getLogger(__name__).warning('mcp_not_allowed_stop_failed', extra={'turn_id': turn.turn_id}, exc_info=True)
+                raise
             finally:
                 self._launchers.pop(turn.turn_id, None)
                 self._stopped.discard(turn.turn_id)
@@ -124,6 +143,7 @@ class SubprocessRunner:
                         if event.kind == "usage":
                             event.payload["model"] = event.payload.get("model") or turn.bot.get("model", "")
                             event.payload["seconds"] = round(asyncio.get_running_loop().time() - started, 3)
+                        self.guard(turn, event)
                         yield event
                 code = await process.wait()
             if code and turn.turn_id not in self._stopped:

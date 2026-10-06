@@ -37,6 +37,7 @@ const TITLES = {
   approval_requested: 'Запрошено подтверждение',
   approval_approved: 'Подтверждение разрешено',
   approval_rejected: 'Подтверждение отклонено',
+  checker_denied: 'Проверяющая модель отклонила действие',
   approval_expired: 'Срок подтверждения истёк',
   takeover_started: 'Вы перехватили браузер',
   takeover_returned: 'Вы вернули управление боту',
@@ -45,6 +46,10 @@ const TITLES = {
   schedule_run: 'Запуск по расписанию',
   hook_run: 'Запуск по событию (webhook)',
   schedule_resumed: 'Расписание возобновлено',
+  wakeup_scheduled: 'Бот запланировал пробуждение',
+  wakeup_fired: 'Бот проснулся по своему запросу',
+  delegation_sent: 'Бот передал задачу другому боту',
+  delegation_done: 'Поручение выполнено',
   procedure_started: 'Запущена процедура',
   procedure_finished: 'Процедура завершена',
   memory_proposed: 'Бот предложил запомнить',
@@ -56,6 +61,17 @@ const SKIPPED = {
   bot_paused: 'Запуск пропущен: бот на паузе',
   provider_unavailable: 'Запуск пропущен: модель бота недоступна',
   check_failed: 'Запуск пропущен: проверка исполнителя не удалась',
+};
+const WAKEUP_SKIPPED = {
+  executor_unavailable: 'Пробуждение пропущено: компьютер бота недоступен',
+  bot_paused: 'Пробуждение пропущено: бот на паузе',
+  provider_unavailable: 'Пробуждение пропущено: модель бота недоступна',
+  check_failed: 'Пробуждение пропущено: проверка исполнителя не удалась',
+};
+const DELEGATION_END = {
+  done: 'Поручение выполнено',
+  error: 'Поручение завершилось ошибкой',
+  stopped: 'Поручение остановлено',
 };
 const BROWSER_ACTIONS = {
   navigate: 'Открыта страница',
@@ -76,6 +92,8 @@ export function describe(item) {
   const code = item && item.title && item.title.code;
   const params = (item && item.title && item.title.params) || {};
   if (code === 'schedule_skipped') return SKIPPED[params.reason] || 'Запуск пропущен: исполнитель недоступен';
+  if (code === 'wakeup_skipped') return WAKEUP_SKIPPED[params.reason] || 'Пробуждение пропущено: исполнитель недоступен';
+  if (code === 'delegation_done') return DELEGATION_END[params.outcome] || TITLES.delegation_done;
   if (code === 'browser_step') return BROWSER_ACTIONS[params.action] || 'Действие в браузере';
   if (code === 'procedure_finished') return PROCEDURE_END[item.status] || TITLES.procedure_finished;
   return TITLES[code] || 'Событие';
@@ -103,6 +121,10 @@ export function details(item) {
     case 'procedure_started':
     case 'procedure_finished':
       if (params.name) out.push({ text: params.name, user: true });
+      break;
+    case 'delegation_sent':
+    case 'delegation_done':
+      if (params.from_bot && params.to_bot) out.push({ text: `${params.from_bot} → ${params.to_bot}`, user: true });
       break;
     case 'bot_paused':
       if (params.reason) out.push({ text: params.reason, user: true });

@@ -93,7 +93,7 @@ test.describe('экран «Активность»: лента', () => {
     await more.click();
     await expect(rows(page)).toHaveCount(90);
     await more.click();
-    await expect(rows(page)).toHaveCount(92);
+    await expect(rows(page)).toHaveCount(94);
     await expect(more).toHaveCount(0);
     const ids = await rows(page).evaluateAll((nodes) => nodes.map((n) => n.getAttribute('data-item')));
     expect(new Set(ids).size).toBe(ids.length);

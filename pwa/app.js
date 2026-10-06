@@ -4,13 +4,14 @@ import { avatarHtml, AVATAR_KINDS, avatarLabel, randomAvatar } from './avatars.j
 import { openThreadStream } from './ws.js';
 import { ICONS, icon, esc, backHeader, alertHtml, modelTitle, fmtDateTime } from './ui.js';
 import { createAccount, failure, isServerFault } from './account.js';
-import { viewProviders, loadModelOptions, renderModelPicker, botModelCardHtml, mountBotModelCard, botStateBanner, botStartHint, recreateBotAction, confirmDeleteBot } from './providers.js';
+import { viewProviders, loadModelOptions, renderModelPicker, botModelCardHtml, mountBotModelCard, botCheckerCardHtml, mountBotCheckerCard, botStateBanner, botStartHint, recreateBotAction, confirmDeleteBot } from './providers.js';
 import { botNoModel, runnerKind, usableModels, providerStatus } from './registry.js';
 import { viewProviderRequests } from './provider-requests.js';
 import { hasBrowser, browserBodyHtml, browserAsideHtml, mountBrowser, controlTitle } from './browser.js';
 import { viewProcedureRoute, openSaveProcedureDialog } from './procedures.js';
 import { viewMemory } from './memory.js';
 import { viewActivity, skipNoteHtml } from './activity.js';
+import { wakeupsCardHtml, mountWakeups } from './wakeups.js';
 import { getLang, loadLang, locale } from './i18n.js';
 import { startTranslator } from './i18n-dom.js';
 
@@ -67,7 +68,7 @@ function macStatusLine(mac) {
 // Реальное /api/bots отдаёт только колонки из docs/contracts.md (status, executor, role...):
 // status_label/status_kind/location/summary — только у мок-данных. Достраиваем их тут,
 // чтобы карточки ботов не оставались пустыми на настоящем ядре.
-const STATUS_LABEL = { starting: 'Запускается', idle: 'Готово', running: 'Работает', waiting: 'Ждёт решения', waiting_approval: 'Ждёт решения', waiting_mac: 'Ждёт Mac', stopped: 'Остановлен', error: 'Стоп' };
+const STATUS_LABEL = { starting: 'Запускается', idle: 'Готово', running: 'Работает', waiting: 'Ждёт решения', waiting_approval: 'Ждёт решения', waiting_mac: 'Ждёт Mac', stopped: 'Остановлен', error: 'Ошибка' };
 const STATUS_KIND = { starting: 'attention', idle: 'success', running: 'success', waiting: 'attention', waiting_approval: 'attention', waiting_mac: 'attention', stopped: 'neutral', error: 'danger' };
 // Провайдеры из реестра по id: источник названия провайдера и его ошибки (ключ отклонён, адрес не отвечает) для ботов.
 let providerById = new Map();
@@ -190,7 +191,7 @@ async function render() {
       history.replaceState(null, '', `${location.pathname}${location.search}${thread ? `#/bots/${encodeURIComponent(thread.bot_id)}/browser` : '#/'}`);
       route = parseHash();
     }
-    if (desktop) await renderDesktop(route);
+    if (desktop) await renderDesktop(route, mine);
     else await renderMobile(route);
   } catch (err) {
     if (err && err.status === 401) return; // сессия закрыта: событие bothub-unauthorized покажет вход
@@ -333,14 +334,25 @@ async function handleAction(action, el) {
     // Переключатель меняется сразу; при ошибке возвращается как был, а сбой уходит в общий обработчик.
     const wanted = el.checked;
     try { await api.patchSchedule(el.getAttribute('data-id'), { catch_up: wanted }); } catch (error) { el.checked = !wanted; throw error; }
+  } else if (action === 'save-slack-secret' || action === 'clear-slack-secret') {
+    // Секрет только на запись: поле после сохранения пустеет, сервер отдаёт лишь признак has_slack_signing_secret.
+    const id = el.getAttribute('data-id');
+    const input = document.getElementById('sch-slack-secret');
+    const value = action === 'save-slack-secret' ? (input ? input.value.trim() : '') : null;
+    if (action === 'save-slack-secret' && !value) { input?.focus(); return; }
+    el.disabled = true;
+    try { await api.patchSchedule(id, { slack_signing_secret: value }); } catch (error) { el.disabled = false; throw error; }
+    render();
   } else if (action === 'send-message') {
     await sendMessage(el.getAttribute('data-thread'));
   } else if (action === 'stop-turn') {
     await api.stopTurn(el.getAttribute('data-turn') || 'current');
-  } else if (action === 'pick-avatar' || action === 'set-executor' || action === 'toggle-mfc' || action === 'toggle-autocompact') {
+  } else if (action === 'pick-avatar' || action === 'set-executor' || action === 'toggle-mfc' || action === 'toggle-autocompact' || action === 'save-mcp-allow') {
     await updateBotSetting(action, el);
   } else if (action === 'recreate-bot') {
     await recreateBotAction(el);
+  } else if (action === 'export-bot-template') {
+    exportBotTemplateAction(el);
   } else if (action === 'delete-bot') {
     confirmDeleteBot({ id: el.getAttribute('data-bot'), name: el.getAttribute('data-name') });
   } else if (action === 'save-procedure') {
@@ -365,6 +377,20 @@ async function handleAction(action, el) {
 const botState = new Map(); // id бота -> последнее подтверждённое состояние
 const botSeq = new Map(); // id бота -> номер последнего запроса: устаревшие ответы не применяем
 
+const MCP_ALLOW_MAX = 200; // пределы ядра: элементов в списке и символов в элементе
+const MCP_ALLOW_NAME_MAX = 200;
+// Как список применяется у каждого CLI (docs/contracts.md, раздел 4). У agy список не работает совсем: ход с непустым
+// списком не запускается, об этом пишем прямо, а не обещаем защиту.
+const MCP_ALLOW_BY_PROVIDER = {
+  claude: 'Claude: инструмент вне списка отклоняется сразу, ход идёт дальше. При пустом списке сторонние серверы не запускаются.',
+  codex: 'Codex: вызов инструмента вне списка останавливает ход. Вызов к этому моменту уже начат, поэтому это остановка, а не запрет.',
+  gemini: 'Gemini (agy) список не применяет: пока в нём есть строки, ход не запустится. Оставьте поле пустым.',
+};
+const MCP_ALLOW_OTHER = 'Как список применяется, зависит от исполнителя бота: Claude, Codex или Gemini.';
+const mcpAllowText = (bot) => (Array.isArray(bot.mcp_allow) ? bot.mcp_allow : []).join('\n');
+// Строки поля в список: пустые отбрасываются, повторы убираются, порядок сохраняется.
+const parseMcpAllow = (text) => [...new Set(String(text).split('\n').map((line) => line.trim()).filter(Boolean))];
+
 function paintBotSettings(scope, bot) {
   scope.querySelectorAll('[data-action="set-executor"]').forEach((b) => b.setAttribute('aria-checked', String(b.getAttribute('data-value') === bot.executor)));
   scope.querySelectorAll('[data-action="pick-avatar"]').forEach((b) => b.setAttribute('aria-pressed', String(b.getAttribute('data-avatar') === bot.avatar)));
@@ -385,9 +411,43 @@ function paintBotSettings(scope, bot) {
     const out = scope.querySelector('[data-ac-value]');
     if (out) out.textContent = `${acRange.value}%`;
   }
+  // Несохранённый текст в поле не затираем: другое переключение не должно стирать набранное.
+  const mcp = scope.querySelector('#mcp-allow');
+  if (mcp && mcp.value === mcp.dataset.saved) mcp.value = mcp.dataset.saved = mcpAllowText(bot);
   document.querySelectorAll(`[data-avatar-slot="${CSS.escape(bot.id)}"]`).forEach((slot) => {
     slot.innerHTML = avatarHtml(bot.avatar || 'robot', bot.provider, Number(slot.getAttribute('data-size')) || 44);
   });
+}
+
+
+async function exportBotTemplateAction(el) {
+  const id = el.getAttribute('data-bot');
+  const name = el.getAttribute('data-name') || '';
+  const idleHtml = el.innerHTML;
+  el.disabled = true;
+  el.innerHTML = `${ICONS.spinner}<span>Готовлю файл…</span>`;
+  try {
+    const doc = await api.exportBotTemplate(id);
+    downloadBotTemplate(name, doc);
+  } catch (err) {
+    alert('Не получилось экспортировать шаблон: ' + (err.message || String(err)));
+  } finally {
+    el.disabled = false;
+    el.innerHTML = idleHtml;
+  }
+}
+
+function downloadBotTemplate(name, doc) {
+  const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const safe = String(name).replace(/[\\/:*?"<>|\s]+/g, '-').replace(/^-+|-+$/g, '') || 'bot';
+  a.download = `${safe}.botstead.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 async function updateBotSetting(action, el) {
@@ -400,8 +460,14 @@ async function updateBotSetting(action, el) {
     : action === 'set-executor' ? { executor: el.getAttribute('data-value') }
     : action === 'toggle-autocompact' ? { auto_compact_percent: el.checked ? Number(scope.querySelector('#ac-range').value) : null }
     : action === 'set-autocompact-percent' ? { auto_compact_percent: Number(el.value) }
+    : action === 'save-mcp-allow' ? { mcp_allow: parseMcpAllow(scope.querySelector('#mcp-allow').value) }
     : { mac_full_control: el.checked };
   const alertBox = scope.querySelector('#bot-alert');
+  if (action === 'save-mcp-allow' && (patch.mcp_allow.length > MCP_ALLOW_MAX || patch.mcp_allow.some((name) => name.length > MCP_ALLOW_NAME_MAX))) {
+    alertBox.innerHTML = alertHtml('Изменение не сохранено', `Не больше ${MCP_ALLOW_MAX} строк, в каждой до ${MCP_ALLOW_NAME_MAX} символов.`);
+    alertBox.firstElementChild.focus();
+    return;
+  }
   const seq = (botSeq.get(botId) || 0) + 1;
   botSeq.set(botId, seq);
   if (alertBox) alertBox.innerHTML = '';
@@ -410,6 +476,9 @@ async function updateBotSetting(action, el) {
     const row = await api.patchBot(botId, patch);
     const saved = botView({ ...before, status_label: row.status_label, status_kind: row.status_kind, summary: row.summary, ...row });
     botState.set(botId, saved);
+    const field = action === 'save-mcp-allow' ? scope.querySelector('#mcp-allow') : null;
+    // Поле не менялось за время запроса: оно снова «сохранённое», его перерисует paintBotSettings
+    if (field && parseMcpAllow(field.value).join('\n') === patch.mcp_allow.join('\n')) field.dataset.saved = field.value;
     if (botSeq.get(botId) === seq) paintBotSettings(scope, saved);
   } catch (err) {
     if (botSeq.get(botId) !== seq) return;
@@ -640,6 +709,29 @@ function armStartWatch(seq) {
     if (seq === renderSeq) armStartWatch(seq);
   }, START_POLL_MS);
 }
+// Строки ботов в боковой панели (Mac) и карточки (телефон) без перерисовки экрана: статус после хода.
+let botRowsTimer = 0;
+function refreshBotRows() {
+  clearTimeout(botRowsTimer);
+  botRowsTimer = setTimeout(async () => {
+    let bots;
+    try { bots = await listBotsView(); } catch { return; }
+    for (const b of bots) {
+      document.querySelectorAll(`.desktop-bot-row[data-bot="${CSS.escape(b.id)}"]`).forEach((row) => {
+        row.setAttribute('data-bot-status', b.status || '');
+        const line = row.querySelector('.status-line');
+        if (line) line.textContent = b.status_label;
+      });
+      document.querySelectorAll(`.bot-card [data-bot="${CSS.escape(b.id)}"]`).forEach((link) => {
+        const card = link.closest('.bot-card');
+        if (!card) return;
+        card.setAttribute('data-bot-status', b.status || '');
+        const line = card.querySelector('.status-line');
+        if (line) line.innerHTML = statusLineHtml(b);
+      });
+    }
+  }, 400);
+}
 function paintStartedBots(bots) {
   for (const b of bots) {
     document.querySelectorAll(`.bot-card[data-bot-status="starting"] [data-bot="${CSS.escape(b.id)}"]`).forEach((link) => {
@@ -715,14 +807,24 @@ function usageMetaHtml(payload) {
 }
 
 // Итог одобрения словами: approve/reject из ответа и события, expired от ядра, settled когда решение уже принято, а какое, неизвестно.
-const APPROVAL_OUTCOME = { approve: 'Разрешено', reject: 'Отклонено', expired: 'Срок вышел', settled: 'Уже решено' };
+const APPROVAL_OUTCOME = { approve: 'Разрешено', reject: 'Отклонено', rejected: 'Отклонено', checker_denied: 'Отклонено проверяющей моделью', expired: 'Срок вышел', settled: 'Уже решено' };
+// Решение из approval_dec: автоотказ проверяющей модели (reason checker_denied) называется отдельно.
+const decisionOf = (payload) => (payload && payload.reason === 'checker_denied' ? 'checker_denied' : payload && payload.decision);
+
+// Подсказка проверяющей модели бота (docs/contracts.md §19): «Проверка: <вердикт> · <причина>». Причина пишет модель, не переводится.
+function checkerHintHtml(verdict, reason) {
+  if (!['allow', 'deny', 'ask'].includes(verdict)) return '';
+  return `<div class="t-footnote" data-checker-hint><span>Проверка:</span> <span data-i18n-skip>${esc(verdict)}${reason ? ` · ${esc(reason)}` : ''}</span></div>`;
+}
 
 function approvalCardHtml(payload, decision) {
   const id = payload.approval_id || '';
   const resolved = Boolean(APPROVAL_OUTCOME[decision]);
+  const checker = payload.checker && typeof payload.checker === 'object' ? payload.checker : null;
   return `<section class="risk-card" data-approval-id="${esc(id)}" style="background:var(--attention-bg);border-color:var(--attention-border);">
     <div class="risk-tag" style="color:var(--attention-text);">${ICONS.alert}${esc(RISK_LABEL[payload.risk] || 'ПОДТВЕРЖДЕНИЕ')}</div>
     <div class="t-callout" style="font-size:16px;font-weight:500;">${esc(payload.title || '')}</div>
+    ${checker ? checkerHintHtml(checker.verdict, checker.reason) : ''}
     <div class="approval-status t-footnote" role="status" data-approval-status ${resolved ? '' : 'hidden'}>${resolved ? APPROVAL_OUTCOME[decision] : ''}</div>
     ${resolved ? '' : `<div class="btn-row btn-row-2" data-approval-actions>
       <button type="button" class="btn btn-secondary" data-action="thread-approval" data-decision="reject" data-id="${esc(id)}">Отклонить</button>
@@ -754,8 +856,14 @@ function renderEvent(ev, botAvatar) {
   switch (ev.kind) {
     case 'system':
       return `<div class="system-pill">${esc(ev.payload.text)}</div>`;
-    case 'user_msg':
+    case 'user_msg': {
+      const from = ev.payload.delegated_from;
+      if (from && from.name) {
+        // Поручение от другого бота (раздел 19): метка над сообщением, имя бота это данные и не переводится
+        return `<div class="msg-user-wrap"><div class="msg-from" data-delegated-from><span>От бота</span> <span data-i18n-skip>${esc(from.name)}</span></div><div class="msg-user" data-i18n-skip>${esc(ev.payload.text)}</div></div>`;
+      }
       return `<div class="msg-user" data-i18n-skip>${esc(ev.payload.text)}</div>`;
+    }
     case 'assistant_msg':
       return `<div class="msg-bot"><span class="msg-bot-text" data-i18n-skip>${esc(ev.payload.text)}${ev.payload.final === false ? '<span class="t-muted">…</span>' : ''}</span></div>`;
     case 'usage':
@@ -866,6 +974,7 @@ function createThreadEventHandler(body, botAvatar, approvalDecisions, threadId, 
       if (payload.status === 'done') { finishedTurns.add(key); offerProcedure(key); } else if (['error', 'stopped', 'failed'].includes(payload.status)) { finishedTurns.delete(key); findOffer(key)?.remove(); }
       if (payload.status === 'error' && !(ctl && ctl.isCompactTurn(key))) showTurnError(key, payload);  // сжатие пишет своё «Не удалось сжать»
       if (['error', 'stopped', 'failed'].includes(payload.status)) syncPendingCards();
+      refreshBotRows();  // статус бота в списке слева меняется вместе с ходом
     }
     if (TURN_FAILURE_REASON[ev.kind] && turnKey) failureReasons.set(turnKey, TURN_FAILURE_REASON[ev.kind]);
     if (ev.kind === 'usage' && turnKey) { finishedTurns.add(turnKey); offerProcedure(turnKey); }
@@ -901,10 +1010,10 @@ function createThreadEventHandler(body, botAvatar, approvalDecisions, threadId, 
     }
     if (ev.kind === 'approval_dec') {
       const id = payload.approval_id;
-      approvalDecisions.set(id, payload.decision);
+      approvalDecisions.set(id, decisionOf(payload));
       const card = Array.from(body.querySelectorAll('[data-approval-id]'))
         .find((item) => item.dataset.approvalId === id);
-      if (card) applyApprovalDecision(card, payload.decision);
+      if (card) applyApprovalDecision(card, decisionOf(payload));
       return;
     }
     body.insertAdjacentHTML('beforeend', renderEvent(ev, botAvatar));
@@ -917,7 +1026,7 @@ async function connectThreadStream(threadId, body, botAvatar, ctl = null) {
   events = (events || []).slice().sort((a, b) => a.seq - b.seq);
   const approvalDecisions = new Map(events
     .filter((ev) => ev.kind === 'approval_dec' && ev.payload?.approval_id)
-    .map((ev) => [ev.payload.approval_id, ev.payload.decision]));
+    .map((ev) => [ev.payload.approval_id, decisionOf(ev.payload)]));
   const handleEvent = createThreadEventHandler(body, botAvatar, approvalDecisions, threadId, ctl);
   for (const ev of events) { if (ctl) ctl.onEvent(ev, false); handleEvent(ev); }
   body.scrollTop = body.scrollHeight;
@@ -1326,6 +1435,7 @@ async function viewApprovals(focusId) {
       <div class="risk-card">
         <div class="risk-tag">${ICONS.alert}${esc(RISK_LABEL[a.risk] || 'ДЕЙСТВИЕ')}</div>
         <div class="t-callout" style="font-size:17px;font-weight:500;">${esc(a.title)}</div>
+        ${checkerHintHtml(a.checker_verdict, a.checker_reason)}
         <dl class="kv" data-i18n-skip>${Object.entries(a.args || {}).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl>
         <details><summary class="t-footnote" style="color:var(--attention-text);cursor:pointer;min-height:32px;display:flex;align-items:center;">Аргументы действия</summary>
           <pre class="args-pre">${esc(a.tool)}\n${esc(args)} · sha ${esc((a.args_hash || '').slice(0, 8))}…</pre>
@@ -1398,6 +1508,22 @@ function procedureEntryRow(procedures) {
 // ---------------------------------------------------------------------------
 // Рутина (расписание, событие): параметры и запуск
 // ---------------------------------------------------------------------------
+function slackHookHtml(s) {
+  const url = `${location.origin}/bots/hooks/${s.id}/slack`;
+  return `<div class="stack gap-2" data-slack-hook>
+    <span class="t-headline" style="font-size:15px;">Slack</span>
+    <span class="t-footnote">Адрес для Request URL в Event Subscriptions приложения Slack.</span>
+    <code class="t-footnote mono" data-i18n-skip data-slack-url style="word-break:break-all;">${esc(url)}</code>
+    <label for="sch-slack-secret"><span class="t-footnote">Секрет подписи Slack</span></label>
+    <span class="t-footnote" data-slack-secret-state>${s.has_slack_signing_secret ? 'Секрет задан. Его значение не показывается.' : 'Секрет не задан: запросы Slack отклоняются.'}</span>
+    <input id="sch-slack-secret" class="input mono" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" maxlength="256" placeholder="Signing Secret из Basic Information">
+    <div class="row gap-2">
+      <button type="button" class="btn btn-secondary" data-action="save-slack-secret" data-id="${esc(s.id)}">Сохранить секрет</button>
+      ${s.has_slack_signing_secret ? `<button type="button" class="btn btn-secondary" data-action="clear-slack-secret" data-id="${esc(s.id)}">Удалить секрет</button>` : ''}
+    </div>
+  </div>`;
+}
+
 async function viewSchedule(id) {
   const [schedules, bots] = await Promise.all([api.listSchedules(), listBotsView()]);
   const s = schedules.find((x) => x.id === id);
@@ -1411,6 +1537,7 @@ async function viewSchedule(id) {
         <div class="t-body" data-i18n-skip>${esc(s.kind === 'cron' ? (s.cron || '') : s.kind)}</div>
         <div class="t-footnote" data-i18n-skip>${esc(s.prompt || '')}</div>
         ${skipNoteHtml(s)}
+        ${s.kind === 'hook' ? slackHookHtml(s) : ''}
         ${s.kind === 'cron' ? `<div class="switch-row"><label for="sch-catch-up">Один запуск после возобновления<span class="t-footnote">Если расписание стояло из-за недоступного компьютера бота, после возвращения выполнится один запуск. Пропущенные пачкой не догоняются.</span></label><input id="sch-catch-up" type="checkbox" role="switch" data-action="toggle-catch-up" data-id="${esc(s.id)}"${s.catch_up ? ' checked' : ''}></div>` : ''}
       </div>
     </div>
@@ -1479,6 +1606,36 @@ function meterRow(label, pct, colorVar) {
     </div>
     <span class="meter-pct" style="${known && pct >= 100 ? 'color:var(--danger-fg);' : ''}">${known ? pct + '%' : '-'}</span>
   </div>`;
+}
+
+// Боковая панель треда (десктоп), раздел «Квоты». Метры подписок (Claude/Codex) показываем только
+// боту, привязанному к провайдеру-подписке (запись kind cli_subscription: cli совпадает с runner-провайдером
+// бота); у ботов на API-ключе или OpenAI-совместимом сервере (OpenRouter) ядро не знает квоту, поэтому
+// показываем их расход за сегодня из той же сводки, что уже загружена для экрана расхода.
+function threadQuotasHtml(bot, usage) {
+  const provider = bot.provider_id ? providerById.get(bot.provider_id) : null;
+  const label = PROVIDER_LABEL[bot.provider] || bot.provider || 'Квота';
+  if (provider && provider.kind === 'cli_subscription' && runnerKind(provider) === bot.provider) {
+    const row = (usage.providers || []).find((p) => p.provider === bot.provider);
+    return row ? meterRow(label, row.pct_week, { claude: 'var(--claude-fg)', codex: 'var(--codex-fg)', gemini: 'var(--gemini-fg)' }[bot.provider]) : '';
+  }
+  // Метр расхода подписываем именем бота: у API-ключа/Codex-раннера «Codex» пометило бы чужую квоту.
+  const used = (usage.bots || []).find((b) => b.bot_id === bot.id);
+  if (used) {
+    const today = used.tokens_today || 0;
+    const budget = used.budget || bot.budget_daily_tokens || 200000;
+    const pct = budget > 0 ? Math.round((today / budget) * 100) : 0;
+    const fill = pct >= 100 ? 'var(--danger-fg)' : pct >= 80 ? 'var(--attention-fg)' : 'var(--codex-fg)';
+    return `<div class="meter-row">
+      <span class="meter-label" data-i18n-skip>${esc(bot.name || bot.id)}</span>
+      <div role="meter" aria-label="${esc(bot.name || bot.id)}: ${formatTokens(today)} из ${formatTokens(budget)} токенов" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100" class="meter-track">
+        <div class="meter-fill" style="width:${Math.min(pct, 100)}%;background:${fill};"></div>
+      </div>
+      <span class="meter-pct">${pct}%</span>
+    </div>
+    <div class="t-footnote">Сегодня: ${formatTokens(today)} из ${formatTokens(budget)} токенов дневного бюджета</div>`;
+  }
+  return '<div class="t-footnote"><a href="#/usage">Расход по токенам: экран «Расход»</a></div>';
 }
 
 function usageBodyHtml(summary, bots, days) {
@@ -1751,6 +1908,12 @@ async function viewBotNew(qs) {
           </div>
           <p id="bn-desc-error" class="t-footnote" style="color:var(--danger-fg);" hidden></p>
           <button type="button" id="bn-desc-submit" class="btn btn-primary">Собрать</button>
+          <div class="row gap-2" style="margin-top:4px;">
+            <span class="t-footnote" style="color:var(--fg-muted);">или</span>
+            <button type="button" id="bn-from-file" class="btn btn-secondary">${ICONS.share}Создать из файла</button>
+            <input type="file" id="bn-file-input" accept=".botstead.json,application/json" hidden>
+          </div>
+          <p id="bn-file-error" class="t-footnote" style="color:var(--danger-fg);" hidden></p>
         </div>
       </div>
     </div>`;
@@ -1785,6 +1948,44 @@ async function viewBotNew(qs) {
       sync();
     }
     checkModels();
+    const fileBtn = document.getElementById('bn-from-file');
+    const fileInput = document.getElementById('bn-file-input');
+    const fileErr = document.getElementById('bn-file-error');
+    fileBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', async (e) => {
+      const file = e.target.files && e.target.files[0];
+      fileInput.value = '';
+      if (!file) return;
+      if (file.size > 1024 * 1024) {
+        fileErr.textContent = 'Файл больше 1 МБ: это не шаблон бота.';
+        fileErr.hidden = false;
+        return;
+      }
+      let text;
+      try { text = await file.text(); } catch {
+        fileErr.textContent = 'Файл не удалось прочитать.';
+        fileErr.hidden = false;
+        return;
+      }
+      let doc;
+      try { doc = JSON.parse(text); } catch (err) {
+        fileErr.textContent = `Это не JSON: ${String(err.message || '').replace(/^JSON\.parse: /, '')}`;
+        fileErr.hidden = false;
+        return;
+      }
+      if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
+        fileErr.textContent = 'Ожидается один объект шаблона, а не список или значение.';
+        fileErr.hidden = false;
+        return;
+      }
+      if (doc.format !== undefined && doc.format !== 'botstead-bot') {
+        fileErr.textContent = 'Файл не похож на шаблон бота (формат не botstead-bot).';
+        fileErr.hidden = false;
+        return;
+      }
+      fileErr.hidden = true;
+      await renderStep2FromTemplate(doc);
+    });
     btn.addEventListener('click', async () => {
       const text = descEl.value.trim();
       if (text.length < 10) return;
@@ -1813,6 +2014,10 @@ async function viewBotNew(qs) {
     return `<div class="screen">
       ${backHeader({ title: 'Новый бот', backHref: '#/' })}
       <div class="thread-body" style="gap:16px;">
+        ${d._importSummary ? `<div class="card card-pad stack gap-1">
+          <span class="t-footnote" style="font-weight:600;">Из шаблона</span>
+          <span class="t-footnote" data-i18n-skip>${esc(d._importSummary)}</span>
+        </div>` : ''}
         <div class="card card-pad row gap-4" style="justify-content:center;">
           <div id="bn-avatar-big">${avatarHtml(d.avatar, d.provider, 96)}</div>
           <button type="button" id="bn-avatar-random" class="btn btn-secondary" aria-label="Выбрать другого персонажа случайно">${ICONS.retry}Другой</button>
@@ -1963,6 +2168,115 @@ async function viewBotNew(qs) {
     paint();
   }
 
+  async function renderStep2FromTemplate(doc) {
+    // Шаблон из файла: показываем карточку как draft, имя и роль берём из файла, расписания/правила — оттуда же.
+    // Модель человек выбирает из включённых, при импорте передаём её в POST /api/bots/import.
+    const options = await loadModelOptions();
+    const available = usableModels(options.groups);
+    const first = available[0];
+    if (!chosenAvatar) { chosenAvatar = randomAvatar(); avatarDraftSet(chosenAvatar); }
+    const d = {
+      name: doc.name,
+      role: doc.role || '',
+      avatar: chosenAvatar,
+      provider: first ? runnerKind(first.provider) : 'fake',
+      model: first ? first.model.name : doc.name,
+      executor: doc.executor || 'container',
+      mac_full_control: false,
+      auto_allow: Array.isArray(doc.auto_allow) ? doc.auto_allow : [],
+      mcp_allow: Array.isArray(doc.mcp_allow) ? doc.mcp_allow : [],
+      instructions: doc.instructions || '',
+      schedule: Array.isArray(doc.schedules) && doc.schedules.length ? doc.schedules[0] : null,
+      scheduleEnabled: Array.isArray(doc.schedules) && doc.schedules.length > 0,
+      provider_id: first ? first.provider.id : null,
+      model_id: first ? first.model.id : null,
+      budget_daily_tokens: doc.budget_daily_tokens,
+      auto_compact_percent: doc.auto_compact_percent,
+      _templateDoc: doc,
+      _importSummary: `${doc.name}${doc.role ? ` · ${doc.role}` : ''} · расписаний: ${(doc.schedules || []).length} · процедур: ${(doc.procedures || []).length}`,
+    };
+
+    function paint() { app.innerHTML = step2Html(d); wire(); }
+
+    function setAvatar(kind, announce) {
+      d.avatar = chosenAvatar = kind;
+      avatarDraftSet(kind);
+      document.getElementById('bn-avatar-big').innerHTML = avatarHtml(kind, d.provider, 96);
+      document.querySelectorAll('[data-bn-avatar]').forEach((b) => b.setAttribute('aria-pressed', String(b.getAttribute('data-bn-avatar') === kind)));
+      if (announce) document.getElementById('bn-avatar-live').textContent = `Персонаж: ${avatarLabel(kind).split(':')[0]}`;
+    }
+
+    function wire() {
+      document.getElementById('bn-name').addEventListener('input', (e) => { d.name = e.target.value; });
+      document.getElementById('bn-role').addEventListener('input', (e) => { d.role = e.target.value; });
+      document.getElementById('bn-instructions')?.addEventListener('input', (e) => { d.instructions = e.target.value; });
+      document.getElementById('bn-mfc')?.addEventListener('change', (e) => { d.mac_full_control = e.target.checked; });
+      document.getElementById('bn-sched')?.addEventListener('change', (e) => { d.scheduleEnabled = e.target.checked; });
+      document.querySelectorAll('[data-bn-avatar]').forEach((b) => b.addEventListener('click', () => setAvatar(b.getAttribute('data-bn-avatar'), false)));
+      document.getElementById('bn-avatar-random').addEventListener('click', () => setAvatar(randomAvatar(d.avatar), true));
+      renderModelPicker(document.getElementById('bn-model'), {
+        groups: options.groups,
+        selected: () => d.model_id,
+        sheetSubtitle: 'Для нового бота',
+        onPick: async (provider, model) => {
+          d.provider_id = provider.id; d.model_id = model.id; d.model = model.name; d.provider = runnerKind(provider);
+          document.getElementById('bn-avatar-big').innerHTML = avatarHtml(d.avatar, d.provider, 96);
+          document.getElementById('bn-create').disabled = false;
+        },
+      });
+      document.querySelectorAll('[data-bn-executor]').forEach((b) => b.addEventListener('click', () => {
+        d.executor = b.getAttribute('data-bn-executor');
+        if (d.executor !== 'mac') d.mac_full_control = false;
+        paint();
+      }));
+      document.querySelectorAll('[data-bn-rule-del]').forEach((b) => b.addEventListener('click', () => {
+        d.auto_allow.splice(Number(b.getAttribute('data-bn-rule-del')), 1);
+        paint();
+      }));
+      document.getElementById('bn-back').addEventListener('click', () => renderStep1(''));
+      document.getElementById('bn-create').addEventListener('click', async () => {
+        const btn = document.getElementById('bn-create');
+        const errEl = document.getElementById('bn-create-error');
+        btn.disabled = true;
+        btn.setAttribute('aria-busy', 'true');
+        btn.innerHTML = loadingBtnHtml('Создаю…');
+        errEl.hidden = true;
+        try {
+          const templateDoc = { ...d._templateDoc };
+          templateDoc.name = d.name;
+          templateDoc.role = d.role;
+          templateDoc.instructions = d.instructions || '';
+          templateDoc.avatar = d.avatar;
+          templateDoc.executor = d.executor;
+          templateDoc.auto_allow = d.auto_allow;
+          templateDoc.mcp_allow = d.mcp_allow;
+          if (templateDoc.auto_compact_percent === undefined) templateDoc.auto_compact_percent = d.auto_compact_percent;
+          if (!d.scheduleEnabled) templateDoc.schedules = [];  // галочка «расписание» снята: в бота они не попадут
+          const bot = await api.importBotTemplate({ ...templateDoc, provider_id: d.provider_id, model_id: d.model_id });
+          draftSet('');
+          const thread = await api.createThread(bot.id, '');
+          location.hash = `#/threads/${thread.id}`;
+        } catch (err) {
+          btn.disabled = false;
+          btn.removeAttribute('aria-busy');
+          errEl.hidden = false;
+          if (err.status === 409) {
+            btn.textContent = 'Создать';
+            errEl.textContent = 'Бот с таким именем уже есть: переименуйте его в форме или в файле.';
+          } else if (err.status === 422 || err.status === 400 || err.status === 413) {
+            btn.textContent = 'Создать';
+            errEl.textContent = `Файл не подошёл: ${err.message || err.detail || 'неверный формат'}`;
+          } else {
+            btn.textContent = 'Создать';
+            errEl.textContent = `Не получилось создать бота: ${err.message || String(err)}`;
+          }
+        }
+      });
+    }
+
+    paint();
+  }
+
   renderStep1(prefill || restored);
 }
 
@@ -1989,6 +2303,7 @@ function botSettingsCards(bot) {
         </div>
       </div>
       ${botModelCardHtml(bot)}
+      ${botCheckerCardHtml(bot)}
       <div class="card card-pad stack gap-3">
         <span class="t-headline" style="font-size:15px;">Где работает</span>
         <div role="radiogroup" class="segmented" style="grid-template-columns:repeat(2,minmax(0,1fr));">
@@ -2011,11 +2326,24 @@ function botSettingsCards(bot) {
           <output class="ac-value" for="ac-range" data-ac-value>${acPercent}%</output>
         </div>
       </div>
+      ${wakeupsCardHtml()}
+      <div class="card card-pad stack gap-2" id="mcp-allow-card">
+        <label for="mcp-allow"><span class="t-headline" style="font-size:15px;">Разрешённые MCP</span></label>
+        <span class="t-footnote" id="mcp-allow-hint">Одно правило на строку: имя сервера (весь сервер) или сервер.инструмент, например github или github.create_issue. Пусто: у бота только инструменты bothub. Разрешённый инструмент всё равно спросит вас, пока нет правила.</span>
+        <span class="t-footnote" id="mcp-allow-executor-hint">${Object.hasOwn(MCP_ALLOW_BY_PROVIDER, bot.provider) ? MCP_ALLOW_BY_PROVIDER[bot.provider] : MCP_ALLOW_OTHER}</span>
+        <textarea id="mcp-allow" class="input textarea mono" rows="3" style="min-height:84px;" spellcheck="false" autocapitalize="off" autocomplete="off" aria-describedby="mcp-allow-hint mcp-allow-executor-hint" data-saved="${esc(mcpAllowText(bot))}">${esc(mcpAllowText(bot))}</textarea>
+        <button type="button" class="btn btn-secondary" data-action="save-mcp-allow">Сохранить список</button>
+      </div>
       <div class="card card-pad stack gap-2">
         <span class="t-headline" style="font-size:15px;">Правила</span>
         <span class="t-footnote">Без вопроса: чтение файлов, поиск, скриншот</span>
         <span class="t-footnote" style="color:var(--attention-text);">Всегда спрашивать: удаление, отправка, оплата, вход</span>
         <span class="t-footnote">Предохранитель: ${Math.round((bot.budget_daily_tokens || 200000) / 1000)}k токенов в день, стоп после 3 одинаковых ошибок, до 30 мин на задачу</span>
+      </div>
+      <div class="card card-pad stack gap-2">
+        <span class="t-headline" style="font-size:15px;">Экспорт шаблона</span>
+        <span class="t-footnote">Файл .botstead.json с настройками бота, расписаниями и процедурами. Без истории, памяти, токенов и модели.</span>
+        <button type="button" class="btn btn-secondary" data-action="export-bot-template" data-bot="${esc(bot.id)}" data-name="${esc(bot.name)}">${ICONS.download}Экспорт шаблона</button>
       </div>
       <div class="card card-pad stack gap-2">
         <span class="t-headline" style="font-size:15px;">Удаление</span>
@@ -2041,6 +2369,7 @@ async function viewBotSettings(id, qs) {
     </div>
   </div>`;
   mountBotModel(app.querySelector('.screen[data-bot]'), bot.id);
+  mountWakeups(app.querySelector('.screen[data-bot]'), bot.id);
 }
 
 // Выбор модели в настройках бота: подгружает реестр и сохраняет выбор в ядре (provider_id и model_id вместе).
@@ -2053,19 +2382,25 @@ function mountBotModel(scope, botId) {
     botState.set(botId, saved);
     paintBotSettings(scope, saved);
   });
+  mountBotCheckerCard(scope, bot, (row) => {
+    const before = botState.get(botId) || bot;
+    botState.set(botId, botView({ ...before, status_label: row.status_label, status_kind: row.status_kind, summary: row.summary, ...row }));
+  });
 }
 
 // ---------------------------------------------------------------------------
 // Desktop (Mac ≥1024px): три колонки
 // ---------------------------------------------------------------------------
-async function renderDesktop(route) {
+// mine: номер отрисовки из render(). Устаревшая (её обогнала новая) разметку может записать, но ничего не монтирует:
+// иначе её cleanup попал бы в список после очистки новой отрисовки и держал бы экран браузера и поток треда на чужом экране.
+// Затёртый ею актуальный экран рисует заново finally в render().
+async function renderDesktop(route, mine) {
   // usage нужен боковой панели треда (расход по провайдерам); сбой сводки не должен ломать раскладку.
   // На самом экране расхода сводку запрашивает usageContentHtml: второй запрос здесь был бы лишним.
   const [bots, approvals, schedules, usage] = await Promise.all([listBotsView(), api.listApprovals('pending'), api.listSchedules(),
     route.name === 'usage' ? { providers: [], bots: [] } : api.usageSummary().catch(() => ({ providers: [], bots: [] }))]);
   const activeBotId = route.name === 'thread' ? (await api.getThread(route.id))?.bot_id
     : (route.name === 'bot-settings' || route.name === 'browser') ? route.id : (bots[0] && bots[0].id);
-  const providerColor = { claude: 'var(--claude-fg)', codex: 'var(--codex-fg)', gemini: 'var(--gemini-fg)' };
 
   const sidebar = desktopSidebar({ bots, approvals, activeBotId, activeNav: { routines: 'routines', schedule: 'routines', approvals: 'approvals', memory: 'memory', usage: 'usage' }[route.name] || '' });
 
@@ -2094,7 +2429,7 @@ async function renderDesktop(route) {
       ${hasBrowser(bot) ? `<div class="card card-pad stack gap-2"><span class="t-callout" data-browser-status role="status">Состояние экрана…</span><a href="#/bots/${esc(bot.id)}/browser" class="btn btn-secondary">${ICONS.screen}Открыть экран</a></div>`
     : `<div class="card card-pad"><span class="t-footnote">У этого бота нет браузера.</span></div>`}
       <div class="desktop-aside-label" style="margin-top:8px;">Квоты</div>
-      ${usage.providers.map((p) => meterRow(PROVIDER_LABEL[p.provider] || p.provider, p.pct_week, providerColor[p.provider])).join('')}
+      ${threadQuotasHtml(bot, usage)}
     </aside>`;
   } else if (route.name === 'browser') {
     const bot = bots.find((b) => b.id === route.id);
@@ -2114,7 +2449,7 @@ async function renderDesktop(route) {
     const procedures = await api.listProcedures().catch(() => null);
     mainHtml = `<main class="desktop-main"><div class="desktop-thread-head"><div class="t-headline">Рутины</div></div><div class="desktop-thread-body" style="max-width:640px;">
       ${procedureEntryRow(procedures)}
-      ${schedules.map((s) => `<div class="card card-pad row gap-3"><span class="row-icon">${scheduleIconFor(s.kind)}</span><span class="flex-1 stack"><span class="row-title" data-i18n-skip>${esc(s.name)}</span><span class="row-sub">${esc(bots.find((b) => b.id === s.bot_id)?.name || s.bot_id)}</span>${skipNoteHtml(s)}</span><button type="button" class="icon-btn sunken" data-action="run-schedule" data-id="${s.id}">${ICONS.play}</button></div>`).join('')}
+      ${schedules.map((s) => `<div class="card card-pad row gap-3"><span class="row-icon">${scheduleIconFor(s.kind)}</span><span class="flex-1 stack"><span class="row-title" data-i18n-skip>${esc(s.name)}</span><span class="row-sub">${esc(bots.find((b) => b.id === s.bot_id)?.name || s.bot_id)}</span>${skipNoteHtml(s)}</span><button type="button" class="icon-btn sunken" data-action="run-schedule" data-id="${s.id}">${ICONS.play}</button></div>${s.kind === 'hook' ? `<div class="card card-pad">${slackHookHtml(s)}</div>` : ''}`).join('')}
     </div></main>`;
   } else if (route.name === 'approvals') {
     const a = (route.id && approvals.find((x) => x.id === route.id)) || approvals[0];
@@ -2122,6 +2457,7 @@ async function renderDesktop(route) {
       ${a ? `<div class="risk-card">
         <div class="risk-tag">${ICONS.alert}${esc(RISK_LABEL[a.risk] || 'ДЕЙСТВИЕ')}</div>
         <div class="t-callout" style="font-size:17px;font-weight:500;">${esc(a.title)}</div>
+        ${checkerHintHtml(a.checker_verdict, a.checker_reason)}
         <div class="btn-row btn-row-2"><button type="button" class="btn btn-secondary" data-action="reject" data-id="${a.id}">Отклонить</button><button type="button" class="btn btn-attention" data-action="approve" data-id="${a.id}">Разрешить</button></div>
       </div>` : `<p class="t-body">Нет ожидающих решений.</p>`}
     </div></main>`;
@@ -2136,10 +2472,14 @@ async function renderDesktop(route) {
   }
 
   app.innerHTML = `<div class="desktop-shell">${SKIP_LINK}${sidebar}${mainHtml}${asideHtml}</div>`;
+  if (mine !== renderSeq) return;
   const mainEl = app.querySelector('.desktop-main');
   mainEl.id = 'content';
   mainEl.tabIndex = -1;
-  if (route.name === 'bot-settings') mountBotModel(app.querySelector('main[data-bot]'), route.id);
+  if (route.name === 'bot-settings') {
+    mountBotModel(app.querySelector('main[data-bot]'), route.id);
+    mountWakeups(app.querySelector('main[data-bot]'), route.id);
+  }
   if (route.name === 'browser') mountBrowser({ app, bot: bots.find((b) => b.id === route.id), botId: route.id, setCleanup });
 
   if (threadId) {
@@ -2148,9 +2488,10 @@ async function renderDesktop(route) {
     const bot = bots.find((b) => b.id === thread?.bot_id) || {};
     if (hasBrowser(bot)) {
       const paint = (text) => { const node = app.querySelector('[data-browser-status]'); if (node) node.textContent = text; };
-      api.getBrowser(bot.id).then((state) => paint(controlTitle(state.state))).catch(() => paint('Состояние экрана неизвестно'));
+      api.getBrowser(bot.id).then((state) => { if (mine === renderSeq) paint(controlTitle(state.state)); }).catch(() => { if (mine === renderSeq) paint('Состояние экрана неизвестно'); });
     }
     const stop = await startThreadStream(threadId, thread, body, bot.avatar);
+    if (mine !== renderSeq) { stop(); return; } // пока подключались, ушли на другой экран: поток закрываем сразу
     // Ввод открывается только после подключения к потоку треда: иначе событие отправленного сообщения приходит до подписки и теряется.
     app.querySelectorAll('#composer-input, [data-action="send-message"]').forEach((el) => { el.disabled = false; });
     setCleanup(stop);

@@ -265,7 +265,7 @@ def test_models_reject_bad_text_in_nested_fields(bad):
 def test_ordinary_text_is_unchanged():
     text = "Привет,\nмир!\t  emoji \U0001F600 \x1f"
     assert TurnIn.model_validate({"prompt": text, "client": "pwa"}).prompt == text
-    assert BotIn.model_validate(BOT | {"mcp_allow": ["mcp__bothub__x"]}).mcp_allow == ["mcp__bothub__x"]
+    assert BotIn.model_validate(BOT | {"mcp_allow": ["mcp__github__x"]}).mcp_allow == ["mcp__github__x"]
 
 
 def test_deeply_nested_json_is_rejected_not_a_recursion_error():

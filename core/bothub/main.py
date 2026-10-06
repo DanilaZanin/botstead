@@ -47,9 +47,13 @@ from bothub import secrets as secrets_module
 from bothub.secrets import encrypt_secret, decrypt_secret
 from bothub.browser_control import (BrowserEventMasker, RFBClientFilter, RFBProtocolError, is_browser_tool,
                                     human_url, mask_browser_args, mask_browser_text, mask_url, transition, url_forbidden)
-from bothub import activity, procedures
+from bothub import activity, procedures, hook_adapters
+from bothub import checker as action_checker
+from bothub import wakeups as wk
+from bothub import delegation as dg
 from bothub import context as ctxlib
 from bothub.procedure_runner import PgStore, ProcedureRunner, RunError
+from bothub.mcp_policy import NOT_ALLOWED as MCP_NOT_ALLOWED, UNSUPPORTED as MCP_ALLOW_UNSUPPORTED, McpAllowUnsupported, McpNotAllowed, mcp_allowed
 from bothub.risk import MAC_READ_TOOLS, MAC_RISKY_TOOLS, decide, forbidden_reason, op_hash, remember_rule
 from bothub.runner.base import TurnContext
 
@@ -58,6 +62,7 @@ NOW = timezone.utc
 LOGIN_IDLE_TIMEOUT = 600
 LOGIN_TOTAL_TIMEOUT = 1800
 PROVIDER_CHECK_TIMEOUT = 30
+CHECKER_DENIED = 'checker_denied'  # причина автоотказа проверяющей модели (раздел 20)
 PROVIDER_CHECK_COOLDOWN = 30
 PROVIDER_PROBE_PARALLEL = 2           # пробных запросов одновременно на пользователя (POST/PATCH с ключом)
 PROVIDER_PROBE_RATE = 10              # пробных запросов в минуту на пользователя
@@ -155,8 +160,10 @@ def canonical_ip(item) -> str:
 
 class ProbedModels(list):
     """Имена моделей из пробного запроса плюс key_verified: True сервер отверг заведомо неверный ключ (или сам проверил
-    настоящий: anthropic, google), False принял его (ключ сервером не проверяется), None второй запрос не дал ответа."""
+    настоящий: anthropic, google), False принял его (ключ сервером не проверяется), None второй запрос не дал ответа.
+    context_windows: id->размер окна для openai_compatible/openai_api (из поля context_length в /v1/models)."""
     key_verified: bool | None = None
+    context_windows: dict[str, int] | None = None
 
 
 async def probe_unkeyed(client, url: str, headers: dict, hostname: str, budget: float) -> bool | None:
@@ -193,6 +200,28 @@ def model_names(kind: str, body: bytes | bytearray) -> list[str]:
         raise ProbeError('incompatible', 'provider returned an unexpected model list') from None
     if not names: raise ProbeError('incompatible', 'provider returned no models')
     return names
+
+
+def model_context_windows(kind: str, body: bytes | bytearray) -> dict[str, int] | None:
+    """Контекстные окна из /v1/models для openai_compatible и openai_api (поле context_length).
+
+    Остальные провайдеры: None. Ответ уже разобран model_names(): отказ там снимает проверку до вызова этой функции."""
+    if kind not in ('openai_compatible', 'openai_api'):
+        return None
+    try:
+        payload = json.loads(body)
+        entries = payload.get('data', [])
+    except (ValueError, AttributeError, TypeError):
+        return None
+    windows: dict[str, int] = {}
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        mid = item.get('id', '')
+        cl = item.get('context_length')
+        if isinstance(mid, str) and mid and isinstance(cl, int) and cl > 0:
+            windows[mid] = cl
+    return windows or None
 
 
 async def fetch_provider_models(kind: str, base_url: str | None, key: str, *, allow_private: bool = False,
@@ -238,6 +267,7 @@ async def fetch_provider_models(kind: str, base_url: str | None, key: str, *, al
                 finally:
                     await response.aclose()
                 names = model_names(kind, body)  # непригодный список: ProbeError до второго запроса
+                context_windows = model_context_windows(kind, body)
                 if kind in ('openai_compatible', 'openai_api'):
                     budget = scope.when() - asyncio.get_running_loop().time() - 1
                     key_verified = await probe_unkeyed(client, pinned + path, headers, hostname, budget)
@@ -249,6 +279,7 @@ async def fetch_provider_models(kind: str, base_url: str | None, key: str, *, al
         raise ProbeError('unreachable', 'provider unreachable') from None
     result = ProbedModels(names)
     result.key_verified = key_verified
+    result.context_windows = context_windows
     return result
 
 log = logging.getLogger('bothub')
@@ -351,6 +382,14 @@ def data(row):
     return jsonable_encoder(dict(row)) if row else None
 
 
+def schedule_data(row):
+    """Расписание для API: шифртекст секрета подписи Slack не отдаётся, только флаг."""
+    if not row: return None
+    plain = dict(row)
+    has_secret = plain.pop('slack_signing_secret', None) is not None
+    return {**jsonable_encoder(plain), 'has_slack_signing_secret': has_secret}
+
+
 _SENSITIVE_FIELD = re.compile(r'secret|passw|token|value|key|credential', re.I)
 
 
@@ -424,10 +463,27 @@ def check_text(value: str, field: str, *, maximum: int, minimum: int = 0) -> str
 
 
 def check_mcp_allow(value: list[str] | None) -> list[str] | None:
+    """Элемент: имя инструмента, glob или имя сервера. Края обрезаются, повторы убираются, порядок сохраняется. Пустой
+    элемент, пробел или непечатный символ внутри имени отклоняются: такое имя не подойдёт ни под один инструмент,
+    а в списке выглядело бы разрешением."""
+    if value is None:
+        return None
     check_list_size(value, 'mcp_allow')
-    for item in value or ():
-        check_text(item, 'mcp_allow item', maximum=LIST_ITEM_MAX, minimum=1)
-    return value
+    items: list[str] = []
+    for raw in value:
+        item = check_text(raw.strip(), 'mcp_allow item', maximum=LIST_ITEM_MAX, minimum=1)
+        if any(char.isspace() or not char.isprintable() for char in item):
+            raise Unprocessable('mcp_allow item must not contain spaces or control characters')
+        # Свой сервер разрешён всегда; запись `bothub*` в список открыла бы серверы `bothub__*` с чужими инструментами.
+        # Маска после точки (`github.*`) не поддерживается: такая строка выглядела бы разрешением и ничего не открывала.
+        lowered = item.lower()
+        if lowered.startswith('bothub') or lowered.startswith('mcp__bothub'):
+            raise Unprocessable('mcp_allow item: bothub is always allowed, do not list it')
+        if '.' in item and any(char in item for char in '*?['):
+            raise Unprocessable('mcp_allow item: use mcp__server__* for masks, not server.*')
+        if item not in items:
+            items.append(item)
+    return items
 
 
 def check_auto_allow(value: list[dict] | None) -> list[dict] | None:
@@ -485,6 +541,196 @@ def check_timezone(value: str) -> str:
     except Exception:  # ZoneInfoNotFoundError, ValueError (путь с «..»), OSError (каталог вместо зоны)
         raise Unprocessable('timezone is not a known time zone') from None
     return value
+
+
+# --- шаблон бота (экспорт и импорт JSON-файла, раздел 9) -------------------------------------------------------
+BOT_TEMPLATE_FORMAT = 'botstead-bot'
+BOT_TEMPLATE_VERSION = 1
+BOT_TEMPLATE_MAX = 256 * 1024  # предел тела POST /api/bots/import
+BOT_TEMPLATE_NAME_MAX = 80
+BOT_TEMPLATE_ROLE_MAX = 512
+BOT_TEMPLATE_AVATAR_MAX = 128
+BOT_TEMPLATE_INSTRUCTIONS_MAX = 64 * 1024
+BOT_TEMPLATE_EXECUTOR_MAX = 128
+BOT_TEMPLATE_EXECUTORS = ('container', 'mac')
+BOT_TEMPLATE_SCHEDULE_NAME_MAX = 512
+BOT_TEMPLATE_SCHEDULE_PROMPT_MAX = 16 * 1024
+BOT_TEMPLATE_SCHEDULES_MAX = 20
+BOT_TEMPLATE_PROCEDURES_MAX = 200
+BOT_TEMPLATE_FIELDS = frozenset({'format', 'version', 'name', 'role', 'instructions', 'avatar', 'executor',
+                                  'auto_allow', 'mcp_allow', 'budget_daily_tokens', 'auto_compact_percent',
+                                  'schedules', 'procedures'})
+
+
+class BotTemplateError(ValueError):
+    """Шаблон бота не принят. Текст: `поле: код: причина`, без значений от клиента."""
+
+    def __init__(self, path: str, code: str, text: str):
+        super().__init__(f'{path}: {code}: {text}')
+        self.path, self.code, self.text = path, code, text
+
+
+def _bt_fail(path: str, code: str, text: str) -> None:
+    raise BotTemplateError(path, code, text)
+
+
+def unique_name(name: str, taken, maximum: int) -> str:
+    """Имя без коллизии: `name`, затем `name (2)`, `name (3)` … Базу укорачивает так, чтобы итог влез в `maximum`."""
+    if name not in taken:
+        return name
+    for number in range(2, 1000):
+        suffix = f' ({number})'
+        candidate = name[:maximum - len(suffix)].rstrip() + suffix
+        if candidate not in taken:
+            return candidate
+    error('conflict', 409, 'name: too many collisions')
+
+
+def parse_bot_template(doc) -> dict:
+    """Файл экспорта/импорта бота: только перечисленные поля (лишние отклоняются 422), процедуры валидирует procedures.parse_import,
+    расписания — check_timezone и croniter. Возвращает чистый dict: name, role, instructions, avatar, executor, auto_allow,
+    mcp_allow, budget_daily_tokens, auto_compact_percent, schedules [{cron,timezone,prompt,enabled,name?}],
+    procedures [как procedures.parse_import их примет]. Значения чувствительных полей в текст ошибки не попадают."""
+    if not isinstance(doc, dict):
+        _bt_fail('body', 'type', 'must be an object')
+    if set(doc) - BOT_TEMPLATE_FIELDS:
+        _bt_fail('body', 'unknown_field', 'unknown field')
+    fmt = doc.get('format', BOT_TEMPLATE_FORMAT)
+    if fmt != BOT_TEMPLATE_FORMAT:
+        _bt_fail('format', 'unsupported', 'unsupported format')
+    version = doc.get('version', BOT_TEMPLATE_VERSION)
+    if version != BOT_TEMPLATE_VERSION:
+        _bt_fail('version', 'unsupported', f'unsupported version: {version}')
+    name = _bt_strict_text('name', doc.get('name', ''), maximum=BOT_TEMPLATE_NAME_MAX, minimum=1)
+    role = doc.get('role', '')
+    if not isinstance(role, str):
+        _bt_fail('role', 'type', 'must be a string')
+    if len(role) > BOT_TEMPLATE_ROLE_MAX:
+        _bt_fail('role', 'too_long', f'exceeds {BOT_TEMPLATE_ROLE_MAX} characters')
+    instructions = doc.get('instructions', '')
+    if not isinstance(instructions, str):
+        _bt_fail('instructions', 'type', 'must be a string')
+    if len(instructions.encode()) > BOT_TEMPLATE_INSTRUCTIONS_MAX:
+        _bt_fail('instructions', 'too_long', f'exceeds {BOT_TEMPLATE_INSTRUCTIONS_MAX} bytes')
+    avatar = doc.get('avatar', 'robot')
+    if not isinstance(avatar, str):
+        _bt_fail('avatar', 'type', 'must be a string')
+    if len(avatar) > BOT_TEMPLATE_AVATAR_MAX:
+        _bt_fail('avatar', 'too_long', f'exceeds {BOT_TEMPLATE_AVATAR_MAX} characters')
+    executor = doc.get('executor', 'container')
+    if not isinstance(executor, str):
+        _bt_fail('executor', 'type', 'must be a string')
+    if len(executor) > BOT_TEMPLATE_EXECUTOR_MAX:
+        _bt_fail('executor', 'too_long', f'exceeds {BOT_TEMPLATE_EXECUTOR_MAX} characters')
+    if executor not in BOT_TEMPLATE_EXECUTORS:  # иначе CHECK по bots.executor отдаёт безымянный 400 из базы
+        _bt_fail('executor', 'unsupported', 'expected container or mac')
+    auto_allow = doc.get('auto_allow', [])
+    mcp_allow = doc.get('mcp_allow', [])
+    if not isinstance(auto_allow, list):
+        _bt_fail('auto_allow', 'type', 'must be an array')
+    if not isinstance(mcp_allow, list):
+        _bt_fail('mcp_allow', 'type', 'must be an array')
+    for index, rule in enumerate(auto_allow):
+        if not isinstance(rule, dict):
+            _bt_fail(f'auto_allow[{index}]', 'type', 'must be an object')
+    for index, item in enumerate(mcp_allow):
+        if not isinstance(item, str):
+            _bt_fail(f'mcp_allow[{index}]', 'type', 'must be a string')
+    try:  # те же проверки, что у BotIn: размер списка и каждого правила
+        check_auto_allow(auto_allow)
+        check_mcp_allow(mcp_allow)
+    except Unprocessable as exc:
+        _bt_fail('auto_allow/mcp_allow', 'unprocessable', str(exc))
+    except ValueError as exc:
+        _bt_fail('auto_allow', 'invalid', str(exc))
+    budget = doc.get('budget_daily_tokens', 200000)
+    budget = _bt_optional_int('budget_daily_tokens', budget, ge=0, le=10**12)
+    auto_compact = doc.get('auto_compact_percent', ctxlib.AUTO_COMPACT_DEFAULT)
+    if auto_compact is None:
+        pass
+    elif type(auto_compact) is int and not isinstance(auto_compact, bool):
+        if auto_compact < ctxlib.AUTO_COMPACT_MIN or auto_compact > ctxlib.AUTO_COMPACT_MAX:
+            _bt_fail('auto_compact_percent', 'out_of_range',
+                     f'expected {ctxlib.AUTO_COMPACT_MIN}..{ctxlib.AUTO_COMPACT_MAX} or null')
+    else:
+        _bt_fail('auto_compact_percent', 'type', 'must be an integer or null')
+    schedules_raw = doc.get('schedules', [])
+    if not isinstance(schedules_raw, list):
+        _bt_fail('schedules', 'type', 'must be an array')
+    if len(schedules_raw) > BOT_TEMPLATE_SCHEDULES_MAX:
+        _bt_fail('schedules', 'too_many', f'at most {BOT_TEMPLATE_SCHEDULES_MAX} items')
+    schedules = [_bt_parse_schedule(item, index) for index, item in enumerate(schedules_raw)]
+    procedures_raw = doc.get('procedures', [])
+    if not isinstance(procedures_raw, list):
+        _bt_fail('procedures', 'type', 'must be an array')
+    if len(procedures_raw) > BOT_TEMPLATE_PROCEDURES_MAX:
+        _bt_fail('procedures', 'too_many', f'at most {BOT_TEMPLATE_PROCEDURES_MAX} items')
+    return {'name': name, 'role': role, 'instructions': instructions, 'avatar': avatar, 'executor': executor,
+            'auto_allow': auto_allow, 'mcp_allow': mcp_allow, 'budget_daily_tokens': budget,
+            'auto_compact_percent': auto_compact, 'schedules': schedules, 'procedures': procedures_raw}
+
+
+def _bt_strict_text(path: str, value, *, maximum: int, minimum: int = 0) -> str:
+    if not isinstance(value, str):
+        _bt_fail(path, 'type', 'must be a string')
+    if minimum > 0 and not value.strip():
+        _bt_fail(path, 'empty', 'is empty')
+    if len(value) > maximum:
+        _bt_fail(path, 'too_long', f'exceeds {maximum} characters')
+    return value
+
+
+def _bt_optional_int(path: str, value, *, ge: int, le: int) -> int:
+    if type(value) is not int or isinstance(value, bool):
+        _bt_fail(path, 'type', 'must be an integer')
+    if value < ge or value > le:
+        _bt_fail(path, 'out_of_range', f'expected {ge}..{le}')
+    return value
+
+
+def _bt_parse_schedule(item, index: int) -> dict:
+    path = f'schedules[{index}]'
+    if not isinstance(item, dict):
+        _bt_fail(path, 'type', 'must be an object')
+    allowed = {'cron', 'timezone', 'prompt', 'enabled', 'name'}
+    extra = set(item) - allowed
+    if extra:
+        _bt_fail(path, 'unknown_field', 'unknown field')
+    cron = _bt_strict_text(f'{path}.cron', item.get('cron', ''), maximum=512, minimum=1)
+    if "timezone" not in item:
+        _bt_fail(f"{path}.timezone", "missing", "is required")
+    tz = item["timezone"]
+    if not isinstance(tz, str):
+        _bt_fail(f'{path}.timezone', 'type', 'must be a string')
+    if not tz:
+        _bt_fail(f'{path}.timezone', 'empty', 'is empty')
+    if len(tz) > TIMEZONE_MAX:
+        _bt_fail(f'{path}.timezone', 'too_long', f'exceeds {TIMEZONE_MAX} characters')
+    try:
+        check_timezone(tz)
+    except Unprocessable as exc:
+        _bt_fail(f'{path}.timezone', 'unknown_timezone', str(exc))
+    prompt = _bt_strict_text(f'{path}.prompt', item.get('prompt', ''), maximum=BOT_TEMPLATE_SCHEDULE_PROMPT_MAX, minimum=1)
+    enabled = item.get('enabled', True)
+    if not isinstance(enabled, bool):
+        _bt_fail(f'{path}.enabled', 'type', 'must be a boolean')
+    name = item.get('name')
+    if name is not None:
+        if not isinstance(name, str):
+            _bt_fail(f'{path}.name', 'type', 'must be a string')
+        if len(name) > BOT_TEMPLATE_SCHEDULE_NAME_MAX:
+            _bt_fail(f'{path}.name', 'too_long', f'exceeds {BOT_TEMPLATE_SCHEDULE_NAME_MAX} characters')
+    try:
+        next_at = _bt_next_run(cron, tz)
+    except Exception:
+        _bt_fail(f'{path}.cron', 'invalid', 'cron is invalid')
+    return {'cron': cron, 'timezone': tz, 'prompt': prompt, 'enabled': enabled, 'name': name, 'next_run_at': next_at}
+
+
+def _bt_next_run(cron: str, tz: str):
+    """Следующий срок cron в UTC; раздел 9 next_run. Выделено, чтобы парсер шаблона не зависел от FastAPI-роута."""
+    local = datetime.now(NOW).astimezone(ZoneInfo(tz))
+    return croniter(cron, local).get_next(datetime).astimezone(NOW)
 
 
 def parse_email(value) -> str:
@@ -590,6 +836,7 @@ class BotIn(Body):
     model: str
     provider_id: uuid.UUID | None = None
     model_id: uuid.UUID | None = None
+    checker_model_id: uuid.UUID | None = None  # раздел 20: проверяющая модель, null выключает
     role: str = Field(default='', max_length=512)
     instructions: str = Field(default='', max_length=64*1024)
     avatar: str = Field(default='robot', max_length=128)
@@ -631,6 +878,7 @@ class BotPatch(Body):
     model: str | None = None
     provider_id: uuid.UUID | None = None
     model_id: uuid.UUID | None = None
+    checker_model_id: uuid.UUID | None = None  # явный null выключает проверку
     role: str | None = Field(default=None, max_length=512)
     instructions: str | None = Field(default=None, max_length=64*1024)
     avatar: str | None = Field(default=None, max_length=128)
@@ -773,6 +1021,22 @@ class ScheduleIn(Body):
     @classmethod
     def timezone_known(cls, value: str) -> str:
         return check_timezone(value)
+
+
+class WakeupIn(Body):
+    """Раздел 17: ровно одно из `at` (ISO 8601) и `in_minutes`; длины prompt и reason проверяет wakeups.clean_*."""
+    at: str | None = None
+    in_minutes: StrictInt | None = None
+    prompt: str
+    reason: str = ''
+    thread_id: uuid.UUID | None = None
+
+
+class DelegateIn(Body):
+    """Раздел 19: `bot` имя или id бота того же владельца, `turn_id` ход отправителя (для глубины), длину task проверяет delegation.clean_task."""
+    bot: str
+    task: str
+    turn_id: uuid.UUID
 
 
 class MacCallIn(Body):
@@ -1177,6 +1441,8 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             seq = await con.fetchval('update bothub.threads set last_seq=last_seq+1 where id=$1 returning last_seq', thread_id)
             row = await con.fetchrow('insert into bothub.events(thread_id,seq,turn_id,kind,actor,client,payload) values($1,$2,$3,$4,$5,$6,$7::jsonb) returning *', thread_id, seq, turn_id, kind, actor, client, canonical(payload))
         event = data(row)
+        if kind == 'status' and turn_id and payload.get('status') in ('done', 'error', 'stopped'):
+            await note_delegation_done(con, turn_id, payload['status'])
         if fanout:
             publish(event)
         return event
@@ -1188,9 +1454,9 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             owner_id=await con.fetchval('select th.owner_id from bothub.approvals a join bothub.threads th on th.id=a.thread_id where a.id=$1',uuid.UUID(payload['approval_id']))
         await con.execute("insert into bothub.outbox(kind,dedup_key,payload,owner_id) values('push',$1,$2::jsonb,$3) on conflict(dedup_key) do nothing", key, canonical(payload),owner_id)
 
-    async def create_turn(con, thread_id, prompt, client, fanout=True):
+    async def create_turn(con, thread_id, prompt, client, fanout=True, actor=None):
         row = await con.fetchrow('insert into bothub.turns(thread_id,prompt,client) values($1,$2,$3) returning *', thread_id, prompt, client)
-        await append_event(con, thread_id, row['id'], 'user_msg', 'owner' if client in ('api','iphone','mac') else 'system', {'text': prompt}, client, fanout)
+        await append_event(con, thread_id, row['id'], 'user_msg', actor or ('owner' if client in ('api','iphone','mac') else 'system'), {'text': prompt}, client, fanout)
         return data(row)
 
     async def require_available_bot(con, bot_id):
@@ -1468,6 +1734,9 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             gateway_base=os.getenv('BOTHUB_INTERNAL_URL','http://core:8080').rstrip('/')+'/gateway/'+provider_id
             token=app.state.gateway.issue_token(bot['id'],provider_id,max_turn_seconds=bot['max_turn_seconds'],turn_id=str(turn_id))
             bot_data['_gateway_kind']=binding['kind']; bot_data['_gateway_url']=gateway_base
+            async with app.state.pool.acquire() as con:  # соединение выше уже вернулось в пул
+                cl_win = await con.fetchval('select context_window from bothub.models where id=$1', bot['model_id'])
+            if cl_win: bot_data['_context_window'] = cl_win
             exec_env['BOTHUB_GATEWAY_BASE_URL']=gateway_base
             if binding['kind']=='anthropic_api':
                 exec_env.update({'ANTHROPIC_BASE_URL':gateway_base,'ANTHROPIC_AUTH_TOKEN':token,'ANTHROPIC_MODEL':bot['model']})
@@ -1582,6 +1851,14 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             await stop_turn(turn_id, 'timeout')
         except asyncio.CancelledError:
             raise
+        except McpAllowUnsupported as exc:
+            # agy не применяет mcp_allow: непустой список значит отказ до запуска процесса, не молчаливый пропуск
+            log.warning('mcp_allow_unsupported', extra={'turn_id': str(turn_id), 'bot_id': bot['id'], 'provider': exc.provider})
+            await fail_turn(turn_id, MCP_ALLOW_UNSUPPORTED, 'guard', {'reason': MCP_ALLOW_UNSUPPORTED, 'detail': exc.provider})
+        except McpNotAllowed as exc:
+            # codex и agy не спрашивают одобрение: чужой MCP-инструмент вне mcp_allow раннер увидел в потоке и убил процесс
+            log.warning('mcp_not_allowed', extra={'turn_id': str(turn_id), 'bot_id': bot['id']})
+            await fail_turn(turn_id, MCP_NOT_ALLOWED, 'guard', {'reason': MCP_NOT_ALLOWED, 'detail': refused_tool_name(exc.tool)})
         except Exception as exc:
             log.exception('turn_error', extra={'turn_id': str(turn_id), 'bot_id': bot['id']})
             # Пункт 9: закрываем turn и в waiting_approval/waiting_mac (раньше только в running).
@@ -1840,8 +2117,104 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
 
     app.state.run_due_schedules = run_due_schedules
 
+    # --- Самопробуждение бота (раздел 17): тот же планировщик и та же проверка исполнителя (trigger_block), что у расписаний.
+    async def wakeup_thread(con, wakeup, owner_id):
+        """Тред, из которого бот просил пробуждение, если он ещё активен и принадлежит этому боту и владельцу."""
+        if not wakeup['thread_id']:
+            return None
+        return await con.fetchval("select id from bothub.threads where id=$1 and status='active' and owner_id=$2 and bot_id=$3",
+                                  wakeup['thread_id'], owner_id, wakeup['bot_id'])
+
+    def wakeup_params(wakeup, **extra):
+        return {'wakeup_id': str(wakeup['id']), 'scheduled_at': wakeup['scheduled_at'].astimezone(NOW).isoformat(), 'note': wakeup['reason'], **extra}
+
+    async def fire_wakeup(con, wakeup, owner_id):
+        await require_available_bot(con, wakeup['bot_id'])
+        thread_id = await wakeup_thread(con, wakeup, owner_id)
+        if not thread_id:
+            title = ('Пробуждение: ' + (wakeup['reason'] or wakeup['prompt']))[:80]
+            thread_id = await con.fetchval("insert into bothub.threads(bot_id,kind,title,owner_id) values($1,'routine',$2,$3) returning id", wakeup['bot_id'], title, owner_id)
+        turn = await create_turn(con, thread_id, wk.fire_text(wakeup['prompt'], wakeup['reason']), 'wakeup', fanout=False, actor=f"bot:{wakeup['bot_id']}")
+        await con.execute("update bothub.wakeups set status='fired',fired_at=now(),thread_id=$2 where id=$1 and status='active'", wakeup['id'], thread_id)
+        await log_activity(con, owner_id, wakeup['bot_id'], 'schedule', 'wakeup_fired', wakeup_params(wakeup), thread_id)
+        return turn
+
+    async def skip_wakeup(con, wakeup, owner_id, reason, published):
+        await con.execute("update bothub.wakeups set status='skipped',skip_reason=$2 where id=$1 and status='active'", wakeup['id'], reason)
+        thread_id = await wakeup_thread(con, wakeup, owner_id)
+        await log_activity(con, owner_id, wakeup['bot_id'], 'schedule', 'wakeup_skipped', wakeup_params(wakeup, reason=reason), thread_id)
+        if thread_id:
+            published.append(await append_event(con, thread_id, None, 'system', 'system',
+                                                {'text': wk.skipped_text(reason), 'code': 'wakeup_skipped', 'reason': reason}, fanout=False))
+
+    DUE_WAKEUPS = ("from bothub.wakeups w join bothub.bots b on b.id=w.bot_id join bothub.users u on u.id=b.owner_id "
+                   "where w.status='active' and w.scheduled_at<=now() and u.status='active'")
+
+    async def run_due_wakeups():
+        async with app.state.pool.acquire() as con:
+            blocked = {}
+            for row in await con.fetch('select distinct w.bot_id ' + DUE_WAKEUPS):
+                try:
+                    blocked[row['bot_id']] = await trigger_block(con, row['bot_id'])
+                except Exception:
+                    log.exception('trigger_block_failed', extra={'bot_id': row['bot_id']})
+                    blocked[row['bot_id']] = 'check_failed'
+            turns, published = [], []
+            async with con.transaction():
+                # Бот с неконечным запуском процедуры пробуждение откладывает, как расписание: оно сработает на первом проходе после освобождения.
+                due = await con.fetch('select w.*, b.owner_id ' + DUE_WAKEUPS + " and not exists (select 1 from bothub.procedure_runs pr where pr.bot_id=w.bot_id and pr.status in ('queued','running','waiting_approval','waiting_model','waiting_human')) order by w.scheduled_at for update of w skip locked")
+                for wakeup in due:
+                    if wakeup['bot_id'] not in blocked:
+                        continue  # бот появился после сверки: следующий проход
+                    events = []
+                    try:
+                        async with con.transaction():  # savepoint: сбой одного пробуждения не откатывает остальные
+                            reason = blocked[wakeup['bot_id']]
+                            action = wk.decide(reason, wakeup['scheduled_at'], datetime.now(NOW))
+                            if action == 'fire':
+                                turns.append(await fire_wakeup(con, wakeup, wakeup['owner_id']))
+                            elif action == 'skip':
+                                await skip_wakeup(con, wakeup, wakeup['owner_id'], reason, events)
+                    except Exception:
+                        log.exception('wakeup_failed', extra={'wakeup_id': str(wakeup['id']), 'bot_id': wakeup['bot_id']})
+                        # Сбой срабатывания повторяется каждый проход только в пределах GRACE, потом пробуждение
+                        # закрывается пропуском: иначе оно оставалось бы активным и падало вечно.
+                        if datetime.now(NOW) - wakeup['scheduled_at'] > wk.GRACE:
+                            events = []
+                            try:
+                                async with con.transaction():
+                                    await skip_wakeup(con, wakeup, wakeup['owner_id'], 'fire_failed', events)
+                            except Exception:
+                                log.exception('wakeup_skip_failed', extra={'wakeup_id': str(wakeup['id'])})
+                                continue
+                            published.extend(events)
+                        continue
+                    published.extend(events)
+            for turn in turns:
+                event = await con.fetchrow("select * from bothub.events where turn_id=$1 and kind='user_msg' order by seq desc limit 1", uuid.UUID(turn['id']))
+                publish(data(event))
+            for event in published:
+                publish(event)
+
+    app.state.run_due_wakeups = run_due_wakeups
+
+    async def scheduler_tick():
+        failure = None
+        try:
+            await app.state.run_due_schedules()
+        except Exception as exc:  # сбой расписаний не отменяет пробуждения этого прохода
+            failure = exc
+        try:
+            await app.state.run_due_wakeups()
+        except Exception:
+            if failure is None:
+                raise
+            log.exception('wakeups_failed')
+        if failure is not None:
+            raise failure
+
     async def scheduler():
-        await supervise('scheduler', lambda: app.state.run_due_schedules(), env_float('BOTHUB_SCHEDULER_INTERVAL', 30), env_float('BOTHUB_LOOP_ERROR_DELAY', 30))
+        await supervise('scheduler', scheduler_tick, env_float('BOTHUB_SCHEDULER_INTERVAL', 30), env_float('BOTHUB_LOOP_ERROR_DELAY', 30))
 
     async def expire_approvals():
         async with app.state.pool.acquire() as con:
@@ -2529,6 +2902,11 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             await con.execute('insert into bothub.models(provider_id,name) values($1,$2) '
                 'on conflict(provider_id,name) do update set enabled=not models.manually_disabled',provider_id,name)
         await con.execute('update bothub.models set enabled=false where provider_id=$1 and not (name=any($2::text[]))',provider_id,list(names))
+        windows = getattr(names, 'context_windows', None) or {}
+        if windows:
+            known = set(names)
+            await con.executemany('update bothub.models set context_window=$3 where provider_id=$1 and name=$2',
+                                  [(provider_id, name, window) for name, window in windows.items() if name in known])
 
     async def check_provider_record(provider_id, owner_id, force=False):
         async with app.state.pool.acquire() as con:
@@ -3384,9 +3762,6 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             except Exception:
                 error('invalid')
         fields = body.model_dump(exclude={'schedule', 'start_container', 'skip_container'})
-        fields['owner_id'] = who['user_id']
-        if body.provider_id:
-            fields['registry_bound'] = True
         async with app.state.pool.acquire() as con:
             if body.id:
                 # Повтор запроса, пока бот запускается (ответ потерялся по дороге): тот же бот, не дубль и не второй запуск.
@@ -3394,33 +3769,9 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                 replay = await con.fetchrow("select * from bothub.bots where id=$1 and owner_id=$2 and status='starting'",body.id,who['user_id'])
                 if replay:
                     return {**data(replay), 'container': 'starting', 'recreate_url': None}
-            if not body.provider_id:
-                has_registry = await con.fetchval('select exists(select 1 from bothub.providers where owner_id=$1)',who['user_id'])
-                # Бот без модели создаётся только в режиме совместимости (установка, обновлённая через OWNER_TOKEN) и пока реестр владельца пуст.
-                if body.provider != 'fake' and (has_registry or not await legacy_enabled(con)):  # fake: тестовый раннер без модели
-                    error('invalid',400,'provider_id required')
-            if body.provider_id:
-                binding=await con.fetchrow('select p.kind,p.cli,p.status,m.name from bothub.providers p join bothub.models m on m.provider_id=p.id and m.id=$3 and m.enabled=true where p.id=$1 and p.owner_id=$2',body.provider_id,who['user_id'],body.model_id)
-                if not binding or binding['status']!='ok': error('invalid',400,'provider/model unavailable')
-                fields['provider']=runner_provider(binding['kind'],binding['cli'])
-                fields['model']=binding['name']
             starts_container = body.start_container and not body.skip_container and os.getenv('BOTHUB_RUNNER_EXEC', 'local') == 'docker'
-            if starts_container and launcher_waiting():
-                error('launcher_unavailable',503)  # после проверки полей и привязки провайдера, до записи бота
-            if starts_container:
-                fields['status'] = 'starting'  # контейнер создаётся фоном после ответа (start_new_bot)
-            for _ in range(5):
-                fields['id'] = body.id if os.getenv('BOTHUB_TEST_LEGACY_IDS')=='1' and body.id else auth.new_bot_id(body.name)
-                try:
-                    keys = list(fields)
-                    vals = [canonical(fields[k]) if k in ('auto_allow','mcp_allow') else fields[k] for k in keys]
-                    sql = 'insert into bothub.bots ('+','.join(keys)+') values ('+','.join(f'${i+1}::jsonb' if k in ('auto_allow','mcp_allow') else f'${i+1}' for i,k in enumerate(keys))+') returning *'
-                    bot = data(await con.fetchrow(sql, *vals))
-                except asyncpg.UniqueViolationError:
-                    if os.getenv('BOTHUB_TEST_LEGACY_IDS')=='1' and body.id: error('conflict',409)
-                    continue
-                break
-            else: error('conflict',409)
+            bot = await insert_bot(con, who, fields, provider_id=body.provider_id, model_id=body.model_id,
+                                   legacy_id=body.id, starts_container=starts_container)
             if schedule:
                 await con.execute(
                     "insert into bothub.schedules(bot_id,name,kind,cron,timezone,prompt,enabled,next_run_at,owner_id) "
@@ -3432,6 +3783,183 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         # error_starting. Первый бот пользователя создаёт сеть и подключает к ней ядро; Docker на этом рвёт соединения.
         spawn_bot_start(bot['id'])
         return JSONResponse(jsonable_encoder({**bot, 'container': 'starting', 'recreate_url': None}), status_code=201)
+
+    @app.post('/api/bots/import', status_code=201)
+    async def import_bot(request: Request):
+        """POST /api/bots/import (owner): принять документ шаблона бота (раздел 9), создать нового бота, его расписания и процедуры (привязаны к новому боту). Документ ≤ 256 КиБ. Имя при коллизии получает « (2)», « (3)»."""
+        who = await principal(request, owner=True)
+        declared = request.headers.get('content-length', '')
+        if declared.isdigit() and int(declared) > BOT_TEMPLATE_MAX:
+            error('invalid', 413, f'body exceeds {BOT_TEMPLATE_MAX // 1024} KiB')
+        raw = await request.body()
+        if len(raw) > BOT_TEMPLATE_MAX:
+            error('invalid', 413, f'body exceeds {BOT_TEMPLATE_MAX // 1024} KiB')
+        try:
+            doc = json.loads(raw)
+        except (ValueError, RecursionError):
+            error('invalid', 400, 'body is not valid JSON')
+        if not isinstance(doc, dict):
+            error('invalid', 422, 'body: type: must be an object')
+        try:
+            check_json_text(doc)  # NUL и непарные суррогаты asyncpg превращает в 500: здесь 422 без значения
+        except Unprocessable as exc:
+            error('invalid', 422, str(exc))
+        ids = {}
+        for key in ('provider_id', 'model_id'):
+            value = doc.pop(key, None)
+            if value is None:
+                continue
+            try:
+                if not isinstance(value, str):
+                    raise ValueError(key)
+                ids[key] = uuid.UUID(value)
+            except ValueError:
+                error('invalid', 400, key)
+        if len(ids) == 1:
+            error('invalid', 400, 'provider_id and model_id must be set together')
+        provider_id, model_id = ids.get('provider_id'), ids.get('model_id')
+        try:
+            parsed = parse_bot_template(doc)
+        except BotTemplateError as exc:
+            error('invalid', 422, str(exc))
+        checked_procedures = []
+        for index, raw_proc in enumerate(parsed['procedures']):
+            if not isinstance(raw_proc, dict):
+                error('invalid', 422, f'procedures[{index}]: body: type: must be an object')
+            if not raw_proc.get('steps'):  # parse_import молча подставил бы []: в файле шаблона шаги обязательны
+                error('invalid', 422, f'procedures[{index}]: steps: is required')
+            try:
+                proc_parsed = procedures.parse_import(raw_proc)
+                params, steps = procedures.normalize_procedure(proc_parsed['params'], proc_parsed['steps'], strict_risk=False)
+            except procedures.ProcedureError as exc:
+                error('invalid', 422, f'procedures[{index}]: {exc}')
+            checked_procedures.append((proc_parsed['name'], proc_parsed['description'], params, steps))
+        fields = {
+            'name': parsed['name'],
+            # Без выбранной модели бот создаётся «без модели» (как бот, у которого удалили провайдера): ход не
+            # запустится, пока владелец не выберет модель. Тестовый провайдер fake здесь недопустим: он обходит
+            # проверку provider_id в insert_bot и в проде отвечал бы заглушкой.
+            'provider': 'claude',
+            'model': '',
+            'role': parsed['role'],
+            'instructions': parsed['instructions'],
+            'avatar': parsed['avatar'],
+            'executor': parsed['executor'],
+            'auto_allow': parsed['auto_allow'],
+            'mcp_allow': parsed['mcp_allow'],
+            'budget_daily_tokens': parsed['budget_daily_tokens'],
+            'auto_compact_percent': parsed['auto_compact_percent'],
+            'mac_full_control': False,
+        }
+        starts_container = os.getenv('BOTHUB_RUNNER_EXEC', 'local') == 'docker' and bool(provider_id)  # без модели компьютер не нужен
+        if not provider_id:
+            fields['status'] = 'no_model'
+        async with app.state.pool.acquire() as con:
+            async with con.transaction():  # бот, расписания и процедуры целиком или никак
+                taken = {row['name'] for row in await con.fetch('select name from bothub.bots where owner_id=$1', who['user_id'])}
+                fields['name'] = unique_name(parsed['name'], taken, BOT_TEMPLATE_NAME_MAX)
+                bot = await insert_bot(con, who, fields, provider_id=provider_id, model_id=model_id, starts_container=starts_container)
+                for schedule in parsed['schedules']:
+                    await insert_schedule(con, who, bot['id'], schedule, default_name=bot['name'])
+                # unique (owner_id, name) у процедур: файл, выгруженный у этого же владельца, не должен падать на своих названиях
+                taken = {row['name'] for row in await con.fetch('select name from bothub.procedures where owner_id=$1', who['user_id'])}
+                for name, description, params, steps in checked_procedures:
+                    name = unique_name(name, taken, procedures.NAME_MAX)
+                    taken.add(name)
+                    await insert_procedure(con, who, bot['id'], name, description, params, steps, 'import')
+        if not starts_container:
+            return JSONResponse(jsonable_encoder({**bot, 'container': 'skipped', 'recreate_url': None}), status_code=201)
+        spawn_bot_start(bot['id'])  # после коммита, как в POST /api/bots
+        return JSONResponse(jsonable_encoder({**bot, 'container': 'starting', 'recreate_url': None}), status_code=201)
+
+    @app.get('/api/bots/{id}/export')
+    async def export_bot(id: str, request: Request):
+        """GET /api/bots/{id}/export (owner): JSON-документ шаблона без id, owner, provider/model, секретов и памяти."""
+        who = await principal(request, owner=True)
+        async with app.state.pool.acquire() as con:
+            bot = await con.fetchrow('select * from bothub.bots where id=$1 and owner_id=$2', id, who['user_id'])
+            if not bot:
+                error('not_found', 404)
+            schedules = await con.fetch(
+                "select cron, timezone, prompt, enabled, name from bothub.schedules "
+                "where bot_id=$1 and kind='cron' order by created_at", id)
+            procedures_rows = await con.fetch(
+                'select * from bothub.procedures where bot_id=$1 order by created_at', id)
+        doc = {
+            'format': BOT_TEMPLATE_FORMAT,
+            'version': BOT_TEMPLATE_VERSION,
+            'name': bot['name'],
+            'role': bot['role'] or '',
+            'instructions': bot['instructions'] or '',
+            'avatar': bot['avatar'] or 'robot',
+            'executor': bot['executor'] or 'container',
+            'auto_allow': jsonable_encoder(bot['auto_allow'] or []),
+            'mcp_allow': list(bot['mcp_allow'] or []),
+            'budget_daily_tokens': bot['budget_daily_tokens'],
+            'auto_compact_percent': bot['auto_compact_percent'],
+            'schedules': [{
+                'cron': s['cron'],
+                'timezone': s['timezone'],
+                'prompt': s['prompt'],
+                'enabled': bool(s['enabled']),
+                **({'name': s['name']} if s['name'] else {}),
+            } for s in schedules],
+            'procedures': [procedures.export_document(row) for row in procedures_rows],
+        }
+        return doc
+
+    async def require_checker_model(con, owner_id, model_id):
+        """Проверяющая модель: включённая модель API-провайдера (не подписка, ключа у неё нет) того же владельца."""
+        if not await con.fetchval("select exists(select 1 from bothub.models m join bothub.providers p on p.id=m.provider_id "
+                                  "where m.id=$1 and p.owner_id=$2 and m.enabled and p.kind<>'cli_subscription')", model_id, owner_id):
+            error('invalid', 400, 'checker model unavailable')
+
+    async def insert_bot(con, who, fields: dict, *, provider_id=None, model_id=None, legacy_id=None, starts_container: bool) -> dict:
+        """Запись бота для POST /api/bots и POST /api/bots/import: проверка связки провайдер/модель, launcher_unavailable,
+        status starting, подбор свободного id. Расписание и запуск контейнера остаются за вызывающим."""
+        fields['owner_id'] = who['user_id']
+        fields['provider_id'], fields['model_id'] = provider_id, model_id
+        if fields.get('checker_model_id'):
+            await require_checker_model(con, who['user_id'], fields['checker_model_id'])
+        if provider_id:
+            fields['registry_bound'] = True
+        if not provider_id and fields.get('status') == 'no_model':
+            fields['registry_bound'] = True  # бот из шаблона без модели: execute_turn отказывает no_model
+        elif not provider_id:
+            has_registry = await con.fetchval('select exists(select 1 from bothub.providers where owner_id=$1)', who['user_id'])
+            if fields.get('provider') != 'fake' and (has_registry or not await legacy_enabled(con)):
+                error('invalid', 400, 'provider_id required')
+        if provider_id:
+            binding = await con.fetchrow('select p.kind,p.cli,p.status,m.name from bothub.providers p join bothub.models m on m.provider_id=p.id and m.id=$3 and m.enabled=true where p.id=$1 and p.owner_id=$2', provider_id, who['user_id'], model_id)
+            if not binding or binding['status'] != 'ok':
+                error('invalid', 400, 'provider/model unavailable')
+            fields['provider'] = runner_provider(binding['kind'], binding['cli'])
+            fields['model'] = binding['name']
+        if starts_container and launcher_waiting():
+            error('launcher_unavailable', 503)
+        if starts_container:
+            fields['status'] = 'starting'
+        for _ in range(5):
+            fields['id'] = legacy_id if legacy_id and os.getenv('BOTHUB_TEST_LEGACY_IDS') == '1' else auth.new_bot_id(fields['name'])
+            try:
+                keys = list(fields)
+                vals = [canonical(fields[k]) if k in ('auto_allow', 'mcp_allow') else fields[k] for k in keys]
+                sql = 'insert into bothub.bots (' + ','.join(keys) + ') values (' + ','.join(f'${i+1}::jsonb' if k in ('auto_allow', 'mcp_allow') else f'${i+1}' for i, k in enumerate(keys)) + ') returning *'
+                async with con.transaction():  # savepoint: в транзакции импорта коллизия id не должна обрывать её целиком
+                    return data(await con.fetchrow(sql, *vals))
+            except asyncpg.UniqueViolationError:
+                if legacy_id and os.getenv('BOTHUB_TEST_LEGACY_IDS') == '1':
+                    error('conflict', 409)
+                continue
+        error('conflict', 409)
+
+    async def insert_schedule(con, who, bot_id: str, schedule: dict, *, default_name: str) -> None:
+        """Строка cron-расписания из разобранного шаблона (parse_bot_template уже посчитал next_run_at)."""
+        await con.execute(
+            "insert into bothub.schedules(bot_id,name,kind,cron,timezone,prompt,enabled,next_run_at,owner_id) "
+            "values($1,$2,'cron',$3,$4,$5,$6,$7,$8)",
+            bot_id, schedule.get('name') or default_name, schedule['cron'], schedule['timezone'],
+            schedule['prompt'], schedule['enabled'], schedule['next_run_at'], who['user_id'])
 
     @app.patch('/api/bots/{id}')
     async def edit_bot(id: str, request: Request, body: JsonObject):
@@ -3451,6 +3979,8 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         async with app.state.pool.acquire() as con:
             old=await con.fetchrow('select * from bothub.bots where id=$1 and owner_id=$2',id,who['user_id'])
             if not old: error('not_found',404)
+            if fields.get('checker_model_id'):
+                await require_checker_model(con,who['user_id'],fields['checker_model_id'])
             if old['provider_id'] and ('provider' in fields or 'model' in fields) and 'provider_id' not in fields and 'model_id' not in fields:
                 error('invalid',400,'change provider_id and model_id together')
             if 'provider_id' in fields or 'model_id' in fields:
@@ -3890,6 +4420,42 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         async with app.state.pool.acquire() as con:
             return [data(r) for r in await con.fetch('select a.* from bothub.approvals a join bothub.threads th on th.id=a.thread_id where a.status=$1 and th.owner_id=$2 order by a.created_at desc',status,who['user_id'])]
 
+    async def prepare_action_checker(con, bot, body, stored_args) -> dict | None:
+        """Раздел 19, шаг 1 (с соединением): всё, что нужно запросу к проверяющей модели (провайдер, расшифрованный ключ,
+        последний запрос владельца в ходе). None: модели или ключа нет, будет `ask`. Не бросает."""
+        try:
+            row = await con.fetchrow(
+                "select p.kind,p.base_url,p.secret_encrypted,p.id as provider_id,p.allow_private,p.allow_private_ips,m.name "
+                "from bothub.models m join bothub.providers p on p.id=m.provider_id "
+                "where m.id=$1 and p.owner_id=$2 and m.enabled and p.kind<>'cli_subscription' and p.secret_encrypted is not null",
+                bot['checker_model_id'], bot['owner_id'])
+            if not row:
+                return None
+            request_text = await con.fetchval(
+                "select payload->>'text' from bothub.events where thread_id=$1 and kind='user_msg' and ($2::uuid is null or turn_id=$2) "
+                "order by seq desc limit 1", body.thread_id, body.turn_id)
+            if request_text is None and body.turn_id:
+                request_text = await con.fetchval("select payload->>'text' from bothub.events where thread_id=$1 and kind='user_msg' "
+                                                  "order by seq desc limit 1", body.thread_id)
+            key = decrypt_secret(bytes(row['secret_encrypted']), row['provider_id'].bytes).decode()
+            return dict(kind=row['kind'], base_url=row['base_url'], key=key, model=row['name'], role=bot['role'],
+                        request_text=request_text, tool=body.tool, args=stored_args, allow_private=row['allow_private'],
+                        approved_ips=row.get('allow_private_ips') or (), allowed_private_hosts=private_allow_hosts(),
+                        forbidden=forbidden_networks, transport=PROBE_TRANSPORT)
+        except Exception:
+            log.warning('action_checker_failed', extra={'bot_id': bot['id']})
+            return None
+
+    async def run_action_checker(prepared: dict | None, bot_id: str) -> dict:
+        """Раздел 19, шаг 2 (без соединения пула, до 20 с): один запрос модели. Любой сбой даёт `ask`."""
+        if prepared is None:
+            return action_checker.ask_fallback(action_checker.REASON_UNAVAILABLE)
+        try:
+            return await action_checker.ask_checker(**prepared)
+        except Exception:
+            log.warning('action_checker_failed', extra={'bot_id': bot_id})
+            return action_checker.ask_fallback(action_checker.REASON_UNAVAILABLE)
+
     @app.post('/api/approvals')
     async def add_approval(body: ApprovalIn, request: Request):
         who = await principal(request, bot=True)
@@ -3909,7 +4475,8 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             # Находки 2/4/5: risk из тела бота игнорируется - сервер считает его
             # сам через decide_permission (bothub.risk.classify + mac_full_control).
             risk, allowed = decide_permission(dict(bot), body.tool, body.args)
-            forbidden = forbidden_reason(body.tool, body.args)
+            # Чужой MCP-инструмент вне bots.mcp_allow отклоняется сразу, как запрещённый адрес: владельцу вопрос не уходит.
+            forbidden = forbidden_reason(body.tool, body.args) or (None if mcp_allowed(dict(bot).get('mcp_allow'), body.tool) else MCP_NOT_ALLOWED)
             status = 'rejected' if forbidden else 'approved' if allowed else 'pending'
             # typed text and URL secrets are neither stored nor hashed (a hash of a short password is guessable)
             stored_args = mask_browser_args(body.args) if is_browser_tool(body.tool) else body.args
@@ -3917,17 +4484,46 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             ttl_minutes = int(os.getenv('APPROVAL_TTL_MINUTES', '60'))  # находка 18
             expires_at = datetime.now(NOW) + timedelta(minutes=ttl_minutes)
             await ping_turn(con,body.turn_id)
-            row = await con.fetchrow("insert into bothub.approvals(thread_id,turn_id,bot_id,risk,title,tool,args,args_hash,op_hash,status,expires_at) values($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11) returning *",body.thread_id,body.turn_id,bot['id'],risk,body.title,body.tool,canonical(stored_args),digest,op_hash(body.tool,stored_args),status,expires_at)
-            if forbidden:
-                await append_event(con,body.thread_id,body.turn_id,'approval_dec','system',{'approval_id':str(row['id']),'decision':'rejected','remember':False,'client':'system','reason':forbidden})
-            if status == 'pending':
-                if body.turn_id:
-                    await con.execute("update bothub.turns set status='waiting_approval' where id=$1 and status='running'",body.turn_id)
-                    await con.execute("update bothub.bots set status='waiting' where id=$1 and status<>'no_model'",bot['id'])
-                    await append_event(con,body.thread_id,body.turn_id,'status','system',{'turn_id':str(body.turn_id),'status':'waiting_approval'})
-                await append_event(con,body.thread_id,body.turn_id,'approval_req',f"bot:{who['bot_id']}",{'approval_id':str(row['id']),'risk':risk,'title':body.title,'tool':body.tool,'expires_at':row['expires_at'].isoformat()})
-                await outbox(con,f'approval:{row["id"]}',{'approval_id':str(row['id'])})
-            return data(row)
+            # Раздел 19: проверяющая модель бота оценивает рискованное действие до владельца. deny закрывает approval сам,
+            # allow и ask оставляют его владельцу (подсказка в карточке), allow сам ничего не разрешает.
+            # Запрос модели (до 20 с) идёт без соединения пула: данные читаются здесь, ответ ждёт вне acquire.
+            checking = status == 'pending' and bool(dict(bot).get('checker_model_id')) and action_checker.should_check(risk)
+            prepared = await prepare_action_checker(con, bot, body, stored_args) if checking else None
+        checker = None
+        if checking:
+            checker = await run_action_checker(prepared, bot['id'])
+        async with app.state.pool.acquire() as con:
+            async with con.transaction():
+                if checking:
+                    # За время запроса бот мог измениться (правило, пауза, другая модель проверки): решение считается заново,
+                    # устаревший вердикт отбрасывается. Ход мог кончиться: тогда approval создаётся, как и при неактивном ходе.
+                    fresh = await con.fetchrow('select * from bothub.bots where id=$1 and owner_id=$2',bot['id'],who['user_id'])
+                    if not fresh: error('not_found',404)
+                    if fresh['checker_model_id'] != bot['checker_model_id']: checker = None
+                    bot = fresh
+                    risk, allowed = decide_permission(dict(bot), body.tool, body.args)
+                    forbidden = forbidden_reason(body.tool, body.args) or (None if mcp_allowed(dict(bot).get('mcp_allow'), body.tool) else MCP_NOT_ALLOWED)
+                    status = 'rejected' if forbidden else 'approved' if allowed else 'pending'
+                    if status != 'pending': checker = None
+                    await ping_turn(con,body.turn_id)
+                denied = bool(checker and checker['verdict'] == 'deny')
+                if denied: status = 'rejected'
+                row = await con.fetchrow("insert into bothub.approvals(thread_id,turn_id,bot_id,risk,title,tool,args,args_hash,op_hash,status,expires_at,checker_verdict,checker_reason,decided_at,decided_from) values($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13,$14,$15) returning *",body.thread_id,body.turn_id,bot['id'],risk,body.title,body.tool,canonical(stored_args),digest,op_hash(body.tool,stored_args),status,expires_at,checker and checker['verdict'],checker and checker['reason'],datetime.now(NOW) if denied else None,'checker' if denied else None)
+                if denied:
+                    shown = {'verdict':checker['verdict'],'reason':checker['reason']}
+                    await append_event(con,body.thread_id,body.turn_id,'approval_req',f"bot:{who['bot_id']}",{'approval_id':str(row['id']),'risk':risk,'title':body.title,'tool':body.tool,'expires_at':row['expires_at'].isoformat(),'checker':shown})
+                    await append_event(con,body.thread_id,body.turn_id,'approval_dec','system',{'approval_id':str(row['id']),'decision':'rejected','remember':False,'client':'system','reason':CHECKER_DENIED,'checker':shown})
+                    await append_event(con,body.thread_id,body.turn_id,'checker_denied','system',{'approval_id':str(row['id']),'tool':body.tool,'reason':checker['reason']})
+                if forbidden:
+                    await append_event(con,body.thread_id,body.turn_id,'approval_dec','system',{'approval_id':str(row['id']),'decision':'rejected','remember':False,'client':'system','reason':forbidden})
+                if status == 'pending':
+                    if body.turn_id:
+                        await con.execute("update bothub.turns set status='waiting_approval' where id=$1 and status='running'",body.turn_id)
+                        await con.execute("update bothub.bots set status='waiting' where id=$1 and status<>'no_model'",bot['id'])
+                        await append_event(con,body.thread_id,body.turn_id,'status','system',{'turn_id':str(body.turn_id),'status':'waiting_approval'})
+                    await append_event(con,body.thread_id,body.turn_id,'approval_req',f"bot:{who['bot_id']}",{'approval_id':str(row['id']),'risk':risk,'title':body.title,'tool':body.tool,'expires_at':row['expires_at'].isoformat(),**({'checker':{'verdict':checker['verdict'],'reason':checker['reason']}} if checker else {})})
+                    await outbox(con,f'approval:{row["id"]}',{'approval_id':str(row['id'])})
+                return data(row) | ({'reason':forbidden} if forbidden else {'reason':CHECKER_DENIED} if denied else {})
 
     @app.post('/api/approvals/{id}/decide')
     async def decide(id: uuid.UUID, body: DecisionIn, request: Request):
@@ -4115,7 +4711,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
     async def schedules(request: Request):
         who = await principal(request,owner=True)
         async with app.state.pool.acquire() as con:
-            return [data(r) for r in await con.fetch('select * from bothub.schedules where owner_id=$1 order by created_at',who['user_id'])]
+            return [schedule_data(r) for r in await con.fetch('select * from bothub.schedules where owner_id=$1 order by created_at',who['user_id'])]
 
     @app.post('/api/schedules')
     async def add_schedule(body: ScheduleIn, request: Request):
@@ -4126,12 +4722,13 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         async with app.state.pool.acquire() as con:
             row=await con.fetchrow('insert into bothub.schedules(bot_id,name,kind,cron,timezone,prompt,hook_token,enabled,next_run_at,owner_id,catch_up) select id,$2,$3,$4,$5,$6,$7,$8,$9,owner_id,$11 from bothub.bots where id=$1 and owner_id=$10 returning *',body.bot_id,body.name,body.kind,body.cron,body.timezone,body.prompt,secrets.token_urlsafe(32) if body.kind=='hook' else None,body.enabled,next_at,who['user_id'],body.catch_up)
             if not row: error('not_found',404)
-            return data(row)
+            return schedule_data(row)
 
     @app.patch('/api/schedules/{id}')
     async def edit_schedule(id: uuid.UUID, request: Request, body: JsonObject):
         who = await principal(request,owner=True)
-        if not body or set(body)-{'enabled','cron','prompt','catch_up'}: error('invalid')
+        if not body or set(body)-{'enabled','cron','prompt','catch_up','slack_signing_secret'}: error('invalid')
+        if 'slack_signing_secret' in body and body['slack_signing_secret'] is not None and (not isinstance(body['slack_signing_secret'],str) or not body['slack_signing_secret'].strip() or len(body['slack_signing_secret'])>256): error('invalid',400,'slack_signing_secret')
         if 'catch_up' in body and not isinstance(body['catch_up'],bool): error('invalid',400,'catch_up')
         if 'prompt' in body and (not isinstance(body['prompt'],str) or len(body['prompt'])>512): error('invalid',400,'prompt')
         async with app.state.pool.acquire() as con:
@@ -4140,7 +4737,12 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             cron = body.get('cron',prior['cron'])
             try: next_at = next_run(cron,prior['timezone']) if prior['kind']=='cron' else None
             except (ValueError,KeyError): error('invalid')
-            return data(await con.fetchrow('update bothub.schedules set enabled=coalesce($2,enabled),cron=coalesce($3,cron),prompt=coalesce($4,prompt),next_run_at=$5,catch_up=coalesce($7,catch_up) where id=$1 and owner_id=$6 returning *',id,body.get('enabled'),body.get('cron'),body.get('prompt'),next_at,who['user_id'],body.get('catch_up')))
+            if 'slack_signing_secret' in body and prior['kind']!='hook': error('invalid',400,'slack_signing_secret')
+            # null очищает секрет, строка заменяет; без поля секрет не трогаем
+            secret_set = 'slack_signing_secret' in body
+            try: secret_value = encrypt_secret(body['slack_signing_secret'].strip().encode(),id.bytes) if secret_set and body['slack_signing_secret'] is not None else None
+            except ValueError: error('secret_keys_missing',503,'BOTHUB_SECRET_KEYS is not configured')
+            return schedule_data(await con.fetchrow('update bothub.schedules set enabled=coalesce($2,enabled),cron=coalesce($3,cron),prompt=coalesce($4,prompt),next_run_at=$5,catch_up=coalesce($7,catch_up),slack_signing_secret=case when $8 then $9 else slack_signing_secret end where id=$1 and owner_id=$6 returning *',id,body.get('enabled'),body.get('cron'),body.get('prompt'),next_at,who['user_id'],body.get('catch_up'),secret_set,secret_value))
 
     @app.post('/api/schedules/{id}/run')
     async def run_now(id: uuid.UUID, request: Request):
@@ -4150,6 +4752,141 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             if not schedule: error('not_found',404)
             if await con.fetchval('select paused from bothub.bots where id=$1',schedule['bot_id']): error('bot_paused',409)
             return await run_schedule(con,schedule)
+
+    # --- Самопробуждение (раздел 17): бот создаёт, владелец смотрит и отменяет.
+    def wakeup_refused(exc):
+        error('conflict' if exc.status == 409 else 'invalid', exc.status, exc.code)
+
+    @app.post('/api/bots/wakeups', status_code=201)
+    async def add_wakeup(body: WakeupIn, request: Request):
+        who = await principal(request, bot=True)
+        if who['kind'] != 'bot': error('forbidden', 403)
+        try:
+            when = wk.resolve_time(body.at, body.in_minutes, datetime.now(NOW))
+            prompt = wk.clean_prompt(body.prompt)
+            note = wk.clean_reason(body.reason)
+        except wk.WakeupError as exc:
+            wakeup_refused(exc)
+        async with app.state.pool.acquire() as con:
+            async with con.transaction():
+                # строка бота под блокировкой: два параллельных вызова не обходят предел и не плодят дубли
+                if not await con.fetchval('select 1 from bothub.bots where id=$1 and owner_id=$2 for update', who['bot_id'], who['user_id']):
+                    error('not_found', 404)
+                thread_id = (await own_thread(con, body.thread_id, who))['id'] if body.thread_id else None
+                active = await con.fetch("select * from bothub.wakeups where bot_id=$1 and status='active'", who['bot_id'])
+                duplicate = wk.find_duplicate(active, when, prompt)
+                if duplicate:
+                    return JSONResponse(data(duplicate) | {'deduplicated': True}, status_code=200)
+                try:
+                    wk.check_active_limit(len(active))
+                except wk.WakeupError as exc:
+                    wakeup_refused(exc)
+                row = await con.fetchrow('insert into bothub.wakeups(bot_id,thread_id,scheduled_at,prompt,reason) values($1,$2,$3,$4,$5) returning *',
+                                         who['bot_id'], thread_id, when, prompt, note)
+                await log_activity(con, who['user_id'], who['bot_id'], 'schedule', 'wakeup_scheduled', wakeup_params(row), thread_id)
+            if thread_id:
+                await append_event(con, thread_id, None, 'system', 'system', {'text': wk.scheduled_text(when), 'code': 'wakeup_scheduled', 'wakeup_id': str(row['id'])})
+            return data(row) | {'deduplicated': False}
+
+    @app.get('/api/bots/{id}/wakeups')
+    async def list_wakeups(id: str, request: Request, status: str | None = None):
+        who = await principal(request, owner=True)
+        if status is not None and status not in wk.STATUSES: error('invalid', 422, 'status')
+        async with app.state.pool.acquire() as con:
+            if not await con.fetchval('select 1 from bothub.bots where id=$1 and owner_id=$2', id, who['user_id']): error('not_found', 404)
+            # активные по близости срока, затем история от новых к старым
+            return [data(r) for r in await con.fetch("select * from bothub.wakeups where bot_id=$1 and ($2::text is null or status=$2) "
+                                                     "order by (status<>'active'), case when status='active' then scheduled_at end asc, scheduled_at desc limit 100", id, status)]
+
+    @app.delete('/api/wakeups/{id}')
+    async def cancel_wakeup(id: uuid.UUID, request: Request):
+        who = await principal(request, owner=True)
+        async with app.state.pool.acquire() as con:
+            if not await con.fetchval('select 1 from bothub.wakeups w join bothub.bots b on b.id=w.bot_id where w.id=$1 and b.owner_id=$2', id, who['user_id']):
+                error('not_found', 404)
+            if not await con.fetchval("delete from bothub.wakeups where id=$1 and status='active' returning id", id):
+                error('conflict', 409, 'wakeup_not_active')  # уже сработало или пропущено: в историю не вмешиваемся
+            return {'ok': True, 'id': str(id)}
+
+    # --- Поручения бота боту (раздел 19): бот-отправитель ставит задачу боту того же владельца и читает результат.
+    def delegation_refused(exc):
+        error('conflict' if exc.status == 409 else 'invalid', exc.status, exc.code)
+
+    async def note_delegation_done(con, turn_id, outcome):
+        """Ход, созданный поручением, закончился: событие в ленту отправителя. Для обычных ходов один запрос без записи."""
+        row = await con.fetchrow('select t.delegated_by_bot, t.thread_id, th.bot_id as to_bot, th.owner_id, b.name as to_name, f.name as from_name '
+                                 'from bothub.turns t join bothub.threads th on th.id=t.thread_id join bothub.bots b on b.id=th.bot_id '
+                                 'left join bothub.bots f on f.id=t.delegated_by_bot where t.id=$1 and t.delegated_by_bot is not null', turn_id)
+        if row and row.get('delegated_by_bot'):
+            await log_activity(con, row['owner_id'], row['delegated_by_bot'], 'schedule', 'delegation_done',
+                               {'from_bot': row['from_name'] or row['delegated_by_bot'], 'to_bot': row['to_name'], 'to_bot_id': row['to_bot'],
+                                'turn_id': str(turn_id), 'outcome': outcome}, row['thread_id'])
+
+    @app.post('/api/bots/delegations', status_code=201)
+    async def add_delegation(body: DelegateIn, request: Request):
+        who = await principal(request, bot=True)
+        if who['kind'] != 'bot': error('forbidden', 403)
+        try:
+            task = dg.clean_task(body.task)
+            target_ref = dg.clean_target(body.bot)
+        except dg.DelegationError as exc:
+            delegation_refused(exc)
+        published = []
+        async with app.state.pool.acquire() as con:
+            async with con.transaction():
+                # строка отправителя под блокировкой: параллельные вызовы не обходят предел активных поручений
+                caller = await con.fetchrow('select id,name from bothub.bots where id=$1 and owner_id=$2 for update', who['bot_id'], who['user_id'])
+                if not caller: error('not_found', 404)
+                source = await con.fetchrow('select t.id,t.client,t.delegated_from_turn,t.delegated_by_bot from bothub.turns t join bothub.threads th on th.id=t.thread_id '
+                                            'where t.id=$1 and th.bot_id=$2 and th.owner_id=$3', body.turn_id, who['bot_id'], who['user_id'])
+                if not source: error('not_found', 404, 'turn_not_found')
+                try:
+                    dg.check_depth(source['delegated_by_bot'] is not None or source['delegated_from_turn'] is not None or source['client'] == dg.CLIENT)
+                    candidates = await con.fetch('select * from bothub.bots where owner_id=$1 and (id=$2 or lower(name)=lower($2))', who['user_id'], target_ref)
+                    exact = [row for row in candidates if row['id'] == target_ref]
+                    candidates = exact or candidates
+                    if not candidates: error('not_found', 404, 'bot_not_found')
+                    if len(candidates) > 1: error('conflict', 409, 'bot_ambiguous')
+                    target = candidates[0]
+                    dg.check_not_self(caller['id'], target['id'])
+                    blocked = dg.target_block(target)
+                    if blocked: raise dg.DelegationError(blocked, 409)
+                    dg.check_active_limit(await con.fetchval(
+                        'select count(*) from bothub.turns where delegated_by_bot=$1 and status = any($2::text[])', caller['id'], list(dg.ACTIVE_STATUSES)))
+                except dg.DelegationError as exc:
+                    delegation_refused(exc)
+                thread_id = await con.fetchval(
+                    "select th.id from bothub.threads th where th.bot_id=$1 and th.owner_id=$2 and th.status='active' and th.kind='direct' and not th.dry_run "
+                    "order by coalesce((select max(e.ts) from bothub.events e where e.thread_id=th.id), th.created_at) desc, th.id limit 1",
+                    target['id'], who['user_id'])
+                if not thread_id:
+                    thread_id = await con.fetchval("insert into bothub.threads(bot_id,kind,title,owner_id) values($1,'direct',$2,$3) returning id",
+                                                   target['id'], dg.thread_title(caller['name']), who['user_id'])
+                prompt = dg.message_text(caller['name'], task)
+                turn = await con.fetchrow('insert into bothub.turns(thread_id,prompt,client,delegated_from_turn,delegated_by_bot) values($1,$2,$3,$4,$5) returning id',
+                                          thread_id, prompt, dg.CLIENT, source['id'], caller['id'])
+                published.append(await append_event(con, thread_id, turn['id'], 'user_msg', f"bot:{caller['id']}",
+                                                    {'text': prompt, 'delegated_from': {'bot_id': caller['id'], 'name': caller['name']}}, dg.CLIENT, fanout=False))
+                await log_activity(con, who['user_id'], caller['id'], 'schedule', 'delegation_sent',
+                                   {'from_bot': caller['name'], 'to_bot': target['name'], 'to_bot_id': target['id'], 'turn_id': str(turn['id']), 'task': task[:200]}, thread_id)
+        for event in published:
+            publish(event)
+        return {'turn_id': str(turn['id']), 'thread_id': str(thread_id)}
+
+    @app.get('/api/bots/delegations/{turn_id}')
+    async def delegation_result(turn_id: uuid.UUID, request: Request):
+        who = await principal(request, bot=True)
+        if who['kind'] != 'bot': error('forbidden', 403)
+        async with app.state.pool.acquire() as con:
+            row = await con.fetchrow('select t.id,t.status,t.error,t.thread_id,th.bot_id as to_bot,b.provider from bothub.turns t join bothub.threads th on th.id=t.thread_id '
+                                     'join bothub.bots b on b.id=th.bot_id where t.id=$1 and t.delegated_by_bot=$2 and th.owner_id=$3', turn_id, who['bot_id'], who['user_id'])
+            if not row: error('not_found', 404)
+            result = None
+            if row['status'] == 'done':
+                events = await con.fetch("select kind, payload->>'text' as text from bothub.events where turn_id=$1 and kind in ('assistant_msg','tool_call','tool_result') order by seq", turn_id)
+                result = dg.final_text([(e['kind'], e['text']) for e in events], row['provider'])
+            return {'turn_id': str(row['id']), 'thread_id': str(row['thread_id']), 'to_bot': row['to_bot'], 'status': row['status'],
+                    'result': result, 'error': row['error'] if row['status'] == 'error' else None}
 
     # --- Процедуры (раздел 14): CRUD, из действий бота, импорт и экспорт, чтение запусков. Воспроизведение: следующая часть.
     PROCEDURE_STATUSES = ('draft', 'active', 'archived')
@@ -4414,53 +5151,121 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                                    who['user_id'])
         return [{'name': row['name'], 'bot_id': row['bot_id']} for row in rows]
 
-    @app.post('/hooks/{id}',status_code=202)
+    async def read_hook_body(request: Request) -> bytes:
+        # Лимит применяется до чтения всего тела: по Content-Length и по ходу потока (chunked без длины)
+        declared = request.headers.get('content-length')
+        if declared is not None and declared.isascii() and declared.isdigit() and int(declared) > hook_adapters.HOOK_MAX_BODY: error('invalid', 413)
+        chunks, size = [], 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > hook_adapters.HOOK_MAX_BODY: error('invalid', 413)
+            chunks.append(chunk)
+        return b''.join(chunks)
+
+    async def get_hook_schedule(con, schedule_id: uuid.UUID):
+        schedule = await con.fetchrow("select s.* from bothub.schedules s join bothub.users u on u.id=s.owner_id where s.id=$1 and s.kind='hook' and s.enabled and u.status='active'", schedule_id)
+        if not schedule: error('not_found', 404)
+        return schedule
+
+    async def dispatch_hook_turn(con, schedule, prompt: str) -> dict:
+        # Раздел 16: ответ всегда 202 {"status":"accepted"}, без id turn: по форме и телу ответа отправитель не узнаёт, создан ли turn
+        # или запуск пропущен (пауза, исполнитель, провайдер). Проверка и постановка в очередь (или запись пропуска) идут до ответа
+        # в обоих случаях, поэтому и по времени ответа разница небольшая. Сбой самой проверки считается пропуском check_failed.
+        try:
+            reason = await trigger_block(con, schedule['bot_id'])
+        except Exception:
+            log.exception('trigger_block_failed', extra={'bot_id': schedule['bot_id'], 'schedule_id': str(schedule['id'])})
+            reason = 'check_failed'
+        if not reason:
+            try:
+                await require_available_bot(con, schedule['bot_id'])
+            except HTTPException as exc:  # бот сломался между проверкой и постановкой: тоже пропуск, не 409 отправителю
+                if exc.status_code != 409: raise
+                reason = 'provider_unavailable' if (exc.detail or {}).get('error') == 'no_model' else 'executor_unavailable'
+        if reason:
+            async with con.transaction():
+                locked = await con.fetchrow('select * from bothub.schedules where id=$1 for update', schedule['id'])
+                events = []
+                await record_skip(con, locked, reason, events)
+            for event in events: publish(event)
+            return {'status': 'accepted'}
+        thread_id = await con.fetchval("insert into bothub.threads(bot_id,kind,title,owner_id) values($1,'routine',$2,$3) returning id", schedule['bot_id'], schedule['name'], schedule['owner_id'])
+        turn = await create_turn(con, thread_id, prompt, 'hook')
+        await con.execute('update bothub.schedules set last_turn_id=$2 where id=$1 and owner_id=$3', schedule['id'], uuid.UUID(turn['id']), schedule['owner_id'])
+        if schedule['skipped_count'] or schedule['paused_by_unavailable']:
+            events = []
+            async with con.transaction():
+                await record_resume(con, schedule, events)
+            for event in events: publish(event)
+        return {'status': 'accepted'}
+
+    @app.post('/hooks/{id}', status_code=202)
     async def hook(id: uuid.UUID, request: Request, token: str = ''):
         header_token = request.headers.get('x-hook-token')
         if header_token is None and token:
-            log.warning('deprecated_query_token', extra={'path':request.url.path})
+            log.warning('deprecated_query_token', extra={'path': request.url.path})
         token = header_token if header_token is not None else token
-        raw = await request.body()
-        if len(raw)>65536: error('invalid',413)
+        raw = await read_hook_body(request)
         try:
             text = raw.decode()  # utf-16/32 пропустил бы json.loads(bytes), а разбор ниже ждёт utf-8
             payload = json.loads(text)
         except ValueError: error('invalid')
         async with app.state.pool.acquire() as con:
-            schedule = await con.fetchrow("select s.* from bothub.schedules s join bothub.users u on u.id=s.owner_id where s.id=$1 and s.kind='hook' and s.enabled and u.status='active'",id)
-            if not schedule: error('not_found',404)
-            if not token_equals(token,schedule['hook_token']): error('forbidden',403)
-            # Раздел 16: ответ всегда 202 {"status":"accepted"}, без id turn: по форме и телу ответа отправитель не узнаёт, создан ли turn
-            # или запуск пропущен (пауза, исполнитель, провайдер). Проверка и постановка в очередь (или запись пропуска) идут до ответа
-            # в обоих случаях, поэтому и по времени ответа разница небольшая. Сбой самой проверки считается пропуском check_failed.
-            try:
-                reason = await trigger_block(con,schedule['bot_id'])
-            except Exception:
-                log.exception('trigger_block_failed',extra={'bot_id':schedule['bot_id'],'schedule_id':str(id)})
-                reason = 'check_failed'
-            if not reason:
-                try:
-                    await require_available_bot(con,schedule['bot_id'])
-                except HTTPException as exc:  # бот сломался между проверкой и постановкой: тоже пропуск, не 409 отправителю
-                    if exc.status_code != 409: raise
-                    reason = 'provider_unavailable' if (exc.detail or {}).get('error') == 'no_model' else 'executor_unavailable'
-            if reason:
-                async with con.transaction():
-                    locked = await con.fetchrow('select * from bothub.schedules where id=$1 for update',id)
-                    events = []
-                    await record_skip(con,locked,reason,events)
-                for event in events: publish(event)
-                return {'status':'accepted'}
-            thread_id = await con.fetchval("insert into bothub.threads(bot_id,kind,title,owner_id) values($1,'routine',$2,$3) returning id",schedule['bot_id'],schedule['name'],schedule['owner_id'])
+            schedule = await get_hook_schedule(con, id)
+            if not token_equals(token, schedule['hook_token']): error('forbidden', 403)
             prompt = schedule['prompt'] + '\n\nДанные события:\n```json\n' + text + '\n```'
-            turn = await create_turn(con,thread_id,prompt,'hook')
-            await con.execute('update bothub.schedules set last_turn_id=$2 where id=$1 and owner_id=$3',id,uuid.UUID(turn['id']),schedule['owner_id'])
-            if schedule['skipped_count'] or schedule['paused_by_unavailable']:
-                events = []
-                async with con.transaction():
-                    await record_resume(con,schedule,events)
-                for event in events: publish(event)
-            return {'status':'accepted'}
+            return await dispatch_hook_turn(con, schedule, prompt)
+
+    @app.post('/hooks/{id}/github', status_code=202)
+    async def hook_github(id: uuid.UUID, request: Request):
+        raw = await read_hook_body(request)
+        sig = request.headers.get('x-hub-signature-256')
+        event_name = request.headers.get('x-github-event', '')
+        async with app.state.pool.acquire() as con:
+            schedule = await get_hook_schedule(con, id)
+            # Подпись сырого тела проверяется до любого разбора JSON
+            if not hook_adapters.verify_github_signature(raw, schedule['hook_token'], sig):
+                error('forbidden', 403)
+            if event_name == 'ping':
+                return {'status': 'accepted'}
+            try:
+                payload = json.loads(raw.decode())
+            except ValueError: error('invalid')
+            if not isinstance(payload, dict): error('invalid')
+            prompt_text = hook_adapters.build_github_prompt(event_name, payload)
+            if prompt_text is None:
+                return {'status': 'accepted'}
+            full_prompt = (schedule['prompt'] + '\n\n' if schedule['prompt'] else '') + prompt_text
+            return await dispatch_hook_turn(con, schedule, full_prompt)
+
+    @app.post('/hooks/{id}/slack', status_code=202)
+    async def hook_slack(id: uuid.UUID, request: Request):
+        raw = await read_hook_body(request)
+        sig = request.headers.get('x-slack-signature')
+        timestamp = request.headers.get('x-slack-request-timestamp')
+        async with app.state.pool.acquire() as con:
+            schedule = await get_hook_schedule(con, id)
+            # Подпись и окно в 5 минут по timestamp проверяются до любого разбора JSON
+            # Slack подписывает своим Signing Secret приложения; без него (или при сбое расшифровки) всегда 403, hook_token не подходит
+            stored = schedule['slack_signing_secret']
+            try:
+                signing_secret = decrypt_secret(bytes(stored), schedule['id'].bytes).decode() if stored else None
+            except Exception:
+                log.exception('slack_secret_decrypt_failed', extra={'schedule_id': str(schedule['id'])})
+                signing_secret = None
+            if not signing_secret or not hook_adapters.verify_slack_signature(raw, signing_secret, sig, timestamp):
+                error('forbidden', 403)
+            try:
+                payload = json.loads(raw.decode())
+            except ValueError: error('invalid')
+            if not isinstance(payload, dict): error('invalid')
+            if payload.get('type') == 'url_verification':
+                return JSONResponse({'challenge': payload.get('challenge', '')}, status_code=200)
+            prompt_text = hook_adapters.build_slack_prompt(payload)
+            if prompt_text is None:
+                return {'status': 'accepted'}
+            full_prompt = (schedule['prompt'] + '\n\n' if schedule['prompt'] else '') + prompt_text
+            return await dispatch_hook_turn(con, schedule, full_prompt)
 
     @app.post('/api/files')
     async def upload_file(request: Request, file: UploadFile = File(...), thread_id: uuid.UUID = Form(...), origin: str = Form('upload')):

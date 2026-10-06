@@ -267,6 +267,32 @@ To authenticate developer subscription CLIs (Claude Code, OpenAI Codex, Antigrav
 2. Describe your bot's role, instructions, avatar, and select the model provider.
 3. Click **Create**. The core instructs the launcher to provision the bot container and user bridge network.
 
+### Bot Templates
+
+You can export existing bots and import them to create new bots:
+- **Export**: Open the bot settings and export the template file. This downloads a `<name>.botstead.json` file containing instructions, avatar, auto-allow rules, MCP allow-list, budget settings, cron schedules, and procedures. It does not contain API keys, secrets, memory, threads, tokens, or container state.
+- **Import**: On the new bot screen, choose the option to create from file. Select the `.botstead.json` file (up to 256 KB), select a model provider and model, and click create. The system creates the bot, its schedules, and its procedures in a single transaction.
+
+### Connect GitHub or Slack
+
+You can trigger bot turns from external GitHub or Slack events:
+
+1. In the app, create a schedule of kind `hook` for your bot.
+2. Copy the webhook URL and, for GitHub, the token (`hook_token`). Slack does not use `hook_token`.
+3. **GitHub**:
+   - In your repository or organization settings, open **Webhooks** and click **Add webhook**.
+   - Set the Payload URL to `https://<domain>/bots/hooks/<schedule_id>/github`.
+   - Set **Content type** to `application/json`.
+   - Paste the schedule token into the **Secret** field.
+   - Select individual events (such as issues, pull requests, or pushes) and save the webhook.
+4. **Slack**:
+   - In the Slack app management console, open **Event Subscriptions** and enable events.
+   - In the **Request URL** field, enter `https://<domain>/bots/hooks/<schedule_id>/slack`.
+   - Copy the app's **Signing Secret** (Basic Information) into the schedule's **Slack signing secret** field in the app (open the schedule in Routines). The field is write-only: after saving, the app only shows that a secret is set.
+   - Until the secret is saved, the server answers Slack with 403 and the URL cannot be verified.
+   - Slack sends a verification challenge. The server verifies the URL automatically.
+   - Under bot events, subscribe to `app_mention` and `message.channels`, then install the app to your workspace.
+
 ### Create via Script
 
 Alternatively, create a bot from the terminal:

@@ -104,6 +104,12 @@ function lockForm(form, locked) {
 
 // Ошибка сети: у fetch нет status. Остальное разбираем по коду ответа.
 function isNetworkError(err) { return !err || !err.status; }
+// Сбой самой страницы (исключение в коде до запроса): fetch бросает TypeError с одним из этих текстов, всё прочее
+// без status это ошибка в приложении, и называть её «нет связи» значит прятать причину.
+const FETCH_FAILED = /failed to fetch|load failed|networkerror|network request failed|fetch failed/i;
+export function isAppFault(err) {
+  return Boolean(err) && !err.status && err instanceof Error && !FETCH_FAILED.test(String(err.message || ''));
+}
 
 // 5xx кроме 502/503/504: сервер ответил и сломался. Это не обрыв связи и не «попробуйте через минуту», причина в логе ядра.
 export function isServerFault(err) {
@@ -114,6 +120,10 @@ const FAULT_HINT = 'Подробности в логе ядра (docker compose 
 // Текст для сбоя без понятного ответа сервера: код ответа пользователю не показываем.
 export function failure(err, unsent = '') {
   if (isServerFault(err)) return { title: 'Ошибка сервера', text: `${unsent}${FAULT_HINT}` };
+  if (isAppFault(err)) {
+    console.error(err);  // стек для разбора: в консоли браузера
+    return { title: 'Ошибка в приложении', text: `${unsent}Обновите страницу и повторите. Текст ошибки: ${String(err.message || err).slice(0, 160)}` };
+  }
   return { title: 'Сервер не отвечает', text: `${unsent}${isNetworkError(err) ? 'Проверьте сеть или VPN.' : 'Попробуйте ещё раз через минуту.'}` };
 }
 function failureAlert(box, err, unsent = '') {

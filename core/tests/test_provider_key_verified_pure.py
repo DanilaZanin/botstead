@@ -154,6 +154,35 @@ async def test_unusable_model_list_fails_as_before_without_a_second_request(monk
     assert raised.value.code == 'incompatible' and len(seen) == 1
 
 
+
+
+# ---- context_length in model list ----------------------------------------------------
+
+CONTEXT_MODELS = {'data': [
+    {'id': 'm1', 'context_length': 4096},
+    {'id': 'm2', 'context_length': 32768},
+    {'id': 'm3'},  # без context_length: игнорируется
+    {'id': 'm4', 'context_length': 0},  # неположительное: игнорируется
+]}
+
+
+@pytest.mark.parametrize('kind', ['openai_compatible', 'openai_api'])
+async def test_fetch_keeps_context_windows_from_model_list(monkeypatch, kind):
+    seen = server(monkeypatch, lambda request: httpx.Response(200, json=CONTEXT_MODELS), kind_body=CONTEXT_MODELS)
+    names = await fetch_provider_models(kind, 'https://api.example', GOOD_KEY, resolver=public_resolver)
+    assert names == ['m1', 'm2', 'm3', 'm4']
+    assert names.context_windows == {'m1': 4096, 'm2': 32768}
+
+
+@pytest.mark.parametrize('kind,body', [('anthropic_api', MODELS), ('google_api', {'models': [{'name': 'models/g1'}]})])
+async def test_context_windows_is_none_for_non_openai_providers(monkeypatch, kind, body):
+    def upstream(request):
+        return httpx.Response(200, json=body)
+    monkeypatch.setattr('bothub.main.PROBE_TRANSPORT', httpx.MockTransport(upstream))
+    names = await fetch_provider_models(kind, 'https://api.example', GOOD_KEY,
+                                        allow_private=True, resolver=public_resolver,
+                                        approved_ips=['8.8.8.8'])
+    assert names.context_windows is None
 # ---- маршруты: ответ проверки и колонка ----------------------------------------------------------------
 
 def loose_server(env):

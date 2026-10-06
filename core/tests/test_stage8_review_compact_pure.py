@@ -77,6 +77,8 @@ class Con:
         if 'insert into bothub.usage' in query:
             w.usage.append(args)
             return {'id': 1}
+        if 'delegated_by_bot is not null' in query:
+            return None  # append_event ищет поручение (раздел 19): ход не из поручения
         raise AssertionError('fetchrow: ' + query)
 
     async def fetchval(self, query, *args):
