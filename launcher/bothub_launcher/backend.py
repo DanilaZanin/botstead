@@ -62,6 +62,7 @@ class ContainerInfo:
     started_at: str = ""
     restart_count: int = 0
     image: str = ""
+    image_id: str = ""  # sha256 образа контейнера: отличается от текущего после пересборки образа
     networks: tuple[str, ...] = ()
     pid: int = 0
 
@@ -109,6 +110,7 @@ class Backend(Protocol):
     async def list_containers(self, role: str | None = None) -> list[ContainerInfo]: ...
     async def run_bot(self, bot_id: str, owner_id: str) -> str: ...
     async def run_login(self, owner_id: str) -> str: ...
+    async def image_id(self, image: str) -> str: ...
     async def start_container(self, name: str) -> None: ...
     async def disable_restart(self, name: str) -> None: ...
     async def remove_container(self, name: str) -> bool: ...
@@ -193,7 +195,7 @@ class DockerCLIBackend:
             status=str(state.get("Status", "")), exit_code=int(state.get("ExitCode") or 0),
             oom_killed=bool(state.get("OOMKilled")), started_at=str(state.get("StartedAt", "")),
             restart_count=int(raw.get("RestartCount") or 0), image=str(cfg.get("Image", "")),
-            networks=tuple(nets),
+            image_id=str(raw.get("Image", "")), networks=tuple(nets),
             pid=int(state.get("Pid") or 0),
         )
 
@@ -248,6 +250,11 @@ class DockerCLIBackend:
         return await self._start(da.login_run_args(
             self.cfg, owner_id, login_volume=self._volume_names.get(self.cfg.login_volume(owner_id))),
             f"создание логин-контейнера {owner_id}")
+
+    async def image_id(self, image: str) -> str:
+        """sha256 образа по имени; пустая строка, если образа нет (тогда сравнение пропускается)."""
+        res = await self._docker([self.cfg.docker_bin, "image", "inspect", "-f", "{{.Id}}", image], f"образ {image}")
+        return res.out.strip() if res.rc == 0 else ""
 
     async def start_container(self, name: str) -> None:
         info = await self.inspect_container(name)

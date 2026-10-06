@@ -881,7 +881,13 @@ class Launcher:
         async with self._lock(name):
             info = await self._managed(name, "login", owner_id)
             if info is not None and info.running:
-                return self._status(info)
+                # Образ ботов пересобрали (новые CLI): работающий контейнер входа со старым образом пересоздаётся,
+                # том с логинами остаётся. Без id образа (образа нет) сравнение пропускается.
+                current = await self.backend.image_id(self.cfg.image)
+                if not current or not info.image_id or info.image_id == current:
+                    return self._status(info)
+                for s in [s for s in self._sessions.values() if s.owner_id == owner_id and not s.exited]:
+                    await self.close_login_session(s.id)
             if info is not None:
                 await self.backend.remove_container(name)
             await self.backend.ensure_volume(self.cfg.login_volume(owner_id), owner_id, "login")

@@ -551,6 +551,19 @@ async def test_create_login_container(launcher, backend):
     assert backend.order.index("reconcile") < backend.order.index("run_login")
 
 
+async def test_login_container_recreated_after_image_rebuild(launcher, backend):
+    # Образ пересобрали: работающий контейнер входа со старым образом пересоздаётся, том не трогается.
+    await launcher.create_login_container("o1")
+    backend.current_image_id = "sha256:image-2"
+    st = await launcher.create_login_container("o1")
+    assert st["running"] and len(ops(backend, "run_login")) == 2
+    assert ("remove_container", "login-o1") in backend.log
+    assert not any(op[0] == "remove_volume" for op in backend.log)
+    assert backend.containers["login-o1"].image_id == "sha256:image-2"
+    again = await launcher.create_login_container("o1")
+    assert again["running"] and len(ops(backend, "run_login")) == 2
+
+
 async def test_login_container_validates_owner(launcher):
     with pytest.raises(ValidationFailed):
         await launcher.create_login_container("o1; reboot")

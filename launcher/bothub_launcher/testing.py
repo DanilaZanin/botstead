@@ -260,6 +260,7 @@ class FakeBackend:
         self.kill_ends_exec = True
         self._execs: dict[str, FakeExec] = {}
         self._ids = itertools.count(1)
+        self.current_image_id = "sha256:image-1"  # меняется в тестах пересборки образа
         self.browser_running_names: set[str] = set()
         self.browser_modes: dict[str, str] = {}
         self.browser_urls: dict[str, str] = {}
@@ -328,12 +329,16 @@ class FakeBackend:
         cid = f"c{next(self._ids):04d}"
         self.containers[name] = ContainerInfo(
             name=name, id=cid, labels=labels, running=True, status="running", image="bothub-bot",
-            networks=(f"bothub-u-{owner_id}",), started_at="2026-10-04T10:00:00Z")
+            image_id=self.current_image_id, networks=(f"bothub-u-{owner_id}",), started_at="2026-10-04T10:00:00Z")
         return cid
 
     async def run_bot(self, bot_id, owner_id):
         self._rec("run_bot", bot_id, owner_id)
         return self._add(f"bot-{bot_id}", "bot", owner_id, bot_id)
+
+    async def image_id(self, image):
+        self._rec("image_id", image)
+        return self.current_image_id
 
     async def run_login(self, owner_id):
         self._rec("run_login", owner_id)
