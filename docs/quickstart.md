@@ -1,22 +1,34 @@
-# Quick Start Guide
+# Быстрый запуск Botstead
 
-This guide walks through deploying Botstead on a Linux host with Docker.
+Руководство по развёртыванию Botstead на Linux с Docker. Команды выполняются из корня репозитория или каталога `deploy/`, если это указано в шаге. [English version](en/quickstart.md).
 
-All commands assume you are working from the repository root or the `deploy/` directory as specified.
+## Возможности
 
----
+- **Telegram:** бот принимает текст из разрешённых чатов и отправляет ответ туда же ([контракт, раздел 23](contracts.md#contract-23)).
+- **Ответы в Slack:** после hook-хода бот отвечает в канал и тред события, если задан Bot Token ([раздел 18](contracts.md#contract-18)).
+- **Входящая почта Mailgun:** подписанное JSON-письмо запускает ход бота ([раздел 18](contracts.md#contract-18)).
+- **Несколько Mac:** владелец регистрирует Mac-агенты с отдельными токенами ([раздел 5](contracts.md#contract-5)).
+- **Каталог шаблонов:** готовые конфигурации из `templates/` доступны при создании бота ([раздел 9](contracts.md#contract-9)).
+- **Групповой чат:** от 2 до 6 ботов обсуждают сообщение по раундам в одном треде ([раздел 21](contracts.md#contract-21)).
+- **Проактивные подсказки:** бот предлагает до трёх действий, владелец принимает или скрывает их ([раздел 22](contracts.md#contract-22)).
+- **Делегирование:** бот поручает задачу другому своему боту и получает результат ([раздел 19](contracts.md#contract-19)).
+- **Проверяющая модель:** дополнительная модель оценивает рискованное действие до запроса подтверждения владельца ([раздел 20](contracts.md#contract-20)).
+- **Самопробуждение:** бот планирует будущий ход, владелец видит и отменяет ожидание ([раздел 17](contracts.md#contract-17)).
+- **Оценка стоимости:** сводка расхода рассчитывает стоимость по ценам моделей и отмечает неполный расчёт ([раздел 2](contracts.md#contract-2)).
+- **Экспорт CSV:** владелец скачивает ленту активности за 1, 7, 30 или 90 дней ([раздел 16](contracts.md#contract-16)).
+- **Панель «Квоты»:** для бота с API-провайдером видны токены и оценка расходов за день и месяц ([раздел 2](contracts.md#contract-2)).
+- **Пределы ввода:** API отклоняет поля, которые длиннее заданного предела ([раздел 13](contracts.md#contract-13)).
+- **Шаблоны ботов:** настройки, cron-расписания и процедуры экспортируются и импортируются без секретов ([раздел 9](contracts.md#contract-9)).
+- **События GitHub и Slack:** подписанные события запускают ход через hook-расписание ([раздел 18](contracts.md#contract-18)).
+- **`mcp_allow`:** владелец задаёт список разрешённых сторонних MCP-инструментов ([раздел 4](contracts.md#contract-4)).
 
-## 1. Prerequisites
+## 1. Требования к хосту
 
-Ensure your host meets the following requirements:
-- **Operating System**: Linux (Ubuntu 22.04+, Debian 12+, or compatible distribution).
-- **Container Engine**: Docker Engine 24+ with `iptables` support enabled in the daemon.
-- **Kernel Module**: `br_netfilter` loaded and configured so bridge traffic passes through host iptables.
-- **User Namespaces**: Enabled for unprivileged processes (`sysctl user.max_user_namespaces` greater than 0).
+Нужен Linux (Ubuntu 22.04+, Debian 12+ или совместимый дистрибутив), Docker Engine 24+ с поддержкой `iptables`, загруженный модуль `br_netfilter` и разрешённые пространства имён пользователя (`user.max_user_namespaces > 0`).
 
-### Prepare Host Kernel and Bridge Filtering
+### Настройка ядра Linux и фильтрации мостового трафика
 
-Run the following commands on the host:
+На хосте выполните:
 
 ```bash
 sudo modprobe br_netfilter
@@ -25,154 +37,155 @@ sudo sysctl -w net.bridge.bridge-nf-call-iptables=1
 echo "net.bridge.bridge-nf-call-iptables = 1" | sudo tee -a /etc/sysctl.d/99-bothub.conf
 ```
 
-Verify user namespace support:
+Проверьте поддержку пространств имён пользователя:
 
 ```bash
 sysctl user.max_user_namespaces
 ```
 
-If the value is 0, enable it:
+Если команда вернула `0`, включите поддержку:
 
 ```bash
 sudo sysctl -w user.max_user_namespaces=28633
 echo "user.max_user_namespaces = 28633" | sudo tee -a /etc/sysctl.d/99-bothub.conf
 ```
 
----
+## 2. Предварительная проверка хоста
 
-## 2. Preflight Check
-
-Navigate to the `deploy/` directory and run the preflight verification script:
+Перейдите в каталог `deploy/` и запустите проверочный скрипт:
 
 ```bash
 cd deploy
 ./preflight.sh
 ```
 
-The script verifies:
-- `br_netfilter` availability and sysctl configuration.
-- The presence of the `DOCKER-USER` iptables chain.
-- The matching iptables backend (nftables vs legacy).
-- Absence of conflicting IPv6 settings on Docker default bridges.
+Скрипт проверяет:
 
-If any check fails, the script outputs the exact corrective command. Resolve any reported issues before proceeding.
+- наличие `br_netfilter` и настройки sysctl;
+- наличие цепочки `DOCKER-USER` в iptables;
+- согласованность backend iptables (nftables или legacy);
+- отсутствие конфликтующих настроек IPv6 на стандартных мостах Docker.
 
----
+При ошибке скрипт выводит команду для исправления. Устраните все найденные проблемы до следующего шага.
 
-## 3. Environment Configuration
+## 3. Настройка переменных окружения
 
-From the `deploy/` directory, copy the environment templates:
+Из каталога `deploy/` скопируйте образцы файлов:
 
 ```bash
 cp .env.example .env
 cp db.env.example db.env
 ```
 
-### Configure Secrets (`deploy/.env`)
+### Секреты в `deploy/.env`
 
-Generate cryptographically secure random values:
+Сгенерируйте случайные значения:
 
 ```bash
-# Generate 32-byte hex secrets
-openssl rand -hex 32   # for LAUNCHER_SECRET
-openssl rand -hex 32   # for BOT_TOKEN_SECRET
-openssl rand -hex 32   # for BOTHUB_GATEWAY_TOKEN_SECRET
+# Секреты по 32 байта в hex
+openssl rand -hex 32   # LAUNCHER_SECRET
+openssl rand -hex 32   # BOT_TOKEN_SECRET
+openssl rand -hex 32   # BOTHUB_GATEWAY_TOKEN_SECRET
 
-# Generate base64 key for BOTHUB_SECRET_KEYS (provider API key encryption)
+# Ключ base64 для BOTHUB_SECRET_KEYS (шифрование ключей API-провайдеров)
 openssl rand -base64 32 | tr -d '\n'
 ```
 
-Edit `deploy/.env` and configure:
-- `DATABASE_URL`: PostgreSQL connection string, matching values in `db.env` (e.g., `postgres://bothub:your_db_password@db:5432/bothub`).
-- `LAUNCHER_SECRET`: Minimum 32 characters hex string generated above.
-- `BOT_TOKEN_SECRET`: Hex secret for HMAC bot tokens.
-- `BOTHUB_GATEWAY_TOKEN_SECRET`: Hex secret for model gateway per-turn tokens.
-- `BOTHUB_SECRET_KEYS`: `1:<base64_string>` using the base64 key generated above.
-- `BOTHUB_INTERNAL_URL`: Internal gateway address, keep as `http://core:8080`.
-- `BOTHUB_RUNNER_EXEC`: Set to `docker`.
-- `FILES_DIR`: File storage path, defaults to `/data/files`.
+Откройте `deploy/.env` и задайте:
 
-### Configure Database (`deploy/db.env`)
+- `DATABASE_URL`: строку подключения PostgreSQL со значениями из `db.env`, например `postgres://bothub:your_db_password@db:5432/bothub`;
+- `LAUNCHER_SECRET`: hex-секрет длиной не менее 32 символов;
+- `BOT_TOKEN_SECRET`: hex-секрет для HMAC-токенов ботов;
+- `BOTHUB_GATEWAY_TOKEN_SECRET`: hex-секрет для токенов шлюза моделей на один ход;
+- `BOTHUB_SECRET_KEYS`: значение вида `1:<base64_string>`, используя сгенерированный выше ключ;
+- `BOTHUB_INTERNAL_URL`: `http://core:8080`;
+- `BOTHUB_RUNNER_EXEC`: `docker`;
+- `FILES_DIR`: каталог файлов; по умолчанию `/data/files`.
 
-Edit `deploy/db.env` and set:
-- `POSTGRES_USER`: Database username (e.g., `bothub`).
-- `POSTGRES_PASSWORD`: Database password (must match `DATABASE_URL` in `.env`).
-- `POSTGRES_DB`: Database name (e.g., `bothub`).
+Сохраните образцы секретов в надёжном месте, чтобы восстановить конфигурацию после переезда или сбоя.
 
----
+### База данных в `deploy/db.env`
 
-## 4. Launcher Configuration
+Задайте:
 
-Inspect `deploy/launcher.toml`.
+- `POSTGRES_USER`: имя пользователя базы, например `bothub`;
+- `POSTGRES_PASSWORD`: пароль базы. Он должен совпадать с паролем в `DATABASE_URL`;
+- `POSTGRES_DB`: имя базы, например `bothub`.
 
-1. **Check iptables backend**:
-   Run `iptables --version` on the host. If output contains `(legacy)`, uncomment in `launcher.toml`:
+## 4. Настройка Launcher
+
+Откройте `deploy/launcher.toml`.
+
+1. **Проверьте backend iptables.** Выполните на хосте `iptables --version`. Если вывод содержит `(legacy)`, раскомментируйте в `launcher.toml`:
+
    ```toml
    iptables_bin = "iptables-legacy"
    ip6tables_bin = "ip6tables-legacy"
    ```
 
-2. **Seccomp Profile**:
-   The default profile is located at `deploy/seccomp/bot.json` and mounted read-only into the launcher container. To verify or rebuild the profile from source:
+2. **Проверьте профиль seccomp.** Профиль `deploy/seccomp/bot.json` подключается к контейнеру launcher только для чтения. Для проверки или пересборки из исходных данных выполните:
+
    ```bash
    python3 seccomp/build_profile.py --check
    ```
 
-3. **Internal DNS (Optional)**:
-   If your bots need to resolve internal private hostnames, specify your upstream DNS resolver in `launcher.toml`:
+3. **При необходимости задайте внутренний DNS.** Если ботам нужно разрешить внутренние приватные имена, укажите upstream DNS-резолвер в `launcher.toml`:
+
    ```toml
    internal_dns = "192.168.1.53"
    ```
-   Note: Do not use `127.0.0.11`, which is reserved for Docker's embedded container DNS.
 
----
+   Не используйте `127.0.0.11`: этот адрес зарезервирован встроенным DNS Docker.
 
-## 5. Build Bot Image
+## 5. Сборка образа бота
 
-Build the base bot container image:
+Соберите базовый образ контейнера бота:
 
 ```bash
 ./build-bot-image.sh
 ```
 
-Alternatively, use Docker Compose:
+Можно собрать его через Docker Compose:
 
 ```bash
 docker compose --profile build build bot-image
 ```
 
-### Optional: Antigravity CLI (`agy`) for Gemini Runner
+### Необязательно: CLI Antigravity (`agy`) для раннера Gemini
 
-To enable the `agy` CLI layer in the bot image:
-1. Obtain the direct URL of the binary or of a `.tar.gz`/`.tgz` archive and calculate the SHA-256 of the downloaded file (for an archive, the archive itself):
+Чтобы добавить в образ слой CLI `agy`:
+
+1. Возьмите прямой адрес бинарного файла или архива `.tar.gz`/`.tgz`, скачайте файл и вычислите SHA-256. Для архива вычисляйте хеш самого архива:
+
    ```bash
    curl -fsSL -o /tmp/agy "<direct_download_url>"
    sha256sum /tmp/agy
    ```
-2. Set `AGY_URL` and `AGY_SHA256` in `deploy/.env`.
-3. Re-run `./build-bot-image.sh`.
 
-If these variables are omitted, the image builds without `agy` and the `gemini` CLI runner is disabled.
+2. Укажите `AGY_URL` и `AGY_SHA256` в `deploy/.env`.
+3. Повторно запустите `./build-bot-image.sh`.
 
----
+Без этих переменных образ соберётся без `agy`, а CLI-раннер Gemini останется выключенным.
 
-## 6. Reverse Proxy Setup (Nginx)
+## 6. Настройка обратного прокси Nginx
 
-Botstead serves the core API and static PWA through Nginx.
-The snippet mounts the app under `/bots/`. For another prefix, change the paths in the snippet and set the same prefix in `BOTHUB_BASE_PATH` in `.env` (the session cookie path), otherwise login succeeds and every next request gets 401.
+Botstead обслуживает API и статическую PWA через Nginx. Пример конфигурации публикует приложение по пути `/bots/`. Для другого префикса измените пути в конфигурации и задайте тот же префикс в `BOTHUB_BASE_PATH` файла `.env`. Это путь cookie сессии: при несовпадении вход пройдёт, но следующие запросы получат 401.
 
-1. Copy the Nginx location configuration snippet:
+1. Скопируйте конфигурацию location:
+
    ```bash
    sudo cp nginx/bothub-locations.conf /etc/nginx/snippets/
    ```
 
-2. Create the proxy secret configuration:
+2. Создайте файл с секретом прокси:
+
    ```bash
    sudo bash -c 'echo "proxy_set_header X-Bothub-Proxy $(grep BOTHUB_PROXY_SECRET .env | cut -d= -f2);" > /etc/nginx/snippets/bothub-proxy-secret.conf'
    sudo chmod 600 /etc/nginx/snippets/bothub-proxy-secret.conf
    ```
 
-3. Include the snippet in your Nginx server block:
+3. Подключите snippet в блоке Nginx server:
+
    ```nginx
    server {
        server_name your-domain.example.com;
@@ -181,191 +194,269 @@ The snippet mounts the app under `/bots/`. For another prefix, change the paths 
    }
    ```
 
-4. Test and reload Nginx:
+4. Проверьте конфигурацию и перезагрузите Nginx:
+
    ```bash
    sudo nginx -t
    sudo systemctl reload nginx
    ```
 
----
+## 7. Запуск сервисов
 
-## 7. Start the Stack
-
-Launch the core services from the `deploy/` directory:
+Из каталога `deploy/` запустите основные сервисы:
 
 ```bash
 docker compose up -d --build
 ```
 
-Check the launcher logs to confirm network rules and startup health:
+Проверьте журнал launcher, чтобы убедиться, что сетевые правила настроены и сервис запустился:
 
 ```bash
 docker compose logs launcher
 ```
 
-If the launcher encountered errors (missing iptables permissions, missing `br_netfilter`, or missing `DOCKER-USER` chain), it terminates with a descriptive error message in the log.
+Если launcher не получил доступ к iptables, не нашёл `br_netfilter` или цепочку `DOCKER-USER`, он завершится. Причину можно посмотреть в журнале.
 
----
+## 8. Первичная настройка администратора
 
-## 8. First Administrator Setup
+При пустой базе открытая регистрация закрыта, а система переходит в режим первоначальной настройки.
 
-When Botstead boots with an empty database, open registration is blocked and the system enters setup mode.
+1. Проверьте состояние:
 
-1. Check the setup status:
    ```bash
    curl -s http://127.0.0.1:8080/api/setup/status
    ```
-   The endpoint returns `{"needs_setup": true}`.
 
-2. Retrieve the one-time setup code from the core container log:
+   В ответе будет `{"needs_setup": true}`.
+
+2. Получите одноразовый код из журнала контейнера ядра:
+
    ```bash
    docker compose logs core | grep "Setup code:"
    ```
 
-3. Navigate to `https://your-domain.example.com/bots/` in your browser. The PWA prompts for initial administrator registration.
-4. Enter the one-time setup code, your email, and a password (minimum 10 characters).
+3. Откройте в браузере `https://your-domain.example.com/bots/`. PWA предложит создать учётную запись администратора.
+4. Введите одноразовый код, адрес почты и пароль длиной не менее 10 символов.
 
-The setup process creates the primary administrator account, initializes system settings, and locks further setup attempts.
+Первичная настройка создаёт учётную запись администратора, системные параметры и закрывает повторный запуск настройки.
 
----
+## 9. Настройка провайдеров моделей
 
-## 9. Configure Model Providers
+Для работы ботов настройте хотя бы один провайдер.
 
-Botstead bots require a configured model provider.
+### Вариант A: провайдер с API-ключом
 
-### Option A: API Key Provider
+Войдите в PWA как администратор, откройте **Провайдеры** и добавьте провайдера:
 
-Log in as the administrator in the PWA, navigate to **Providers**, and add a provider:
-- **Anthropic API**: Direct Anthropic API key (`sk-ant-...`).
-- **OpenAI API**: Direct OpenAI API key (`sk-...`).
-- **OpenAI-Compatible**: Custom base URL (e.g. `https://api.together.xyz/v1` or local endpoint) with API key.
-- **Google Gemini API**: Direct Gemini API key.
+- **Anthropic API:** API-ключ Anthropic вида `sk-ant-...`;
+- **OpenAI API:** API-ключ OpenAI вида `sk-...`;
+- **OpenAI-Compatible:** собственный base URL, например `https://api.together.xyz/v1` или адрес локального endpoint, и API-ключ;
+- **Google Gemini API:** API-ключ Gemini.
 
-#### Private LAN Endpoints (e.g., Local Ollama / vLLM)
-If you configure an endpoint on a private network (RFC 1918, CGNAT, or local host):
-1. The provider enters `pending_admin` status.
-2. The administrator reviews the resolved IP addresses and approves the request (`allow_private`).
-3. The system locks the approved IP addresses to protect against DNS rebinding.
+#### Адреса в локальной сети, например Ollama или vLLM
 
-### Option B: Subscription CLI Login
+Если endpoint находится в частной сети (RFC 1918, CGNAT или локальный хост):
 
-To authenticate developer subscription CLIs (Claude Code, OpenAI Codex, Antigravity CLI):
-1. In the PWA, open **Providers** and select **Subscription Login**, or run the CLI helper:
+1. Провайдер получит статус `pending_admin`.
+2. Администратор проверит разрешённые IP-адреса и одобрит адрес через `allow_private`.
+3. Система закрепит одобренные IP-адреса, чтобы защититься от DNS rebinding.
+
+### Вариант B: вход через CLI по подписке
+
+Чтобы войти в CLI разработчика по подписке (Claude Code, OpenAI Codex или Antigravity CLI):
+
+1. В PWA откройте **Провайдеры** и выберите **Subscription Login** либо запустите помощник CLI:
+
    ```bash
    ./login.sh <owner-id>
    ```
-2. Complete the OAuth login flow inside the interactive terminal.
-3. Credentials are saved into the owner's dedicated storage volume (`bothub-login-<owner-id>`).
 
----
+2. Завершите OAuth-вход в интерактивном терминале.
+3. Учётные данные сохраняются в отдельном томе владельца `bothub-login-<owner-id>`.
 
-## 10. Create and Run a Bot
+## 10. Создание и запуск бота
 
-### Create via Web Interface
+### Создание через веб-интерфейс
 
-1. In the PWA, click **New Bot**.
-2. Describe your bot's role, instructions, avatar, and select the model provider.
-3. Click **Create**. The core instructs the launcher to provision the bot container and user bridge network.
+1. В PWA нажмите **Новый бот**.
+2. Укажите роль бота, инструкции и аватар, выберите провайдера модели.
+3. Нажмите **Создать**. Ядро поручит launcher подготовить контейнер бота и пользовательскую bridge-сеть.
 
-### Bot Templates
+### Шаблоны ботов: экспорт и импорт
 
-You can export existing bots and import them to create new bots:
-- **Export**: Open the bot settings and export the template file. This downloads a `<name>.botstead.json` file containing instructions, avatar, auto-allow rules, MCP allow-list, budget settings, cron schedules, and procedures. It does not contain API keys, secrets, memory, threads, tokens, or container state.
-- **Import**: On the new bot screen, choose the option to create from file. Select the `.botstead.json` file (up to 256 KB), select a model provider and model, and click create. The system creates the bot, its schedules, and its procedures in a single transaction.
+В настройках бота можно экспортировать его конфигурацию в файл `<name>.botstead.json`. Файл содержит инструкции, аватар, правила auto-allow, список разрешённых MCP, параметры бюджета, cron-расписания и процедуры.
 
-### Connect GitHub or Slack
+В экспорт не входят API-ключи и другие секреты, память, треды, токены и состояние контейнера.
 
-You can trigger bot turns from external GitHub or Slack events:
+На экране нового бота выберите создание из файла, укажите `.botstead.json` размером до 256 КиБ, затем выберите провайдера и модель. Система создаст бота, расписания и процедуры в одной транзакции.
 
-1. In the app, create a schedule of kind `hook` for your bot.
-2. Copy the webhook URL and, for GitHub, the token (`hook_token`). Slack does not use `hook_token`.
-3. **GitHub**:
-   - In your repository or organization settings, open **Webhooks** and click **Add webhook**.
-   - Set the Payload URL to `https://<domain>/bots/hooks/<schedule_id>/github`.
-   - Set **Content type** to `application/json`.
-   - Paste the schedule token into the **Secret** field.
-   - Select individual events (such as issues, pull requests, or pushes) and save the webhook.
-4. **Slack**:
-   - In the Slack app management console, open **Event Subscriptions** and enable events.
-   - In the **Request URL** field, enter `https://<domain>/bots/hooks/<schedule_id>/slack`.
-   - Copy the app's **Signing Secret** (Basic Information) into the schedule's **Slack signing secret** field in the app (open the schedule in Routines). The field is write-only: after saving, the app only shows that a secret is set.
-   - Until the secret is saved, the server answers Slack with 403 and the URL cannot be verified.
-   - Slack sends a verification challenge. The server verifies the URL automatically.
-   - Under bot events, subscribe to `app_mention` and `message.channels`, then install the app to your workspace.
+### Каталог готовых шаблонов
 
-### Create via Script
+На экране создания бота нажмите **Из каталога**, выберите готовую карточку и затем задайте провайдера и модель. Каталог читает проверенные файлы из `templates/`; в образ ядра этот каталог копируется при сборке. В репозитории уже есть шаблоны исследователя, переводчика, помощника по почте, ежедневной сводки, PR Reviewer и домашнего помощника. [Формат и API каталога](contracts.md#contract-9).
 
-Alternatively, create a bot from the terminal:
+### Подключение GitHub и Slack
+
+События GitHub или Slack могут запускать ход бота через расписание типа `hook`.
+
+1. В приложении создайте для бота расписание типа `hook`.
+2. Скопируйте адрес webhook. Для GitHub также понадобится токен `hook_token`. Slack использует подпись своего приложения.
+3. **GitHub:**
+   - В настройках репозитория или организации откройте **Webhooks** и нажмите **Add webhook**.
+   - В поле Payload URL укажите `https://<domain>/bots/hooks/<schedule_id>/github`.
+   - Выберите **Content type** `application/json`.
+   - В поле Secret вставьте токен расписания.
+   - Выберите нужные события, например issues, pull requests или pushes, и сохраните webhook.
+4. **Slack:**
+   - В консоли управления Slack-приложением откройте **Event Subscriptions** и включите события.
+   - В поле **Request URL** введите `https://<domain>/bots/hooks/<schedule_id>/slack`.
+   - В разделе **Basic Information** скопируйте **Signing Secret** и вставьте его в поле **Секрет подписи Slack** расписания в Botstead (откройте расписание в разделе **Рутины**).
+   - Секрет доступен только при вводе. После сохранения приложение покажет, что он задан, без отображения значения. Пока он не задан, сервер отвечает Slack кодом 403, поэтому URL не пройдёт проверку.
+   - Slack отправит проверочный challenge. Ядро подтвердит URL автоматически.
+   - В разделе событий приложения добавьте `app_mention` и `message.channels`.
+   - В **OAuth & Permissions** скопируйте **Bot User OAuth Token** вида `xoxb-...`. В Slack-приложении должен быть scope `chat:write`.
+   - В настройке того же расписания вставьте токен в поле **Bot Token Slack** и нажмите **Сохранить секреты**. Ядро проверит токен и привяжет его к workspace. После hook-хода ответ бота придёт в канал события и в его тред.
+
+### Входящая почта Mailgun
+
+Для получения писем создайте для бота расписание типа `hook`, затем откройте его в разделе **Рутины**.
+
+1. В поле **Адаптер вебхука** выберите **Почта (Mailgun)**.
+2. Скопируйте показанный адрес для JSON-режима. Он заканчивается на `/email/<email_route_token>/json`.
+3. В Mailgun настройте маршрут входящей почты с отправкой JSON на этот адрес.
+4. Скопируйте **Webhook Signing Key** из Mailgun и вставьте его в поле **Ключ подписи Mailgun** расписания. После сохранения значение ключа не отображается.
+5. Убедитесь, что настройки Mailgun используют тот же Signing Key. Подписанные письма создают ход бота.
+
+Когда на расписании задан ключ Mailgun, оно принимает только этот почтовый маршрут. Общий hook, GitHub и Slack для него отключаются. Вложения не передаются в обработку. Письмо размером больше 1 МиБ получает ошибку 413. [Подробности webhook-адаптеров](contracts.md#contract-18).
+
+### Канал Telegram
+
+Подключите бота к Telegram через карточку **Telegram** в настройках бота.
+
+1. Создайте Telegram-бота через BotFather и скопируйте его токен.
+2. Если публичный адрес сервера ещё не указан, до сохранения канала добавьте в `deploy/.env` переменную `BOTHUB_PUBLIC_ORIGIN` со схемой и доменом, без пути. Например:
+
+   ```dotenv
+   BOTHUB_PUBLIC_ORIGIN=https://your-domain.example.com
+   ```
+
+3. После изменения переменной пересоздайте ядро из каталога `deploy/`:
+
+   ```bash
+   docker compose up -d --force-recreate core
+   ```
+
+4. В настройках бота укажите токен, перечислите разрешённые числовые `chat_id` через запятую, включите канал и нажмите **Сохранить**.
+
+Ядро регистрирует webhook Telegram при сохранении канала. Если канал уже был сохранён до настройки `BOTHUB_PUBLIC_ORIGIN`, сохраните его в карточке ещё раз. Из разрешённых чатов бот принимает текстовые сообщения и отправляет туда ответы. [Подробности канала](contracts.md#contract-23).
+
+### Создание через скрипт
+
+Бота можно создать из терминала:
 
 ```bash
 ./bot-create.sh <bot-id> <owner-id>
 ```
 
-Parameters:
-- `bot-id`: Alphanumeric slug (e.g., `scout`, `coder-1`).
-- `owner-id`: The UUID of the owner user (from `users.id`).
+Параметры:
 
-### Manage Bot Containers
+- `bot-id`: идентификатор из строчных латинских букв, цифр и дефисов, до 32 символов, например `scout` или `coder-1`;
+- `owner-id`: UUID пользователя из поля `users.id`.
 
-Use `deploy/launcherctl.sh` to manage container lifecycle:
+### Управление контейнерами ботов
+
+Для управления жизненным циклом контейнеров используйте `deploy/launcherctl.sh`:
 
 ```bash
-# Check bot status
+# Проверить состояние бота
 ./launcherctl.sh status <bot-id>
 
-# Recreate bot container (preserves home data volume)
+# Пересоздать контейнер бота, сохранив домашний том
 ./launcherctl.sh recreate <bot-id>
 
-# List all managed bots
+# Показать список всех ботов под управлением launcher
 ./launcherctl.sh list
 
-# Inspect system and network policy information
+# Показать состояние системы и сведения о сетевой политике
 ./launcherctl.sh info
 
-# Remove bot container and optionally purge home volume
+# Удалить контейнер и при необходимости очистить домашний том
 ./launcherctl.sh remove <bot-id> [--purge]
 ```
 
----
+Команда `recreate` сохраняет домашние данные бота. Параметр `--purge` удаляет домашний том вместе с контейнером.
 
-## 11. Run Verification Suite
+## 11. Проверка изоляции
 
-To verify isolation policies, seccomp filters, and network boundaries on your deployment:
+Чтобы проверить политики изоляции, фильтры seccomp и сетевые границы после развёртывания, выполните:
 
 ```bash
 cd deploy
 ./tests/isolation_check.sh
 ```
 
-The test script:
-1. Spawns temporary test users and bot containers.
-2. Verifies capability drops and non-root execution.
-3. Tests seccomp filters against user namespace creation.
-4. Confirms iptables drop rules for host ports, PostgreSQL, and private subnets.
-5. Verifies cross-user volume and credential isolation.
-6. Cleans up all test resources upon completion.
+Скрипт:
 
----
+1. Создаёт временных пользователей и контейнеры ботов.
+2. Проверяет сброс Linux capabilities и запуск контейнеров от непривилегированного пользователя.
+3. Проверяет seccomp-фильтры на попытке создать user namespace.
+4. Проверяет правила iptables, которые блокируют доступ к портам хоста, PostgreSQL и частным подсетям.
+5. Проверяет изоляцию томов и учётных данных между пользователями.
+6. Удаляет все временные ресурсы после проверки.
 
-## 12. Optional: Mac Agent Setup
+## 12. Настройка Mac-агента
 
-To allow bots to interact with a macOS workstation (read files via `mdfind`, preview files, run local shortcuts, or delegate coding tasks):
+Mac-агент даёт ботам доступ к macOS: поиск файлов через `mdfind`, просмотр файлов, запуск локальных команд и делегирование задач на Mac.
 
-1. On your Mac, clone the repository and navigate to `macagent/`:
-   ```bash
-   cd macagent
-   ./install.sh
-   ```
+### Регистрация нескольких Mac
 
-2. Establish an SSH tunnel forwarding port 18080 to the server core port 8080:
-   ```bash
-   ssh -N -L 18080:127.0.0.1:8080 your-server-alias
-   ```
+В PWA откройте **Настройки → Mac-агенты** и добавьте устройство, задав ему имя. Для каждого Mac создаётся отдельный регистрационный токен. Он показывается один раз, поэтому сохраните его до перехода с экрана. Для следующего компьютера создайте ещё одну запись с отдельным токеном.
 
-3. In `macagent/`, set the environment variable:
-   ```bash
-   export BOTHUB_URL="http://127.0.0.1:18080"
-   export MAC_AGENT_TOKEN="<token_generated_in_pwa>"
-   ```
+После подключения агента выберите нужный Mac в настройках бота. Удаление Mac из списка отзывает его токен и отключает доступ назначенных ему ботов. [Подробности регистрации](contracts.md#contract-5).
 
-4. Start the LaunchAgent service. The Mac agent registers with the core and reports status (`online`, `locked`, `sleep`, or `offline`).
+### Установка агента на Mac
+
+На каждом Mac клонируйте репозиторий и перейдите в `macagent/`:
+
+```bash
+cd macagent
+./install.sh
+```
+
+Скрипт устанавливает зависимости, создаёт файл `~/Library/Application Support/BotHubMac/config.env`, если его ещё нет, и регистрирует LaunchAgent. Откройте этот файл и задайте URL ядра и одноразовый токен для именно этого Mac:
+
+```dotenv
+BOTHUB_URL=http://127.0.0.1:18080
+MAC_AGENT_TOKEN=<token_for_this_mac>
+```
+
+Для конфигурации из репозитория запустите SSH-туннель на Mac, чтобы пробросить локальный порт 18080 к порту ядра 8080 на сервере:
+
+```bash
+ssh -N -L 18080:127.0.0.1:8080 your-server-alias
+```
+
+Оставьте это соединение запущенным. Если для агента используется доступный ему публичный адрес ядра, укажите этот адрес вместо `http://127.0.0.1:18080`.
+
+Для процесса, который запускается вручную из текущего терминала, те же значения можно экспортировать:
+
+```bash
+export BOTHUB_URL="http://127.0.0.1:18080"
+export MAC_AGENT_TOKEN="<token_generated_in_pwa>"
+```
+
+LaunchAgent читает значения из `config.env`. После заполнения файла повторно выполните установку, чтобы перезагрузить службу:
+
+```bash
+./install.sh
+```
+
+Проверьте состояние LaunchAgent и журнал:
+
+```bash
+launchctl print gui/$(id -u)/com.bothub.macagent
+tail -f /tmp/bothub-macagent.log
+```
+
+Установка требует Xcode Command Line Tools и `uv`. При первом вызове `click` или `type_text` macOS запросит разрешение **Accessibility**, а для снимка экрана понадобится **Screen Recording**.
+
+Агент регистрируется в ядре и сообщает состояние `online`, `locked`, `sleep`, `offline` или `needs_permission`. На каждом Mac храните его собственный `MAC_AGENT_TOKEN`; токен другого устройства сюда не переносите.

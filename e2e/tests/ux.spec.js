@@ -527,7 +527,7 @@ test.describe('вход по подписке: проверка при откр�
     await page.addInitScript(() => { try { localStorage.setItem('bothub.lang', 'en'); } catch { /* без хранилища */ } });
     await page.goto('/?mock=1#/settings/providers/p-claude/login');
     await expect(page.locator('#cl-status')).toContainText('Already signed in');
-    await expect(page.getByRole('button', { name: 'Log in again' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Sign in again' })).toBeVisible();
     await expect(page.getByRole('link', { name: 'Close', exact: true })).toBeVisible();
     await expect(page.locator('#cl-idle')).toContainText('The terminal opens if you need to sign in again.');
   });

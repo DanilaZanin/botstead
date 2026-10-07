@@ -155,7 +155,7 @@ test.describe('экран расхода токенов', () => {
     await expect(table).toBeVisible();
 
     const headers = table.locator('th');
-    await expect(headers).toHaveText(['Модель', 'Вход', 'Выход', 'Кэш чтение', 'Кэш запись', 'Итого', 'Ходы']);
+    await expect(headers).toHaveText(['Модель', 'Вход', 'Выход', 'Кэш чтение', 'Кэш запись', 'Итого', 'Ходы', 'Стоимость']);
 
     await expect(table.getByText('claude-sonnet-5')).toBeVisible();
     await expect(table.getByText('claude-opus-5-5')).toBeVisible();

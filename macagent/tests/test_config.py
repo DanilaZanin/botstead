@@ -8,7 +8,8 @@ def test_load_from_env(tmp_path):
     config = Config.load(env=env, env_file=tmp_path / "missing.env")
     assert config.bothub_url == "https://bots.example.com"
     assert config.mac_agent_token == "secret"
-    assert config.ws_url == "wss://bots.example.com/agent/mac?token=secret"
+    assert config.ws_url == "wss://bots.example.com/agent/mac"
+    assert "secret" not in config.ws_url
 
 
 def test_load_from_file_fallback(tmp_path):
@@ -73,4 +74,5 @@ def test_bothub_urls_from_file_fallback(tmp_path):
 
 def test_ws_url_for_arbitrary_address():
     config = Config(bothub_url="https://a", mac_agent_token="tok", bothub_urls=("https://a", "https://b"))
-    assert config.ws_url_for("https://b") == "wss://b/agent/mac?token=tok"
+    assert config.ws_url_for("https://b") == "wss://b/agent/mac"
+    assert "tok" not in config.ws_url_for("https://b")

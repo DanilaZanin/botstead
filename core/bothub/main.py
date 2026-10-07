@@ -16,8 +16,9 @@ import subprocess
 import sys
 import uuid
 import weakref
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
+from collections import defaultdict
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -29,7 +30,7 @@ import httpx
 from croniter import croniter
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from pydantic import (AfterValidator, BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError,
@@ -47,15 +48,19 @@ from bothub import secrets as secrets_module
 from bothub.secrets import encrypt_secret, decrypt_secret
 from bothub.browser_control import (BrowserEventMasker, RFBClientFilter, RFBProtocolError, is_browser_tool,
                                     human_url, mask_browser_args, mask_browser_text, mask_url, transition, url_forbidden)
-from bothub import activity, procedures, hook_adapters
+from bothub import activity, procedures, hook_adapters, channels_telegram
+from bothub import channels_slack
 from bothub import checker as action_checker
 from bothub import wakeups as wk
+from bothub import suggestions as sg
 from bothub import delegation as dg
+from bothub import group_chat as gc
 from bothub import context as ctxlib
 from bothub.procedure_runner import PgStore, ProcedureRunner, RunError
 from bothub.mcp_policy import NOT_ALLOWED as MCP_NOT_ALLOWED, UNSUPPORTED as MCP_ALLOW_UNSUPPORTED, McpAllowUnsupported, McpNotAllowed, mcp_allowed
-from bothub.risk import MAC_READ_TOOLS, MAC_RISKY_TOOLS, decide, forbidden_reason, op_hash, remember_rule
+from bothub.risk import MAC_READ_TOOLS, MAC_RISKY_TOOLS, READ_ONLY_TOOLS, decide, forbidden_reason, op_hash, remember_rule
 from bothub.runner.base import TurnContext
+from bothub.runner.subprocess import CLI_AUTH_EXPIRED, CLI_AUTH_MESSAGE, CliAuthExpired
 
 SCHEMA = 'bothub.'
 NOW = timezone.utc
@@ -161,9 +166,11 @@ def canonical_ip(item) -> str:
 class ProbedModels(list):
     """Имена моделей из пробного запроса плюс key_verified: True сервер отверг заведомо неверный ключ (или сам проверил
     настоящий: anthropic, google), False принял его (ключ сервером не проверяется), None второй запрос не дал ответа.
-    context_windows: id->размер окна для openai_compatible/openai_api (из поля context_length в /v1/models)."""
+    context_windows: id->размер окна для openai_compatible/openai_api (из поля context_length в /v1/models).
+    model_pricing: id->(цена входа, цена выхода) USD за 1M токенов, из поля pricing (OpenRouter)."""
     key_verified: bool | None = None
     context_windows: dict[str, int] | None = None
+    model_pricing: dict[str, tuple[float, float]] | None = None
 
 
 async def probe_unkeyed(client, url: str, headers: dict, hostname: str, budget: float) -> bool | None:
@@ -224,6 +231,53 @@ def model_context_windows(kind: str, body: bytes | bytearray) -> dict[str, int] 
     return windows or None
 
 
+def model_pricing(kind: str, body: bytes | bytearray) -> dict[str, tuple[float, float]] | None:
+    """Цены из поля pricing для openai_compatible и openai_api (OpenRouter совместимый формат).
+
+    GET /v1/models возвращает на каждую модель pricing: {"prompt": "<usd per token as string>", "completion": "<usd per token>"}.
+    Хранится в USD за 1M токенов (значение * 1e6). Пропущенные и невалидные поля: null."""
+    if kind not in ('openai_compatible', 'openai_api'):
+        return None
+    try:
+        payload = json.loads(body)
+        entries = payload.get('data', [])
+    except (ValueError, AttributeError, TypeError):
+        return None
+    pricing: dict[str, tuple[float, float]] = {}
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        mid = item.get('id', '')
+        p = item.get('pricing')
+        if not isinstance(mid, str) or not mid or not isinstance(p, dict):
+            continue
+        in_str = p.get('prompt', '')
+        out_str = p.get('completion', '')
+        try:
+            in_val = float(in_str) if isinstance(in_str, str) and in_str else None
+            out_val = float(out_str) if isinstance(out_str, str) and out_str else None
+        except (ValueError, TypeError):
+            in_val = out_val = None
+        if in_val is not None and in_val >= 0 and out_val is not None and out_val >= 0:
+            pricing[mid] = (in_val * 1e6, out_val * 1e6)
+        elif in_val is not None and in_val >= 0:
+            pricing[mid] = (in_val * 1e6, None)
+        elif out_val is not None and out_val >= 0:
+            pricing[mid] = (None, out_val * 1e6)
+    return pricing or None
+
+
+def quota_panel_mode(bot: dict, provider: dict | None) -> str:
+    """Что показывать в панели «Квоты» у треда бота (PWA повторяет эту логику в registry.js).
+
+    Подписочный CLI (провайдер kind cli_subscription, cli совпадает с runner-провайдером бота) -
+    метр подписки этого CLI; бот на API-провайдере - расход самого бота в долларах и токенах.
+    """
+    if provider and provider.get('kind') == 'cli_subscription' and runner_provider('cli_subscription', provider.get('cli')) == bot.get('provider'):
+        return 'subscription'
+    return 'usage'
+
+
 async def fetch_provider_models(kind: str, base_url: str | None, key: str, *, allow_private: bool = False,
                                 approved_ips=None, forbidden=(), resolver=None) -> ProbedModels:
     """Один пробный запрос списка моделей через закреплённый проверенный IP. Бросает ProbeError(code, message).
@@ -268,6 +322,7 @@ async def fetch_provider_models(kind: str, base_url: str | None, key: str, *, al
                     await response.aclose()
                 names = model_names(kind, body)  # непригодный список: ProbeError до второго запроса
                 context_windows = model_context_windows(kind, body)
+                pricing = model_pricing(kind, body)
                 if kind in ('openai_compatible', 'openai_api'):
                     budget = scope.when() - asyncio.get_running_loop().time() - 1
                     key_verified = await probe_unkeyed(client, pinned + path, headers, hostname, budget)
@@ -280,9 +335,27 @@ async def fetch_provider_models(kind: str, base_url: str | None, key: str, *, al
     result = ProbedModels(names)
     result.key_verified = key_verified
     result.context_windows = context_windows
+    result.model_pricing = pricing
     return result
 
 log = logging.getLogger('bothub')
+
+
+class MacAccessTokenFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        def redact(value):
+            if not isinstance(value, str) or '/agent/mac?' not in value:
+                return value
+            return re.sub(r'(/agent/mac)\?[^\s"\']*', r'\1?[REDACTED]', value)
+
+        record.msg = redact(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(redact(value) for value in record.args)
+        return True
+
+
+for uvicorn_logger in ('uvicorn.access', 'uvicorn.error'):
+    logging.getLogger(uvicorn_logger).addFilter(MacAccessTokenFilter())
 ACTIVE_STATUSES = ('running', 'waiting_approval', 'waiting_mac')
 HEALTH_TIMEOUT = 2.0
 OUTBOX_BACKOFF_CAP = 3600
@@ -383,11 +456,15 @@ def data(row):
 
 
 def schedule_data(row):
-    """Расписание для API: шифртекст секрета подписи Slack не отдаётся, только флаг."""
+    """Расписание для API: секреты Slack и Mailgun скрыты, доступны только флаги."""
     if not row: return None
     plain = dict(row)
-    has_secret = plain.pop('slack_signing_secret', None) is not None
-    return {**jsonable_encoder(plain), 'has_slack_signing_secret': has_secret}
+    has_slack = plain.pop('slack_signing_secret', None) is not None
+    has_bot_token = plain.pop('slack_bot_token', None) is not None
+    plain.pop('slack_team_id', None)
+    has_email = plain.pop('email_signing_key', None) is not None
+    return {**jsonable_encoder(plain), 'has_slack_signing_secret': has_slack,
+            'has_slack_bot_token': has_bot_token, 'has_email_signing_key': has_email}
 
 
 _SENSITIVE_FIELD = re.compile(r'secret|passw|token|value|key|credential', re.I)
@@ -435,7 +512,7 @@ LIST_ITEM_MAX = 200
 LIST_MAX = 200
 CLIENT_MAX = 64
 TIMEZONE_MAX = 64
-DEVICE_MAX = 200
+DEVICE_MAX = 128
 EMAIL_MAX = 254
 PASSWORD_MAX = 512
 TOKEN_MAX = 512
@@ -471,7 +548,10 @@ def check_mcp_allow(value: list[str] | None) -> list[str] | None:
     check_list_size(value, 'mcp_allow')
     items: list[str] = []
     for raw in value:
-        item = check_text(raw.strip(), 'mcp_allow item', maximum=LIST_ITEM_MAX, minimum=1)
+        item = raw.strip()
+        if len(item) > LIST_ITEM_MAX:
+            raise ValueError(f'mcp_allow item exceeds {LIST_ITEM_MAX} characters')
+        check_text(item, 'mcp_allow item', maximum=LIST_ITEM_MAX, minimum=1)
         if any(char.isspace() or not char.isprintable() for char in item):
             raise Unprocessable('mcp_allow item must not contain spaces or control characters')
         # Свой сервер разрешён всегда; запись `bothub*` в список открыла бы серверы `bothub__*` с чужими инструментами.
@@ -492,6 +572,8 @@ def check_auto_allow(value: list[dict] | None) -> list[dict] | None:
         if 'tool' in rule:
             if not isinstance(rule['tool'], str):
                 raise ValueError('auto_allow tool must be a string')
+            if len(rule['tool']) > LIST_ITEM_MAX:
+                raise ValueError(f'auto_allow tool exceeds {LIST_ITEM_MAX} characters')
             check_text(rule['tool'], 'auto_allow tool', maximum=LIST_ITEM_MAX, minimum=1)
         for field, maximum in (('pattern', RULE_PATTERN_MAX), ('op_hash', RULE_HASH_MAX), ('scope', RULE_SCOPE_MAX)):
             if field in rule:
@@ -559,7 +641,78 @@ BOT_TEMPLATE_SCHEDULES_MAX = 20
 BOT_TEMPLATE_PROCEDURES_MAX = 200
 BOT_TEMPLATE_FIELDS = frozenset({'format', 'version', 'name', 'role', 'instructions', 'avatar', 'executor',
                                   'auto_allow', 'mcp_allow', 'budget_daily_tokens', 'auto_compact_percent',
+                                  'proactive_interval_hours',
                                   'schedules', 'procedures'})
+BOT_TEMPLATE_CATALOG_ID = re.compile(r'[a-z0-9][a-z0-9_-]{0,63}')  # id каталога: имя файла без .json; то же ограничение у новых ботов
+BOT_TEMPLATE_CATALOG_DESC_MAX = 200  # предел description в карточке каталога
+
+
+def _catalog_templates_dir() -> Path | None:
+    # Каталог готовых шаблонов: путь из env, по умолчанию `templates` рядом с репо (parents[2] от core/bothub/main.py).
+    # В Docker-образ ядра каталог копируется через COPY в deploy/Dockerfile.core. Если путь не задан и файлов
+    # рядом с репо нет, маршрут отдаёт пустой список (не 500): без шаблонов каталога нет, но ядро работает.
+    raw = os.getenv('BOTHUB_TEMPLATES_DIR')
+    if raw:
+        return Path(raw)
+    candidate = Path(__file__).resolve().parents[2] / 'templates'
+    return candidate if candidate.is_dir() else None
+
+
+def _catalog_description(instructions: str) -> str:
+    # Описание для карточки каталога: первая непустая строка инструкций, обрезанная по словам. Пусто или одни
+    # переводы строк — пустая строка: PWA покажет только роль. Без разделителей абзацев текст длинный.
+    for raw in instructions.splitlines():
+        text = raw.strip()
+        if text:
+            if len(text) > BOT_TEMPLATE_CATALOG_DESC_MAX:
+                cut = text[:BOT_TEMPLATE_CATALOG_DESC_MAX].rsplit(' ', 1)[0].rstrip()
+                return cut or text[:BOT_TEMPLATE_CATALOG_DESC_MAX]
+            return text
+    return ''
+
+
+def _load_catalog_entries() -> list[dict]:
+    # Карточки каталога: читает templates/*.json, проверяет каждый тем же валидатором, что импорт. Битые
+    # пропускаются с warning в лог: один файл с опечаткой не должен валить весь каталог. Возвращает
+    # [{id, name, role, description, avatar}]; порядок — по id (имя файла).
+    root = _catalog_templates_dir()
+    if not root:
+        return []
+    out: dict[str, dict] = {}
+    for path in sorted(root.glob('*.json')):
+        template_id = path.stem
+        if not BOT_TEMPLATE_CATALOG_ID.fullmatch(template_id):
+            log.warning('catalog_template_id_invalid', extra={'file': path.name})
+            continue
+        try:
+            _, parsed = _read_catalog_template(root, path)
+        except (OSError, ValueError, RecursionError) as exc:
+            log.warning('catalog_template_invalid', extra={'file': path.name, 'error': str(exc) if isinstance(exc, BotTemplateError) else type(exc).__name__})
+            continue
+        out[template_id] = {
+            'id': template_id,
+            'name': parsed['name'],
+            'role': parsed['role'],
+            'description': _catalog_description(parsed['instructions']) or _catalog_description(parsed['role']),
+            'avatar': parsed['avatar'],
+        }
+    return [out[key] for key in sorted(out)]
+
+
+def _read_catalog_template(root: Path, path: Path) -> tuple[dict, dict]:
+    # В списке и в полном ответе одна проверка. Симлинк не может увести чтение за пределы каталога.
+    try:
+        resolved = path.resolve()
+    except RuntimeError as exc:  # цикл симлинков
+        raise ValueError('invalid catalog path') from exc
+    if not resolved.is_relative_to(root.resolve()):
+        raise ValueError('path outside catalog')
+    if resolved.stat().st_size > BOT_TEMPLATE_MAX:
+        raise ValueError('template too large')
+    with resolved.open('r', encoding='utf-8') as fh:
+        doc = json.load(fh)
+    parsed, _ = validate_bot_template(doc)
+    return doc, parsed
 
 
 class BotTemplateError(ValueError):
@@ -587,8 +740,8 @@ def unique_name(name: str, taken, maximum: int) -> str:
 
 
 def parse_bot_template(doc) -> dict:
-    """Файл экспорта/импорта бота: только перечисленные поля (лишние отклоняются 422), процедуры валидирует procedures.parse_import,
-    расписания — check_timezone и croniter. Возвращает чистый dict: name, role, instructions, avatar, executor, auto_allow,
+    """Структура файла экспорта/импорта: перечисленные поля, расписания через check_timezone и croniter.
+    Процедуры остаются исходными до validate_bot_template. Возвращает dict: name, role, instructions, avatar, executor, auto_allow,
     mcp_allow, budget_daily_tokens, auto_compact_percent, schedules [{cron,timezone,prompt,enabled,name?}],
     procedures [как procedures.parse_import их примет]. Значения чувствительных полей в текст ошибки не попадают."""
     if not isinstance(doc, dict):
@@ -645,6 +798,9 @@ def parse_bot_template(doc) -> dict:
         _bt_fail('auto_allow', 'invalid', str(exc))
     budget = doc.get('budget_daily_tokens', 200000)
     budget = _bt_optional_int('budget_daily_tokens', budget, ge=0, le=10**12)
+    proactive_interval = doc.get('proactive_interval_hours')
+    if proactive_interval is not None:
+        proactive_interval = _bt_optional_int('proactive_interval_hours', proactive_interval, ge=1, le=720)
     auto_compact = doc.get('auto_compact_percent', ctxlib.AUTO_COMPACT_DEFAULT)
     if auto_compact is None:
         pass
@@ -667,7 +823,30 @@ def parse_bot_template(doc) -> dict:
         _bt_fail('procedures', 'too_many', f'at most {BOT_TEMPLATE_PROCEDURES_MAX} items')
     return {'name': name, 'role': role, 'instructions': instructions, 'avatar': avatar, 'executor': executor,
             'auto_allow': auto_allow, 'mcp_allow': mcp_allow, 'budget_daily_tokens': budget,
-            'auto_compact_percent': auto_compact, 'schedules': schedules, 'procedures': procedures_raw}
+            'auto_compact_percent': auto_compact, 'proactive_interval_hours': proactive_interval,
+            'schedules': schedules, 'procedures': procedures_raw}
+
+
+def validate_bot_template(doc) -> tuple[dict, list[tuple]]:
+    """Общая проверка импорта и каталога: поля, текст JSON, процедуры. Возвращает поля бота и нормализованные процедуры."""
+    try:
+        check_json_text(doc)
+    except Unprocessable as exc:
+        _bt_fail('body', 'invalid', str(exc))
+    parsed = parse_bot_template(doc)
+    checked_procedures = []
+    for index, raw_proc in enumerate(parsed['procedures']):
+        if not isinstance(raw_proc, dict):
+            _bt_fail(f'procedures[{index}]', 'type', 'must be an object')
+        if not raw_proc.get('steps'):
+            _bt_fail(f'procedures[{index}].steps', 'missing', 'is required')
+        try:
+            proc_parsed = procedures.parse_import(raw_proc)
+            params, steps = procedures.normalize_procedure(proc_parsed['params'], proc_parsed['steps'], strict_risk=False)
+        except procedures.ProcedureError as exc:
+            _bt_fail(f'procedures[{index}]', 'invalid', str(exc))
+        checked_procedures.append((proc_parsed['name'], proc_parsed['description'], params, steps))
+    return parsed, checked_procedures
 
 
 def _bt_strict_text(path: str, value, *, maximum: int, minimum: int = 0) -> str:
@@ -734,13 +913,15 @@ def _bt_next_run(cron: str, tz: str):
 
 
 def parse_email(value) -> str:
-    """Адрес из тела публичного маршрута: нормализованный (strip, нижний регистр) или 422. Общая проверка для
-    setup, login и приёма приглашения: до 254 символов, один «@» с текстом по обе стороны, без пробелов и управляющих."""
+    """Адрес из тела публичного маршрута: нормализованный (strip, нижний регистр). Превышение 254 символов даёт 400,
+    неверный формат даёт 422. Общая проверка для setup, login и приёма приглашения."""
     if not isinstance(value, str):
         error('invalid', 400, 'email')
     email = value.strip().lower()
     local, at, domain = email.partition('@')
-    if (not email or len(email) > EMAIL_MAX or not at or not local or not domain or '@' in domain
+    if len(email) > EMAIL_MAX:
+        error('invalid', 400, 'email')
+    if (not email or not at or not local or not domain or '@' in domain
             or any(char.isspace() or not char.isprintable() for char in email)):
         error('invalid', 422, 'email')
     return email
@@ -832,8 +1013,8 @@ class Body(BaseModel):
 class BotIn(Body):
     id: str | None = Field(default=None, pattern=r'^[a-z0-9-]{1,32}$')
     name: str = Field(max_length=80)
-    provider: str
-    model: str
+    provider: str = Field(max_length=200)
+    model: str = Field(max_length=200)
     provider_id: uuid.UUID | None = None
     model_id: uuid.UUID | None = None
     checker_model_id: uuid.UUID | None = None  # раздел 20: проверяющая модель, null выключает
@@ -842,9 +1023,11 @@ class BotIn(Body):
     avatar: str = Field(default='robot', max_length=128)
     executor: str = Field(default='container', max_length=128)
     mac_full_control: StrictBool = False
-    auto_allow: list[dict] = Field(default_factory=list)
-    mcp_allow: list[str] = Field(default_factory=list)
+    mac_id: uuid.UUID | None = None
+    auto_allow: list[dict] = Field(default_factory=list, max_length=LIST_MAX)
+    mcp_allow: list[str] = Field(default_factory=list, max_length=LIST_MAX)
     budget_daily_tokens: StrictInt = Field(default=200000, ge=0, le=10**12)
+    proactive_interval_hours: StrictInt | None = Field(default=None, ge=1, le=720)
     max_turn_seconds: StrictInt = Field(default=1800, ge=30, le=86400)
     auto_compact_percent: StrictInt | None = Field(default=ctxlib.AUTO_COMPACT_DEFAULT, ge=ctxlib.AUTO_COMPACT_MIN, le=ctxlib.AUTO_COMPACT_MAX)  # раздел 15: null выключает
     schedule: dict | None = None  # раздел 9: как в BotDraft, kind всегда 'cron'
@@ -874,8 +1057,8 @@ class BotPatch(Body):
     опциональны — вместо старого "дырявого" `dict`, который валил 500 на
     несовпадении типов вместо 400."""
     name: str | None = Field(default=None, max_length=80)
-    provider: str | None = None
-    model: str | None = None
+    provider: str | None = Field(default=None, max_length=200)
+    model: str | None = Field(default=None, max_length=200)
     provider_id: uuid.UUID | None = None
     model_id: uuid.UUID | None = None
     checker_model_id: uuid.UUID | None = None  # явный null выключает проверку
@@ -884,9 +1067,11 @@ class BotPatch(Body):
     avatar: str | None = Field(default=None, max_length=128)
     executor: str | None = Field(default=None, max_length=128)
     mac_full_control: StrictBool | None = None
-    auto_allow: list[dict] | None = None
-    mcp_allow: list[str] | None = None
+    mac_id: uuid.UUID | None = None
+    auto_allow: list[dict] | None = Field(default=None, max_length=LIST_MAX)
+    mcp_allow: list[str] | None = Field(default=None, max_length=LIST_MAX)
     budget_daily_tokens: StrictInt | None = Field(default=None, ge=0, le=10**12)
+    proactive_interval_hours: StrictInt | None = Field(default=None, ge=1, le=720)
     max_turn_seconds: StrictInt | None = Field(default=None, ge=30, le=86400)
     auto_compact_percent: StrictInt | None = Field(default=None, ge=ctxlib.AUTO_COMPACT_MIN, le=ctxlib.AUTO_COMPACT_MAX)  # явный null выключает
 
@@ -908,16 +1093,28 @@ class BotPatch(Body):
         return check_auto_allow(value)
 
 
+class MacIn(Body):
+    name: str = Field(min_length=1, max_length=80)
+
+    @field_validator('name')
+    @classmethod
+    def nonblank_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError('name is empty')
+        return value
+
+
 class ThreadIn(Body):
-    bot_id: str
-    title: str = Field(default='', max_length=512)
-    kind: str = 'direct'
+    bot_id: str = Field(max_length=200)
+    title: str = Field(default='', max_length=200)
+    kind: Literal['direct'] = 'direct'
     dry_run: bool = False
 
 
 class TurnIn(Body):
     prompt: str = Field(max_length=256*1024)
-    client: str = 'api'
+    client: str = Field(default='api', max_length=CLIENT_MAX)
 
     @field_validator('client')
     @classmethod
@@ -939,8 +1136,8 @@ class CompactIn(Body):
 class ApprovalIn(Body):
     thread_id: uuid.UUID
     turn_id: uuid.UUID | None = None
-    risk: str
-    title: str = Field(max_length=512)
+    risk: str = Field(max_length=200)
+    title: str = Field(max_length=200)
     tool: str = Field(max_length=512)
     args: dict
 
@@ -953,9 +1150,9 @@ class ApprovalIn(Body):
 
 
 class DecisionIn(Body):
-    decision: str
+    decision: str = Field(max_length=200)
     remember: bool = False
-    client: str = 'api'
+    client: str = Field(default='api', max_length=CLIENT_MAX)
 
     @field_validator('client')
     @classmethod
@@ -982,7 +1179,7 @@ def client_datetime(value: datetime) -> datetime:
 
 class MemoryIn(Body):
     text: str = Field(max_length=16*1024)
-    bot_id: str | None = None
+    bot_id: str | None = Field(default=None, max_length=200)
     expires_at: datetime | None = None
 
     @field_validator('expires_at')
@@ -1008,11 +1205,11 @@ class UsageIn(Body):
 
 
 class ScheduleIn(Body):
-    bot_id: str
-    name: str = Field(max_length=512)
-    kind: str
-    cron: str | None = None
-    timezone: str = 'Europe/Moscow'
+    bot_id: str = Field(max_length=200)
+    name: str = Field(max_length=200)
+    kind: str = Field(max_length=64)
+    cron: str | None = Field(default=None, max_length=200)
+    timezone: str = Field(default='Europe/Moscow', max_length=TIMEZONE_MAX)
     prompt: str = Field(max_length=16*1024)
     enabled: bool = True
     catch_up: StrictBool = False  # раздел 16: один запуск после возобновления вместо пропущенных (только cron)
@@ -1025,7 +1222,7 @@ class ScheduleIn(Body):
 
 class WakeupIn(Body):
     """Раздел 17: ровно одно из `at` (ISO 8601) и `in_minutes`; длины prompt и reason проверяет wakeups.clean_*."""
-    at: str | None = None
+    at: str | None = Field(default=None, max_length=64)
     in_minutes: StrictInt | None = None
     prompt: str
     reason: str = ''
@@ -1034,9 +1231,31 @@ class WakeupIn(Body):
 
 class DelegateIn(Body):
     """Раздел 19: `bot` имя или id бота того же владельца, `turn_id` ход отправителя (для глубины), длину task проверяет delegation.clean_task."""
-    bot: str
+    bot: str = Field(max_length=200)
     task: str
     turn_id: uuid.UUID
+
+
+class GroupIn(Body):
+    """Раздел 21: границы title, bot_ids, max_rounds, token_budget проверяет group_chat (коды ошибок машинные)."""
+    title: str
+    bot_ids: list[Annotated[str, Field(max_length=200)]]
+    mode: Literal['round', 'debate', 'moderated']
+    max_rounds: StrictInt = gc.ROUNDS_DEFAULT
+    moderator_bot_id: str | None = Field(default=None, max_length=200)
+    token_budget: StrictInt | None = None
+
+
+class GroupPatchIn(Body):
+    title: str | None = None
+    mode: Literal['round', 'debate', 'moderated'] | None = None
+    max_rounds: StrictInt | None = None
+    moderator_bot_id: str | None = Field(default=None, max_length=200)
+    token_budget: StrictInt | None = None
+
+
+class GroupMessageIn(Body):
+    text: str
 
 
 class MacCallIn(Body):
@@ -1055,9 +1274,9 @@ class MacCallIn(Body):
 
 
 class PushIn(Body):
-    endpoint: str = Field(max_length=512)
+    endpoint: str = Field(max_length=2048)
     keys: dict
-    device: str = ''
+    device: str = Field(default='', max_length=DEVICE_MAX)
 
     @field_validator('device')
     @classmethod
@@ -1067,9 +1286,9 @@ class PushIn(Body):
     @field_validator('keys')
     @classmethod
     def keys_size(cls, value: dict) -> dict:
-        if any(not isinstance(key,str) or len(key)>512 or not isinstance(item,str) or len(item)>512
+        if any(not isinstance(key,str) or len(key)>256 or not isinstance(item,str) or len(item)>256
                for key,item in value.items()):
-            raise ValueError('keys exceeds 512 characters')
+            raise ValueError('keys exceeds 256 characters')
         return value
 
 
@@ -1091,7 +1310,7 @@ class BrowserCallIn(Body):
     url: str | None = Field(default=None, max_length=2048)
     result: str = Field(default='ok', pattern=r'^(ok|error)$')
     role: str | None = Field(default=None, pattern=r'^[A-Za-z][A-Za-z0-9-]{0,63}$')  # роль и имя элемента из snapshot: сырьё для процедур
-    name: str | None = None
+    name: str | None = Field(default=None, max_length=BROWSER_ELEMENT_NAME_MAX)
 
     @field_validator('role', mode='before')
     @classmethod
@@ -1115,7 +1334,7 @@ class PauseIn(Body):
 class ProcedureIn(Body):
     name: str
     description: str = ''
-    bot_id: str | None = None
+    bot_id: str | None = Field(default=None, max_length=200)
     params: list[dict] = []
     steps: list[dict] = []
 
@@ -1123,14 +1342,14 @@ class ProcedureIn(Body):
 class ProcedurePatch(Body):
     name: str | None = None
     description: str | None = None
-    bot_id: str | None = None
+    bot_id: str | None = Field(default=None, max_length=200)
     params: list[dict] | None = None
     steps: list[dict] | None = None
     status: str | None = Field(default=None, pattern=r'^(active|archived)$')
 
 
 class ProcedureImportIn(Body):
-    format: str | None = None
+    format: str | None = Field(default=None, max_length=200)
     name: str
     description: str = ''
     params: list[dict] = []
@@ -1144,7 +1363,7 @@ class ProcedureFromTurnIn(Body):
 
 
 class ProcedureRunIn(Body):
-    bot_id: str | None = None
+    bot_id: str | None = Field(default=None, max_length=200)
     thread_id: uuid.UUID | None = None
     params: dict = {}
 
@@ -1242,7 +1461,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             await con.execute('insert into bothub.usage(bot_id,thread_id,turn_id,provider,model,tokens_in,tokens_out,provider_id,model_id,tokens_cache_read,tokens_cache_write,turn_type) '
                 'values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)',bot_id,row['thread_id'],row['id'],row['provider'],model,
                 tokens_in,tokens_out,uuid.UUID(provider_id),model_id,cache_read,cache_write,row['turn_type'])
-            if row['turn_type'] != 'compact':  # ход сжатия невидим: расход считается, события в ленте нет
+            if row['turn_type'] not in ('compact', 'proactive'):  # служебные ходы считают расход без события в ленте
                 await append_event(con,row['thread_id'],row['id'],'usage','system',
                     {'provider':row['provider'],'model':model,'tokens_in':tokens_in,'tokens_out':tokens_out,
                      'tokens_cache_read':cache_read,'tokens_cache_write':cache_write,'status':status})
@@ -1276,6 +1495,8 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
     provider_checks: dict[uuid.UUID, asyncio.Task] = {}
     probe_slots: weakref.WeakValueDictionary[str, asyncio.Semaphore] = weakref.WeakValueDictionary()
     mac_socket: dict[str, WebSocket] = {}
+    mac_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+    mac_owner: dict[str, uuid.UUID] = {}
     mac_ready = asyncio.Event()
     app.state.setup_code = auth.new_token()
     app.state.dummy_password_hash = auth.hash_password('invalid-password-for-timing')
@@ -1297,6 +1518,12 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         screen = active_screen.get(bot_id)
         if screen:
             screen[0].put_nowait({WS_CLOSE: code})
+
+    async def close_owner_macs(owner_id: uuid.UUID) -> None:
+        for key, socket in tuple(mac_socket.items()):
+            if mac_owner.get(key) == owner_id:
+                with suppress(Exception):
+                    await socket.close(code=4401)
 
     def rate_limit(key: tuple[str, str], *, maximum=8, window=60):
         now = asyncio.get_running_loop().time()
@@ -1331,6 +1558,11 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
 
     async def setup_admin(con):
         return await con.fetchrow("select u.id,u.role,u.status from bothub.settings s join bothub.users u on u.id::text=(s.value #>> '{}') where s.key='setup_user_id' and u.role='admin' and u.status='active'")
+
+    async def pinned_legacy_mac(con, owner_id):
+        # The setting survives deletion; a missing or null pin never moves to another Mac.
+        return await con.fetchval("select m.id from bothub.settings s join bothub.macs m "
+            "on m.id::text=(s.value #>> '{}') where s.key='legacy_mac_id' and m.owner_id=$1",owner_id)
 
     def ws_token(ws: WebSocket) -> str:
         header = ws.headers.get('authorization')
@@ -1391,17 +1623,21 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             if legacy and (token_equals(token, os.getenv('OWNER_TOKEN')) or (not token and not cookie and via_owner_proxy(request.headers))):
                 row = await setup_admin(con)
                 who = {'kind':'user','user_id':row['id'],'role':'admin'} if row else None
-            elif legacy and token_equals(token, os.getenv('MAC_AGENT_TOKEN')):
-                row = await setup_admin(con)
-                who = {'kind':'mac','user_id':row['id'],'role':'member'} if row else None
             elif token.startswith('bot:') and os.getenv('BOT_TOKEN_SECRET'):
                 parts = token.split(':')
                 expected = hmac.new(os.environ['BOT_TOKEN_SECRET'].encode(), parts[1].encode(), hashlib.sha256).hexdigest() if len(parts) == 3 else ''
                 row = await con.fetchrow("select b.owner_id from bothub.bots b join bothub.users u on u.id=b.owner_id where b.id=$1 and u.status='active'",parts[1]) if len(parts)==3 and token_equals(parts[2],expected) else None
                 who = {'kind':'bot','user_id':row['owner_id'],'role':'member','bot_id':parts[1]} if row and row['owner_id'] else None
             elif token:
-                row = await con.fetchrow("select m.user_id from bothub.mac_tokens m join bothub.users u on u.id=m.user_id where m.token_hash=$1 and m.revoked_at is null and u.status='active'",auth.token_hash(token))
-                who = {'kind':'mac','user_id':row['user_id'],'role':'member'} if row else None
+                row = await con.fetchrow("select m.owner_id,m.id from bothub.macs m join bothub.users u on u.id=m.owner_id where m.token_hash=$1 and u.status='active'",auth.token_hash(token))
+                if row:
+                    who = {'kind':'mac','user_id':row['owner_id'],'mac_id':row['id'],'role':'member'}
+                elif legacy and token_equals(token, os.getenv('MAC_AGENT_TOKEN')):
+                    setup_owner = await setup_admin(con)
+                    mac_id = await pinned_legacy_mac(con,setup_owner['id']) if setup_owner else None
+                    who = {'kind':'mac','user_id':setup_owner['id'],'mac_id':mac_id,'role':'member'} if mac_id else None
+                else:
+                    who = None
             elif cookie:
                 row = await con.fetchrow("select s.user_id,s.expires_at,s.last_extended_at,u.role,u.status from bothub.sessions s join bothub.users u on u.id=s.user_id where s.id_hash=$1 and s.revoked_at is null",auth.token_hash(cookie))
                 if row and row['status']=='active' and row['expires_at']>datetime.now(NOW):
@@ -1558,7 +1794,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             events.append(await append_event(con, thread_id, turn_id, 'approval_dec', 'system', {'approval_id': str(approval['id']), 'decision': 'expired', 'remember': False, 'client': 'system'}, fanout=fanout))
         return events
 
-    async def fail_turn(turn_id, reason, kind=None, payload=None, *, stop_runner=True):
+    async def fail_turn(turn_id, reason, kind=None, payload=None, *, stop_runner=True, code=None, auth_provider_id=None, owner_id=None):
         """Закрывает активный turn как неудавшийся (в схеме статус failed = 'error', CHECK
         миграции 001 не расширяем): останавливает раннер, закрывает висящие approval turn'а,
         пишет событие kind (approval_expired, budget_exceeded, guard) и status, освобождая тред
@@ -1582,6 +1818,10 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             changed = await con.fetchval("update bothub.turns set status='error',error=$2,finished_at=now(),lease_until=null where id=$1 and status in ('running','waiting_approval','waiting_mac') returning id", turn_id, reason)
             if not changed:
                 return False
+            if code == CLI_AUTH_EXPIRED and auth_provider_id and owner_id:
+                await con.execute("update bothub.providers set status='needs_login',last_error=$3,last_check_at=now() "
+                                  "where id=$1 and owner_id=$2 and kind='cli_subscription' and status<>'disabled'",
+                                  auth_provider_id, owner_id, CLI_AUTH_MESSAGE)
             await con.execute("update bothub.bots set status=$2,stop_retry_exec_id=$3 where id=$1 and status not in ('no_model','error_starting')", row['bot_id'], 'error_starting' if stop_failed else 'error',str(turn_id) if stop_failed else None)
             await expire_turn_approvals(con, row['thread_id'], turn_id)
             if kind:
@@ -1589,8 +1829,11 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             if row['turn_type'] == 'compact':
                 await con.execute('update bothub.threads set turns_since_compact=0 where id=$1', row['thread_id'])
                 await append_event(con, row['thread_id'], turn_id, 'compact_failed', 'system', {'detail': str(reason)[:500]})
-            await append_event(con, row['thread_id'], turn_id, 'status', 'system', {'turn_id': str(turn_id), 'status': 'error'})
-            await outbox(con, f'turn:{turn_id}', {'turn_id': str(turn_id), 'status': 'error'})
+            status_payload = {'turn_id': str(turn_id), 'status': 'error'}
+            if code:
+                status_payload.update(code=code, detail=reason, provider_id=str(auth_provider_id) if auth_provider_id else None)
+            await append_event(con, row['thread_id'], turn_id, 'status', 'system', status_payload)
+            await outbox(con, f'turn:{turn_id}', status_payload)
             log.warning('turn_failed', extra={'turn_id': str(turn_id), 'thread_id': str(row['thread_id']), 'bot_id': row['bot_id'], 'reason': reason})
         if stop_runner:
             if stop_failed:
@@ -1714,6 +1957,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             if bot['provider_id'] and (not binding or binding['status']!='ok'):
                 raise RuntimeError('provider unavailable')
             compact = row['turn_type'] == 'compact'
+            proactive = row['turn_type'] == 'proactive'
             prompt = row['prompt']
             if not compact and thread['summary'] and not thread['cli_session_id']:
                 # Раздел 15: первый ход после сжатия начинает новую сессию CLI, сводка и последние сообщения идут в промпт.
@@ -1769,6 +2013,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                     log.exception('lease_renew_failed', extra={'turn_id': str(turn_id)})
         lease_task = asyncio.create_task(renew())
         masker = BrowserEventMasker()
+        slack_reply = False
 
         def repeated_error(event):
             """Три одинаковые ошибки инструмента подряд: ход останавливается (и обычный, и сжатия)."""
@@ -1782,7 +2027,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         try:
             async with asyncio.timeout(bot['max_turn_seconds']):
                 async for event in runner.run(context):
-                    if compact and event.kind == 'tool_call':
+                    if event.kind == 'tool_call' and (compact or (proactive and not sg.read_tool_allowed(event.payload.get('tool'), READ_ONLY_TOOLS))):
                         # Раздел 15: ход сжатия только пишет сводку. Любой вызов инструмента (раннер мог не получить запрета:
                         # у codex и agy его нет) немедленно останавливает ход; имя инструмента в событии, аргументов нет.
                         await stop_turn(turn_id, 'tool_call_refused', compact_failed={
@@ -1792,7 +2037,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                         event.payload = masker.event(event.kind, event.payload)
                     async with app.state.pool.acquire() as con:
                         await ping_turn(con, turn_id)
-                        if compact:
+                        if compact or proactive:
                             # Раздел 15: ход сжатия невидим. Текст ответа это сводка; событий в ленту нет, сессия CLI не
                             # меняется, расход пишется с типом compact. tool_result в ленту не пишется, но считается ниже
                             # в repeat_error.
@@ -1831,18 +2076,29 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             async with app.state.pool.acquire() as con:
                 if compact:
                     changed = await complete_compact(con, thread, bot, row, summary_parts)
+                elif proactive:
+                    async with con.transaction():
+                        changed = await con.fetchval("update bothub.turns set status='done',finished_at=now(),lease_until=null where id=$1 and status='running' returning id", turn_id)
+                        if changed:
+                            for suggestion in sg.parse_suggestions(''.join(summary_parts)):
+                                await con.execute('insert into bothub.suggestions(owner_id,bot_id,text) values($1,$2,$3)',
+                                                  bot['owner_id'], bot['id'], suggestion)
                 else:
                     changed = await con.fetchval("update bothub.turns set status='done',finished_at=now(),lease_until=null where id=$1 and status='running' returning id", turn_id)
                 if changed:
                     await con.execute("update bothub.bots set status='idle' where id=$1 and status<>'no_model'", bot['id'])
                     await append_event(con, thread['id'], turn_id, 'status', 'system', {'turn_id': str(turn_id), 'status':'done'})
-                    if not compact:
+                    if not compact and not proactive and not row.get('group_run_id'):  # реплика бота в обсуждении не шлёт push на каждый ход
                         await outbox(con, f'turn:{turn_id}', {'turn_id':str(turn_id), 'status':'done'})
                         try:
                             await schedule_auto_compact(con, thread['id'])
                         except Exception:
                             log.exception('auto_compact_failed', extra={'turn_id': str(turn_id)})
+                    slack_reply = not compact and row.get('client') == 'hook' and row.get('turn_type') == 'normal'
                     log.info('turn_done', extra={'turn_id': str(turn_id), 'bot_id': bot['id']})
+                    task = asyncio.create_task(_send_telegram_reply(turn_id))
+                    background.add(task)
+                    task.add_done_callback(background.discard)
                 elif await con.fetchval('select status from bothub.turns where id=$1', turn_id) in ('waiting_approval', 'waiting_mac'):
                     # Пункт 9: раннер завершился, пока turn ждал approval/mac: ответа уже некому
                     # ждать, а тред остался бы заблокированным.
@@ -1859,6 +2115,11 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             # codex и agy не спрашивают одобрение: чужой MCP-инструмент вне mcp_allow раннер увидел в потоке и убил процесс
             log.warning('mcp_not_allowed', extra={'turn_id': str(turn_id), 'bot_id': bot['id']})
             await fail_turn(turn_id, MCP_NOT_ALLOWED, 'guard', {'reason': MCP_NOT_ALLOWED, 'detail': refused_tool_name(exc.tool)})
+        except CliAuthExpired:
+            auth_provider_id = bot['provider_id'] if binding and binding['kind'] == 'cli_subscription' else None
+            await fail_turn(turn_id, CLI_AUTH_MESSAGE, 'guard',
+                            {'reason': CLI_AUTH_EXPIRED, 'detail': CLI_AUTH_MESSAGE},
+                            code=CLI_AUTH_EXPIRED, auth_provider_id=auth_provider_id, owner_id=bot['owner_id'])
         except Exception as exc:
             log.exception('turn_error', extra={'turn_id': str(turn_id), 'bot_id': bot['id']})
             # Пункт 9: закрываем turn и в waiting_approval/waiting_mac (раньше только в running).
@@ -1869,12 +2130,14 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         finally:
             lease_task.cancel()
             running.pop(str(turn_id), None)
+        return bot['provider'] if slack_reply else None
 
     async def run_turn(row):
         # Исключение вне try в execute_turn (например, упала БД на старте) не должно оставлять
         # turn в running до истечения lease: логируем и закрываем.
+        provider = None
         try:
-            await execute_turn(row)
+            provider = await execute_turn(row)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1886,6 +2149,15 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                 bot_id = await con.fetchval('select bot_id from bothub.threads where id=$1',row['thread_id'])
             if bot_id:
                 await recreate_pending_bot(bot_id)
+        if provider:
+            async def send_reply():
+                try:
+                    await deliver_slack_reply(row, provider)
+                except Exception:
+                    log.exception('slack_reply_failed', extra={'turn_id': str(row['id'])})
+            task = asyncio.create_task(send_reply())
+            background.add(task)
+            task.add_done_callback(background.discard)
 
     async def reap_turns():
         """Пункты 9 и 10, вызывается из claim_turn перед захватом.
@@ -1972,8 +2244,10 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
 
     async def worker_step():
         row = await app.state.claim_turn()
+        # обсуждения ботов (раздел 21) двигаются в том же цикле: после завершённого хода сразу следующий ход группы
+        progressed = await app.state.group_tick()
         if not row:
-            return False
+            return progressed
         task = asyncio.create_task(run_turn(row))
         background.add(task)  # сильная ссылка: иначе задачу может собрать GC
         task.add_done_callback(background.discard)
@@ -2003,10 +2277,10 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         await con.execute('insert into bothub.activity_log(owner_id,bot_id,thread_id,kind,code,params) values($1,$2,$3,$4,$5,$6::jsonb)',
                           owner_id, bot_id, thread_id, kind, code, canonical(params))
 
-    async def mac_online(con, owner_id) -> bool:
-        if str(owner_id) not in mac_socket:
+    async def mac_online(con, mac_id) -> bool:
+        if not mac_id or str(mac_id) not in mac_socket:
             return False
-        row = await con.fetchrow('select state,last_seen from bothub.mac_status where owner_id=$1 order by id limit 1', owner_id)
+        row = await con.fetchrow('select state,last_seen from bothub.mac_status where mac_id=$1 order by id limit 1', mac_id)
         return bool(row and row['state'] == 'online' and row['last_seen'] and row['last_seen'] >= datetime.now(NOW) - timedelta(seconds=90))
 
     async def trigger_block(con, bot_id):
@@ -2020,7 +2294,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         if reason:
             return reason
         if bot['executor'] == 'mac':
-            return activity.skip_reason(bot, provider_status=provider_status, mac_online=await mac_online(con, bot['owner_id']))
+            return activity.skip_reason(bot, provider_status=provider_status, mac_online=await mac_online(con, bot['mac_id']))
         if os.getenv('BOTHUB_RUNNER_EXEC', 'local') == 'docker' and app.state.launcher is not None:
             running_now = False
             if app.state.launcher_ready:
@@ -2198,6 +2472,44 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
 
     app.state.run_due_wakeups = run_due_wakeups
 
+    async def run_due_suggestions():
+        """Не запускаем служебный ход поверх занятого бота или при исчерпанном бюджете."""
+        async with app.state.pool.acquire() as con:
+            async with con.transaction():
+                bots = await con.fetch(
+                    "select b.* from bothub.bots b join bothub.users u on u.id=b.owner_id "
+                    "where b.proactive_interval_hours is not null and not b.paused and u.status='active' "
+                    "and (b.last_proactive_at is null or b.last_proactive_at + b.proactive_interval_hours * interval '1 hour' <= now()) "
+                    "and b.status not in ('starting','error_starting','no_model') "
+                    "and not exists (select 1 from bothub.turns t join bothub.threads th on th.id=t.thread_id "
+                    "where th.bot_id=b.id and t.status in ('queued','running','waiting_approval','waiting_mac')) "
+                    "order by b.created_at for update of b skip locked limit 10")
+                for bot in bots:
+                    if await budget_spent(con, bot['id']) >= bot['budget_daily_tokens']:
+                        continue
+                    if await trigger_block(con, bot['id']):
+                        continue
+                    recent = await con.fetch(
+                        "select e.payload->>'text' as text from bothub.events e join bothub.threads th on th.id=e.thread_id "
+                        "where th.bot_id=$1 and th.owner_id=$2 and e.kind in ('user_msg','assistant_msg','system') "
+                        "and e.payload ? 'text' order by e.ts desc limit 20", bot['id'], bot['owner_id'])
+                    prompt = sg.PROMPT + '\n\nПоследние события:\n' + '\n'.join(
+                        (row['text'] or '')[:500] for row in reversed(recent))
+                    thread_id = await con.fetchval(
+                        "select id from bothub.threads where bot_id=$1 and owner_id=$2 and kind='routine' "
+                        "and title='Подсказки' and status='active' order by created_at limit 1",
+                        bot['id'], bot['owner_id'])
+                    if thread_id is None:
+                        thread_id = await con.fetchval(
+                            "insert into bothub.threads(bot_id,kind,title,owner_id) values($1,'routine','Подсказки',$2) returning id",
+                            bot['id'], bot['owner_id'])
+                    await con.execute(
+                        "insert into bothub.turns(thread_id,prompt,client,turn_type) values($1,$2,'proactive','proactive')",
+                        thread_id, prompt)
+                    await con.execute('update bothub.bots set last_proactive_at=now() where id=$1', bot['id'])
+
+    app.state.run_due_suggestions = run_due_suggestions
+
     async def scheduler_tick():
         failure = None
         try:
@@ -2210,6 +2522,10 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             if failure is None:
                 raise
             log.exception('wakeups_failed')
+        try:
+            await app.state.run_due_suggestions()
+        except Exception:
+            log.exception('suggestions_failed')
         if failure is not None:
             raise failure
 
@@ -2676,6 +2992,14 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                 for table in ('bots','threads','memory','schedules','files','push_subscriptions','outbox','mac_status'):
                     await con.execute(f'update bothub.{table} set owner_id=$1 where owner_id is null',user['id'])
                     await con.execute(f'alter table bothub.{table} alter column owner_id set not null')
+                legacy_mac = await con.fetchrow('select info,last_seen from bothub.mac_status where owner_id=$1 and mac_id is null order by id limit 1',user['id'])
+                if legacy_mac:
+                    mac_id = await con.fetchval('insert into bothub.macs(owner_id,name,last_seen_at) values($1,$2,$3) returning id',
+                        user['id'], str(legacy_mac['info'].get('host') or 'Mac')[:80], legacy_mac['last_seen'])
+                    await con.execute('update bothub.mac_status set mac_id=$2 where owner_id=$1 and mac_id is null',user['id'],mac_id)
+                    await con.execute('update bothub.bots set mac_id=$2 where owner_id=$1 and mac_id is null',user['id'],mac_id)
+                await con.execute("insert into bothub.settings(key,value) values('legacy_mac_id',coalesce(to_jsonb($1::text),'null'::jsonb)) "
+                    "on conflict(key) do update set value=excluded.value",str(mac_id) if legacy_mac else None)
         app.state.setup_code = None
         app.state.has_users = True
         if not launcher_waiting():
@@ -2744,10 +3068,10 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                 if not auth.verify_password(old,old_password): error('unauthorized',401)
                 await con.execute('update bothub.users set password_hash=$2 where id=$1',who['user_id'],digest)
                 await revoke_user(con,who['user_id'])
-                await con.execute('update bothub.mac_tokens set revoked_at=now() where user_id=$1',who['user_id'])
-        socket=mac_socket.get(str(who['user_id']))
-        if socket:
-            with suppress(Exception): await socket.close(code=4401)
+                macs = await con.fetch('select id from bothub.macs where owner_id=$1',who['user_id'])
+                for mac in macs:
+                    await con.execute('update bothub.macs set token_hash=$2 where id=$1',mac['id'],auth.token_hash(auth.new_token()))
+        await close_owner_macs(who['user_id'])
         response=JSONResponse({'ok':True})
         response.delete_cookie('bothub_session',path=cookie_path())
         return response
@@ -2837,11 +3161,10 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                             thread_id = await con.fetchval("insert into bothub.threads(bot_id,kind,title,owner_id) values($1,'routine',$2,$3) returning id",schedule['bot_id'],schedule['name'],id)
                         await append_event(con,thread_id,event_turn_id,'schedule_paused','system',{'schedule_id':str(schedule['id']),'reason':'user_disabled','detail':'Пользователь отключён'})
                     await revoke_user(con,id)
-                    socket=mac_socket.get(str(id))
-                    if socket:
-                        with suppress(Exception): await socket.close(code=4401)
                 elif status=='active' and row['status']=='disabled':
                     await con.execute("update bothub.schedules set enabled=true,paused_by_disabled=false where owner_id=$1 and paused_by_disabled",id)
+        if status=='disabled':
+            await close_owner_macs(id)
         for turn_id in to_stop:
             try:
                 await stop_turn(turn_id, 'user_disabled')
@@ -2869,25 +3192,82 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             response.delete_cookie('bothub_session',path=cookie_path())
         return response
 
-    @app.post('/api/mac/token',status_code=201)
-    async def create_mac_token(request: Request):
-        who=await principal(request,owner=True)
-        token=auth.new_token()
+    def public_mac(row) -> dict:
+        mac = data(row)
+        mac['state'] = mac.get('state') or 'offline'
+        if str(row['id']) not in mac_socket or not row['last_seen_at'] or row['last_seen_at'] < datetime.now(NOW)-timedelta(seconds=90):
+            mac['state'] = 'offline'
+        return mac
+
+    @app.get('/api/macs')
+    async def list_macs(request: Request):
+        who = await principal(request, owner=True)
         async with app.state.pool.acquire() as con:
-            await con.execute('insert into bothub.mac_tokens(token_hash,user_id) values($1,$2) on conflict(user_id) do update set token_hash=$1,created_at=now(),revoked_at=null',auth.token_hash(token),who['user_id'])
-        socket=mac_socket.get(str(who['user_id']))
+            rows = await con.fetch(
+                'select m.id,m.name,m.last_seen_at,m.created_at,s.state from bothub.macs m '
+                'left join lateral (select state from bothub.mac_status where mac_id=m.id order by id limit 1) s on true '
+                'where m.owner_id=$1 order by m.created_at,m.id', who['user_id'])
+        return [public_mac(row) for row in rows]
+
+    @app.post('/api/macs', status_code=201)
+    async def add_mac(body: MacIn, request: Request):
+        who = await principal(request, owner=True)
+        token = auth.new_token()
+        async with app.state.pool.acquire() as con:
+            row = await con.fetchrow(
+                'insert into bothub.macs(owner_id,name,token_hash) values($1,$2,$3) '
+                'returning id,name,last_seen_at,created_at', who['user_id'], body.name, auth.token_hash(token))
+        return {**data(row), 'state':'offline', 'token':token}
+
+    @app.delete('/api/macs/{id}')
+    async def delete_mac(id: uuid.UUID, request: Request):
+        who = await principal(request, owner=True)
+        key = str(id)
+        async with mac_locks.setdefault(key, asyncio.Lock()):
+            async with app.state.pool.acquire() as con:
+                if not await con.fetchval('select 1 from bothub.macs where id=$1 and owner_id=$2', id, who['user_id']):
+                    error('not_found', 404)
+                socket = mac_socket.pop(key, None)
+                mac_owner.pop(key, None)
+                if not mac_socket: mac_ready.clear()
+                if socket:
+                    with suppress(Exception):
+                        await socket.close(code=4401)
+                for future in pending_mac.get(key,{}).values():
+                    if not future.done(): future.set_exception(ConnectionError('Mac removed'))
+                await con.execute('delete from bothub.macs where id=$1 and owner_id=$2', id, who['user_id'])
+        return {'ok':True}
+
+    @app.post('/api/mac/token', status_code=201)
+    async def create_mac_token(request: Request):
+        # Старый маршрут обновляет первый Mac владельца для уже установленных агентов.
+        who = await principal(request, owner=True)
+        token = auth.new_token()
+        async with app.state.pool.acquire() as con:
+            async with con.transaction():
+                await con.execute('select pg_advisory_xact_lock(hashtext($1))', str(who['user_id']))
+                mac_id = await con.fetchval('select id from bothub.macs where owner_id=$1 order by created_at,id limit 1', who['user_id'])
+                if mac_id:
+                    await con.execute('update bothub.macs set token_hash=$2 where id=$1', mac_id, auth.token_hash(token))
+                else:
+                    mac_id = await con.fetchval("insert into bothub.macs(owner_id,name,token_hash) values($1,'Mac',$2) returning id", who['user_id'], auth.token_hash(token))
+        socket = mac_socket.get(str(mac_id))
         if socket:
-            with suppress(Exception): await socket.close(code=4401)
+            with suppress(Exception):
+                await socket.close(code=4401)
         return {'token':token}
 
     @app.delete('/api/mac/token')
     async def revoke_mac_token(request: Request):
-        who=await principal(request,owner=True)
+        who = await principal(request, owner=True)
         async with app.state.pool.acquire() as con:
-            await con.execute('update bothub.mac_tokens set revoked_at=now() where user_id=$1',who['user_id'])
-        socket=mac_socket.get(str(who['user_id']))
+            mac_id = await con.fetchval('select id from bothub.macs where owner_id=$1 order by created_at,id limit 1', who['user_id'])
+            if mac_id:
+                await con.execute('update bothub.macs set token_hash=$2 where id=$1', mac_id, auth.token_hash(auth.new_token()))
+        socket = mac_socket.get(str(mac_id)) if mac_id else None
         if socket:
-            with suppress(Exception): await socket.close(code=4401)
+            with suppress(Exception):
+                await socket.close(code=4401)
         return {'ok':True}
 
     def public_provider(row):
@@ -2897,16 +3277,22 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         return {**jsonable_encoder(item), 'has_secret': has_secret}
 
     async def sync_models(con, provider_id, names):
+        windows = getattr(names, 'context_windows', None) or {}
+        pricing = getattr(names, 'model_pricing', None) or {}
         names = tuple(dict.fromkeys(str(n) for n in names if isinstance(n,str) and n))[:500]
         for name in names:
             await con.execute('insert into bothub.models(provider_id,name) values($1,$2) '
                 'on conflict(provider_id,name) do update set enabled=not models.manually_disabled',provider_id,name)
         await con.execute('update bothub.models set enabled=false where provider_id=$1 and not (name=any($2::text[]))',provider_id,list(names))
-        windows = getattr(names, 'context_windows', None) or {}
         if windows:
             known = set(names)
             await con.executemany('update bothub.models set context_window=$3 where provider_id=$1 and name=$2',
                                   [(provider_id, name, window) for name, window in windows.items() if name in known])
+        if pricing:
+            known = set(names)
+            await con.executemany(
+                'update bothub.models set price_in_per_mtok=$3, price_out_per_mtok=$4 where provider_id=$1 and name=$2',
+                [(provider_id, name, pin, pout) for name, (pin, pout) in pricing.items() if name in known])
 
     async def check_provider_record(provider_id, owner_id, force=False):
         async with app.state.pool.acquire() as con:
@@ -2915,7 +3301,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         if row['status'] in ('disabled','pending_admin'):  # pending_admin: приватный адрес без одобрения админа не опрашиваем
             return public_provider(row)
         cooldown = AGY_CHECK_COOLDOWN if row['cli']=='agy' else PROVIDER_CHECK_COOLDOWN
-        if row['status']=='error':
+        if row['status'] in ('error','needs_login'):
             cooldown = min(cooldown, 30)
         if force: cooldown = min(cooldown, PROVIDER_FORCE_COOLDOWN)  # force обходит кэш, но не чаще раза в несколько секунд
         if row['last_check_at'] and datetime.now(NOW)-row['last_check_at']<timedelta(seconds=cooldown):
@@ -2976,7 +3362,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             # Одобренный адрес сменился: флаг не снимаем, провайдер ждёт повторного одобрения администратором.
             status,last_error=('pending_admin' if exc.reapproval else 'error'),str(exc)[:300]
         except Exception as exc:
-            status,last_error='error',(str(exc) or exc.__class__.__name__)[:300]
+            status,last_error=('needs_login' if row['status']=='needs_login' and row['kind']=='cli_subscription' else 'error'),(str(exc) or exc.__class__.__name__)[:300]
         async with app.state.pool.acquire() as con:
             async with con.transaction():
                 current = await con.fetchrow('select * from bothub.providers where id=$1 and owner_id=$2 for update',provider_id,owner_id)
@@ -3800,10 +4186,6 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             error('invalid', 400, 'body is not valid JSON')
         if not isinstance(doc, dict):
             error('invalid', 422, 'body: type: must be an object')
-        try:
-            check_json_text(doc)  # NUL и непарные суррогаты asyncpg превращает в 500: здесь 422 без значения
-        except Unprocessable as exc:
-            error('invalid', 422, str(exc))
         ids = {}
         for key in ('provider_id', 'model_id'):
             value = doc.pop(key, None)
@@ -3819,21 +4201,9 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             error('invalid', 400, 'provider_id and model_id must be set together')
         provider_id, model_id = ids.get('provider_id'), ids.get('model_id')
         try:
-            parsed = parse_bot_template(doc)
+            parsed, checked_procedures = validate_bot_template(doc)
         except BotTemplateError as exc:
             error('invalid', 422, str(exc))
-        checked_procedures = []
-        for index, raw_proc in enumerate(parsed['procedures']):
-            if not isinstance(raw_proc, dict):
-                error('invalid', 422, f'procedures[{index}]: body: type: must be an object')
-            if not raw_proc.get('steps'):  # parse_import молча подставил бы []: в файле шаблона шаги обязательны
-                error('invalid', 422, f'procedures[{index}]: steps: is required')
-            try:
-                proc_parsed = procedures.parse_import(raw_proc)
-                params, steps = procedures.normalize_procedure(proc_parsed['params'], proc_parsed['steps'], strict_risk=False)
-            except procedures.ProcedureError as exc:
-                error('invalid', 422, f'procedures[{index}]: {exc}')
-            checked_procedures.append((proc_parsed['name'], proc_parsed['description'], params, steps))
         fields = {
             'name': parsed['name'],
             # Без выбранной модели бот создаётся «без модели» (как бот, у которого удалили провайдера): ход не
@@ -3849,6 +4219,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             'mcp_allow': parsed['mcp_allow'],
             'budget_daily_tokens': parsed['budget_daily_tokens'],
             'auto_compact_percent': parsed['auto_compact_percent'],
+            'proactive_interval_hours': parsed['proactive_interval_hours'],
             'mac_full_control': False,
         }
         starts_container = os.getenv('BOTHUB_RUNNER_EXEC', 'local') == 'docker' and bool(provider_id)  # без модели компьютер не нужен
@@ -3897,6 +4268,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             'mcp_allow': list(bot['mcp_allow'] or []),
             'budget_daily_tokens': bot['budget_daily_tokens'],
             'auto_compact_percent': bot['auto_compact_percent'],
+            'proactive_interval_hours': bot['proactive_interval_hours'],
             'schedules': [{
                 'cron': s['cron'],
                 'timezone': s['timezone'],
@@ -3906,6 +4278,27 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             } for s in schedules],
             'procedures': [procedures.export_document(row) for row in procedures_rows],
         }
+        return doc
+
+    @app.get('/api/templates/catalog')
+    async def list_catalog(request: Request):
+        """Карточки шаблонов из templates/*.json для вошедшего пользователя."""
+        await principal(request, owner=True)
+        return _load_catalog_entries()
+
+    @app.get('/api/templates/catalog/{id}')
+    async def get_catalog_template(id: str, request: Request):
+        """Полный документ шаблона по имени файла без .json."""
+        await principal(request, owner=True)
+        if not BOT_TEMPLATE_CATALOG_ID.fullmatch(id):
+            error('not_found', 404)
+        root = _catalog_templates_dir()
+        if not root:
+            error('not_found', 404)
+        try:
+            doc, _ = _read_catalog_template(root, root / f'{id}.json')
+        except (OSError, ValueError, RecursionError):
+            error('not_found', 404)
         return doc
 
     async def require_checker_model(con, owner_id, model_id):
@@ -3919,6 +4312,8 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         status starting, подбор свободного id. Расписание и запуск контейнера остаются за вызывающим."""
         fields['owner_id'] = who['user_id']
         fields['provider_id'], fields['model_id'] = provider_id, model_id
+        if fields.get('mac_id') and not await con.fetchval('select 1 from bothub.macs where id=$1 and owner_id=$2', fields['mac_id'], who['user_id']):
+            error('not_found', 404)
         if fields.get('checker_model_id'):
             await require_checker_model(con, who['user_id'], fields['checker_model_id'])
         if provider_id:
@@ -3974,41 +4369,47 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         fields = patch.model_dump(exclude_unset=True)
         if not fields:
             error('invalid')
+        if not auth.is_clean_text(id):
+            error('invalid',400)
         if 'provider' in fields:
             if fields.get('provider_id') is None: check_provider(fields['provider'])
         async with app.state.pool.acquire() as con:
-            old=await con.fetchrow('select * from bothub.bots where id=$1 and owner_id=$2',id,who['user_id'])
-            if not old: error('not_found',404)
-            if fields.get('checker_model_id'):
-                await require_checker_model(con,who['user_id'],fields['checker_model_id'])
-            if old['provider_id'] and ('provider' in fields or 'model' in fields) and 'provider_id' not in fields and 'model_id' not in fields:
-                error('invalid',400,'change provider_id and model_id together')
-            if 'provider_id' in fields or 'model_id' in fields:
-                provider_id=fields.get('provider_id',old['provider_id'])
-                model_id=fields.get('model_id',old['model_id'])
-                if bool(provider_id)!=bool(model_id): error('invalid')
-                if provider_id:
-                    binding=await con.fetchrow('select p.kind,p.cli,p.status,m.name from bothub.providers p join bothub.models m on m.provider_id=p.id and m.id=$3 and m.enabled=true where p.id=$1 and p.owner_id=$2',provider_id,who['user_id'],model_id)
-                    if not binding or binding['status']!='ok': error('invalid',400,'provider/model unavailable')
-                    fields['provider']=runner_provider(binding['kind'],binding['cli'])
-                    fields['model']=binding['name']
-                    fields['registry_bound']=True
-                else:
-                    if old['provider_id']:
-                        error('invalid',400,'bound bot cannot be unbound')
-                    check_provider(fields.get('provider',old['provider']))
-                if provider_id!=old['provider_id'] or model_id!=old['model_id']:
-                    fields['provider_id']=provider_id; fields['model_id']=model_id
-                    if provider_id and old['status']=='no_model':
-                        fields['status']='idle'
-            binding_change = any(key in fields and fields[key] != old[key]
-                                 for key in ('provider_id','model_id','provider','model'))
-            vals = [canonical(v) if k in ('auto_allow','mcp_allow') else v for k,v in fields.items()]
-            sets = ','.join(f'{k}=${i+2}'+('::jsonb' if k in ('auto_allow','mcp_allow') else '') for i,k in enumerate(fields))
             async with con.transaction():
+                if any(key in fields for key in ('provider_id','model_id','provider','model','mac_id')):
+                    # claim_turn/resume_turn take this lock before updating the bot row.
+                    await con.execute("select pg_advisory_xact_lock(hashtext('bothub-claim-turn'))")
+                old=await con.fetchrow('select * from bothub.bots where id=$1 and owner_id=$2 for update',id,who['user_id'])
+                if not old: error('not_found',404)
+                if fields.get('mac_id') and not await con.fetchval('select 1 from bothub.macs where id=$1 and owner_id=$2', fields['mac_id'], who['user_id']):
+                    error('not_found',404)
+                if fields.get('checker_model_id'):
+                    await require_checker_model(con,who['user_id'],fields['checker_model_id'])
+                if old['provider_id'] and ('provider' in fields or 'model' in fields) and 'provider_id' not in fields and 'model_id' not in fields:
+                    error('invalid',400,'change provider_id and model_id together')
+                if 'provider_id' in fields or 'model_id' in fields:
+                    provider_id=fields.get('provider_id',old['provider_id'])
+                    model_id=fields.get('model_id',old['model_id'])
+                    if bool(provider_id)!=bool(model_id): error('invalid')
+                    if provider_id:
+                        binding=await con.fetchrow('select p.kind,p.cli,p.status,m.name from bothub.providers p join bothub.models m on m.provider_id=p.id and m.id=$3 and m.enabled=true where p.id=$1 and p.owner_id=$2',provider_id,who['user_id'],model_id)
+                        if not binding or binding['status']!='ok': error('invalid',400,'provider/model unavailable')
+                        fields['provider']=runner_provider(binding['kind'],binding['cli'])
+                        fields['model']=binding['name']
+                        fields['registry_bound']=True
+                    else:
+                        if old['provider_id']:
+                            error('invalid',400,'bound bot cannot be unbound')
+                        check_provider(fields.get('provider',old['provider']))
+                    if provider_id!=old['provider_id'] or model_id!=old['model_id']:
+                        fields['provider_id']=provider_id; fields['model_id']=model_id
+                        if provider_id and old['status']=='no_model':
+                            fields['status']='idle'
+                binding_change = any(key in fields and fields[key] != old[key]
+                                     for key in ('provider_id','model_id','provider','model','mac_id'))
+                vals = [canonical(v) if k in ('auto_allow','mcp_allow') else v for k,v in fields.items()]
+                sets = ','.join(f'{k}=${i+2}'+('::jsonb' if k in ('auto_allow','mcp_allow') else '') for i,k in enumerate(fields))
                 if binding_change:
                     # Serialize with claim_turn/resume_turn so a new active turn cannot race this check.
-                    await con.execute("select pg_advisory_xact_lock(hashtext('bothub-claim-turn'))")
                     active = await con.fetchval(
                         "select exists(select 1 from bothub.turns t join bothub.threads th on th.id=t.thread_id "
                         "where th.bot_id=$1 and th.owner_id=$2 "
@@ -4152,11 +4553,34 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         page, next_cursor = activity.merge_page(groups, size, cursor)
         return activity.finish_page(page, next_cursor)
 
+    @app.get('/api/activity/export.csv')
+    async def activity_export_csv(request: Request, days: str | None = None):
+        who = await principal(request, owner=True)
+        try:
+            period = activity.parse_export_days(days)
+        except activity.ActivityError:
+            error('invalid', 422, 'days')
+        since = datetime.now(NOW) - timedelta(days=period)
+        groups = []
+        async with app.state.pool.acquire() as con:
+            bot_names = {row['id']: row['name'] for row in await con.fetch(
+                'select id,name from bothub.bots where owner_id=$1', who['user_id'])}
+            for source in activity.sources_for(None):
+                extra = (activity.log_kinds_for(None),) if source == 'log' else ()
+                rows = await con.fetch(activity.SQL[source], who['user_id'], None, None, None,
+                                       activity.CSV_MAX_ROWS + 1, *extra)
+                groups.append([activity.build_item(source, row) for row in rows])
+        rows = [row for group in groups for row in group if row['at'] >= since]
+        rows.sort(key=activity.sort_key, reverse=True)
+        body = activity.build_csv(rows[:activity.CSV_MAX_ROWS], bot_names)
+        return Response(body, media_type='text/csv; charset=utf-8',
+                        headers={'Content-Disposition': 'attachment; filename="activity.csv"'})
+
     @app.get('/api/threads')
     async def threads(request: Request, bot_id: str | None = None, status: str | None = None):
         who = await principal(request, owner=True)
         async with app.state.pool.acquire() as con:
-            return [thread_view(r) for r in await con.fetch('select * from bothub.threads where owner_id=$3 and ($1::text is null or bot_id=$1) and ($2::text is null or status=$2) order by last_seq desc,created_at desc', bot_id,status,who['user_id'])]
+            return [thread_view(r) for r in await con.fetch('select * from bothub.threads where owner_id=$3 and kind not in (\'group\',\'group_bot\') and ($1::text is null or bot_id=$1) and ($2::text is null or status=$2) order by last_seq desc,created_at desc', bot_id,status,who['user_id'])]
 
     @app.get('/api/threads/{id}')
     async def get_thread(id: uuid.UUID, request: Request):
@@ -4190,12 +4614,52 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         async with app.state.pool.acquire() as con:
             thread = await own_thread(con,id,who)
             if thread['status'] != 'active': error('conflict',409)
+            if thread['kind'] in ('group','group_bot'): error('conflict',409,'group_thread')  # ходы группы создаёт только обсуждение
             await require_available_bot(con,thread['bot_id'])
             turn = await create_turn(con,id,body.prompt,body.client)
             if await con.fetchval('select paused from bothub.bots where id=$1',thread['bot_id']):
                 # Раздел 16: сообщение принято и ждёт возобновления; одно системное событие на turn
                 await append_event(con,id,uuid.UUID(turn['id']),'system','system',{'text':activity.BOT_PAUSED_TEXT,'code':'bot_paused'})
             return turn
+
+    @app.get('/api/suggestions')
+    async def list_suggestions(request: Request):
+        who = await principal(request, owner=True)
+        async with app.state.pool.acquire() as con:
+            return [data(row) for row in await con.fetch(
+                "select id,owner_id,bot_id,text,status,created_at from bothub.suggestions "
+                "where owner_id=$1 and status='proposed' order by created_at desc limit 100", who['user_id'])]
+
+    @app.post('/api/suggestions/{id}/accept')
+    async def accept_suggestion(id: uuid.UUID, request: Request):
+        who = await principal(request, owner=True)
+        async with app.state.pool.acquire() as con:
+            async with con.transaction():
+                suggestion = await con.fetchrow(
+                    "select * from bothub.suggestions where id=$1 and owner_id=$2 for update", id, who['user_id'])
+                if not suggestion: error('not_found',404)
+                if suggestion['status'] != 'proposed': error('conflict',409)
+                await require_available_bot(con, suggestion['bot_id'])
+                thread_id = await con.fetchval(
+                    "select id from bothub.threads where bot_id=$1 and owner_id=$2 and kind='direct' "
+                    "and status='active' order by created_at desc limit 1", suggestion['bot_id'], who['user_id'])
+                if thread_id is None:
+                    thread_id = await con.fetchval(
+                        "insert into bothub.threads(bot_id,kind,title,owner_id) values($1,'direct',$2,$3) returning id",
+                        suggestion['bot_id'], 'Подсказка', who['user_id'])
+                turn = await create_turn(con, thread_id, suggestion['text'], 'api')
+                await con.execute("update bothub.suggestions set status='accepted' where id=$1", id)
+                return turn
+
+    @app.post('/api/suggestions/{id}/dismiss')
+    async def dismiss_suggestion(id: uuid.UUID, request: Request):
+        who = await principal(request, owner=True)
+        async with app.state.pool.acquire() as con:
+            row = await con.fetchval(
+                "update bothub.suggestions set status='dismissed' where id=$1 and owner_id=$2 "
+                "and status='proposed' returning id", id, who['user_id'])
+        if not row: error('not_found',404)
+        return {'ok': True}
 
     @app.post('/api/threads/{id}/compact')
     async def compact_thread(id: uuid.UUID, request: Request, body: CompactIn | None = None):
@@ -4466,6 +4930,9 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             if body.turn_id:
                 turn_type = await con.fetchval('select t.turn_type from bothub.turns t join bothub.threads th on th.id=t.thread_id where t.id=$1 and t.thread_id=$2 and th.owner_id=$3',body.turn_id,body.thread_id,who['user_id'])
                 if turn_type is None: error('not_found',404)
+            if turn_type == 'proactive':
+                # Запрет до создания approval: владелец никогда не получает запрос на запись.
+                error('forbidden', 403, 'read_only_turn')
             if turn_type == 'compact':
                 # Раздел 15: ход сжатия инструментов не вызывает, значит и подтверждений не просит: ход останавливается,
                 # подтверждение не создаётся (ни владельцу, ни в ленту).
@@ -4656,10 +5123,15 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             except (ValueError,TypeError):
                 error('invalid',422,'days')
         async with app.state.pool.acquire() as con:
+            price_join = ("left join bothub.models m on m.id=u.model_id or "
+                          "(u.model_id is null and m.provider_id=coalesce(u.provider_id,b.provider_id) and m.name=u.model) ")
+            cost_sql = ("(coalesce(m.price_in_per_mtok,0)*(u.tokens_in::numeric+u.tokens_cache_read::numeric+u.tokens_cache_write::numeric)"
+                        "+coalesce(m.price_out_per_mtok,0)*u.tokens_out::numeric)/1000000")
             bot_rows = await con.fetch(
                 "select b.id bot_id,b.budget_daily_tokens budget,"
                 "coalesce(sum(u.tokens_in::bigint+u.tokens_out::bigint+u.tokens_cache_read::bigint+u.tokens_cache_write::bigint) filter(where u.ts>=date_trunc('day',now())),0)::bigint tokens_today,"
                 "coalesce(sum(u.tokens_in::bigint+u.tokens_out::bigint+u.tokens_cache_read::bigint+u.tokens_cache_write::bigint) filter(where u.ts>=date_trunc('day',now()-($2::int-1)*interval '1 day')),0)::bigint tokens_period,"
+                "coalesce(sum(u.tokens_in::bigint+u.tokens_out::bigint+u.tokens_cache_read::bigint+u.tokens_cache_write::bigint) filter(where u.ts>=date_trunc('month',now())),0)::bigint tokens_month,"
                 "max(u.ts) last_activity "
                 "from bothub.bots b left join bothub.usage u on u.bot_id=b.id where b.owner_id=$1 group by b.id,b.budget_daily_tokens order by b.created_at,b.id",
                 who['user_id'],days)
@@ -4670,8 +5142,12 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                 "coalesce(sum(u.tokens_cache_read::bigint),0)::bigint tokens_cache_read,"
                 "coalesce(sum(u.tokens_cache_write::bigint),0)::bigint tokens_cache_write,"
                 "coalesce(sum(u.tokens_in::bigint+u.tokens_out::bigint+u.tokens_cache_read::bigint+u.tokens_cache_write::bigint),0)::bigint total_tokens,"
-                "count(distinct coalesce(u.turn_id::text,'u:'||u.id::text))::int turns "
+                "count(distinct coalesce(u.turn_id::text,'u:'||u.id::text))::int turns,"
+                f"sum({cost_sql}) raw_cost,"
+                "bool_or(m.price_in_per_mtok is not null or m.price_out_per_mtok is not null) has_price,"
+                "bool_or(m.price_in_per_mtok is null and m.price_out_per_mtok is null) missing_price "
                 "from bothub.usage u join bothub.bots b on b.id=u.bot_id "
+                + price_join +
                 "where b.owner_id=$1 and u.ts>=date_trunc('day',now()-($2::int-1)*interval '1 day') "
                 "group by u.provider,u.model order by total_tokens desc,u.provider,u.model",
                 who['user_id'],days)
@@ -4686,11 +5162,93 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                 who['user_id'],days)
             providers = await con.fetch('select distinct provider from bothub.bots where owner_id=$1 order by provider',who['user_id'])
             total_tokens = sum(r['total_tokens'] for r in daily_rows)
+            # Compute cost per model row
+            def model_cost(row):
+                if not row['has_price']:
+                    return None
+                return round(float(row['raw_cost']), 4)
+
+            def _window_cost(row, column, missing_column):
+                """Стоимость окна: None, если в нём есть расход без цены или нет расхода."""
+                if row[column] is None or row[missing_column]:
+                    return None
+                return round(float(row[column]), 4)
+
+            def model_cost_today(row):
+                return _window_cost(row, 'raw_cost_today', 'missing_price_today')
+
+            def model_cost_month(row):
+                return _window_cost(row, 'raw_cost_month', 'missing_price_month')
+            model_list = []
+            model_costs = []
+            for r in model_rows:
+                d = data(r)
+                for key in ('raw_cost', 'has_price', 'missing_price'):
+                    d.pop(key)
+                d['cost_usd'] = model_cost(r)
+                model_list.append(d)
+                model_costs.append(d['cost_usd'])
+            # Per-bot cost uses the same historical prices, grouped by bot and model.
+            bot_model_rows = await con.fetch(
+                "select u.provider,u.model,b.id bot_id,"
+                "coalesce(sum(u.tokens_in::bigint),0)::bigint tokens_in,"
+                "coalesce(sum(u.tokens_out::bigint),0)::bigint tokens_out,"
+                "coalesce(sum(u.tokens_cache_read::bigint),0)::bigint tokens_cache_read,"
+                "coalesce(sum(u.tokens_cache_write::bigint),0)::bigint tokens_cache_write,"
+                f"sum({cost_sql}) filter(where u.ts>=date_trunc('day',now()-($2::int-1)*interval '1 day')) raw_cost,"
+                f"sum({cost_sql}) filter(where u.ts>=date_trunc('day',now())) raw_cost_today,"
+                f"sum({cost_sql}) filter(where u.ts>=date_trunc('month',now())) raw_cost_month,"
+                "bool_or(m.price_in_per_mtok is null and m.price_out_per_mtok is null) filter(where u.ts>=date_trunc('day',now()-($2::int-1)*interval '1 day')) missing_price_period,"
+                "bool_or(m.price_in_per_mtok is null and m.price_out_per_mtok is null) filter(where u.ts>=date_trunc('day',now())) missing_price_today,"
+                "bool_or(m.price_in_per_mtok is null and m.price_out_per_mtok is null) filter(where u.ts>=date_trunc('month',now())) missing_price_month "
+                "from bothub.usage u join bothub.bots b on b.id=u.bot_id "
+                + price_join +
+                "where b.owner_id=$1 and u.ts>=least(date_trunc('day',now()-($2::int-1)*interval '1 day'),date_trunc('month',now())) "
+                "group by b.id,u.provider,u.model",
+                who['user_id'],days)
+            # Build bot_id -> суммы известных стоимостей за период, сегодня и месяц + флаги окон с расходом без цены.
+            # Сегодня и месяц всегда считаем, чтобы панель «Квоты» у бота показывала их при любом days.
+            bot_cost_map: dict[str, dict] = {
+                r['bot_id']: {'period': 0.0, 'today': 0.0, 'month': 0.0,
+                              'period_partial': False, 'today_partial': False, 'month_partial': False}
+                for r in bot_rows
+            }
+            for br in bot_model_rows:
+                bid = br['bot_id']
+                entry = bot_cost_map[bid]
+                cost_period = _window_cost(br, 'raw_cost', 'missing_price_period')
+                if cost_period is not None:
+                    entry['period'] += cost_period
+                elif br['raw_cost'] is not None:
+                    entry['period_partial'] = True
+                cost_today = model_cost_today(br)
+                if cost_today is not None:
+                    entry['today'] += cost_today
+                elif br['raw_cost_today'] is not None:
+                    entry['today_partial'] = True
+                cost_month = model_cost_month(br)
+                if cost_month is not None:
+                    entry['month'] += cost_month
+                elif br['raw_cost_month'] is not None:
+                    entry['month_partial'] = True
+            bot_list = []
+            for r in bot_rows:
+                d = data(r)
+                bid = d['bot_id']
+                entry = bot_cost_map[bid]
+                d['cost_usd'] = round(entry['period'], 4) if not entry['period_partial'] else None
+                d['cost_usd_today'] = round(entry['today'], 4) if not entry['today_partial'] else None
+                d['cost_usd_month'] = round(entry['month'], 4) if not entry['month_partial'] else None
+                bot_list.append(d)
+            top_cost = sum(c for c in model_costs if c is not None)
+            cost_partial = any(r['missing_price'] for r in model_rows)
             return {
                 'days': days,
                 'total_tokens': total_tokens,
-                'bots': [data(r) for r in bot_rows],
-                'models': [data(r) for r in model_rows],
+                'cost_usd_total': round(top_cost, 4) if top_cost else 0.0,
+                'cost_partial': cost_partial,
+                'bots': bot_list,
+                'models': model_list,
                 'daily': [data(r) for r in daily_rows],
                 'providers': [{'provider':r['provider'],'pct_week':None,'reset_at':None} for r in providers]
             }
@@ -4720,29 +5278,48 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         try: next_at = next_run(body.cron,body.timezone) if body.kind=='cron' else None
         except (ValueError,KeyError): error('invalid')
         async with app.state.pool.acquire() as con:
-            row=await con.fetchrow('insert into bothub.schedules(bot_id,name,kind,cron,timezone,prompt,hook_token,enabled,next_run_at,owner_id,catch_up) select id,$2,$3,$4,$5,$6,$7,$8,$9,owner_id,$11 from bothub.bots where id=$1 and owner_id=$10 returning *',body.bot_id,body.name,body.kind,body.cron,body.timezone,body.prompt,secrets.token_urlsafe(32) if body.kind=='hook' else None,body.enabled,next_at,who['user_id'],body.catch_up)
+            row=await con.fetchrow('insert into bothub.schedules(bot_id,name,kind,cron,timezone,prompt,hook_token,email_route_token,enabled,next_run_at,owner_id,catch_up) select id,$2,$3,$4,$5,$6,$7,$12,$8,$9,owner_id,$11 from bothub.bots where id=$1 and owner_id=$10 returning *',body.bot_id,body.name,body.kind,body.cron,body.timezone,body.prompt,secrets.token_urlsafe(32) if body.kind=='hook' else None,body.enabled,next_at,who['user_id'],body.catch_up,secrets.token_urlsafe(32) if body.kind=='hook' else None)
             if not row: error('not_found',404)
             return schedule_data(row)
 
     @app.patch('/api/schedules/{id}')
     async def edit_schedule(id: uuid.UUID, request: Request, body: JsonObject):
         who = await principal(request,owner=True)
-        if not body or set(body)-{'enabled','cron','prompt','catch_up','slack_signing_secret'}: error('invalid')
-        if 'slack_signing_secret' in body and body['slack_signing_secret'] is not None and (not isinstance(body['slack_signing_secret'],str) or not body['slack_signing_secret'].strip() or len(body['slack_signing_secret'])>256): error('invalid',400,'slack_signing_secret')
+        if not body or set(body)-{'enabled','cron','prompt','catch_up','slack_signing_secret','slack_bot_token','email_signing_key'}: error('invalid')
+        for secret_field in ('slack_signing_secret','slack_bot_token','email_signing_key'):
+            if secret_field in body and body[secret_field] is not None and (not isinstance(body[secret_field],str) or not body[secret_field].strip() or len(body[secret_field])>256): error('invalid',400,secret_field)
+        if 'slack_bot_token' in body and body['slack_bot_token'] is not None and not auth.is_clean_text(body['slack_bot_token']): error('invalid',400,'slack_bot_token')
         if 'catch_up' in body and not isinstance(body['catch_up'],bool): error('invalid',400,'catch_up')
         if 'prompt' in body and (not isinstance(body['prompt'],str) or len(body['prompt'])>512): error('invalid',400,'prompt')
+        token_set = 'slack_bot_token' in body
+        if token_set and body['slack_bot_token'] is not None:
+            async with app.state.pool.acquire() as con:
+                prior = await con.fetchrow('select kind from bothub.schedules where id=$1 and owner_id=$2',id,who['user_id'])
+            if not prior: error('not_found',404)
+            if prior['kind']!='hook': error('invalid',400,'slack_bot_token')
+            try:
+                team_id = await channels_slack.slack_team_id(body['slack_bot_token'].strip())
+            except channels_slack.SlackError:
+                error('invalid',400,'slack_bot_token')
+        else:
+            team_id = None
         async with app.state.pool.acquire() as con:
             prior = await con.fetchrow('select * from bothub.schedules where id=$1 and owner_id=$2',id,who['user_id'])
             if not prior: error('not_found',404)
             cron = body.get('cron',prior['cron'])
             try: next_at = next_run(cron,prior['timezone']) if prior['kind']=='cron' else None
             except (ValueError,KeyError): error('invalid')
-            if 'slack_signing_secret' in body and prior['kind']!='hook': error('invalid',400,'slack_signing_secret')
-            # null очищает секрет, строка заменяет; без поля секрет не трогаем
-            secret_set = 'slack_signing_secret' in body
-            try: secret_value = encrypt_secret(body['slack_signing_secret'].strip().encode(),id.bytes) if secret_set and body['slack_signing_secret'] is not None else None
+            for secret_field in ('slack_signing_secret','slack_bot_token','email_signing_key'):
+                if secret_field in body and prior['kind']!='hook': error('invalid',400,secret_field)
+            # null очищает поле; отсутствие поля сохраняет прежнее значение.
+            slack_set = 'slack_signing_secret' in body
+            email_set = 'email_signing_key' in body
+            try:
+                slack_value = encrypt_secret(body['slack_signing_secret'].strip().encode(),id.bytes) if slack_set and body['slack_signing_secret'] is not None else None
+                token_value = encrypt_secret(body['slack_bot_token'].strip().encode(),id.bytes) if token_set and body['slack_bot_token'] is not None else None
+                email_value = encrypt_secret(body['email_signing_key'].strip().encode(),id.bytes) if email_set and body['email_signing_key'] is not None else None
             except ValueError: error('secret_keys_missing',503,'BOTHUB_SECRET_KEYS is not configured')
-            return schedule_data(await con.fetchrow('update bothub.schedules set enabled=coalesce($2,enabled),cron=coalesce($3,cron),prompt=coalesce($4,prompt),next_run_at=$5,catch_up=coalesce($7,catch_up),slack_signing_secret=case when $8 then $9 else slack_signing_secret end where id=$1 and owner_id=$6 returning *',id,body.get('enabled'),body.get('cron'),body.get('prompt'),next_at,who['user_id'],body.get('catch_up'),secret_set,secret_value))
+            return schedule_data(await con.fetchrow('update bothub.schedules set enabled=coalesce($2,enabled),cron=coalesce($3,cron),prompt=coalesce($4,prompt),next_run_at=$5,catch_up=coalesce($7,catch_up),slack_signing_secret=case when $8 then $9 else slack_signing_secret end,slack_bot_token=case when $10 then $11 else slack_bot_token end,slack_team_id=case when $10 then $12 else slack_team_id end,email_signing_key=case when $13 then $14 else email_signing_key end where id=$1 and owner_id=$6 returning *',id,body.get('enabled'),body.get('cron'),body.get('prompt'),next_at,who['user_id'],body.get('catch_up'),slack_set,slack_value,token_set,token_value,team_id,email_set,email_value))
 
     @app.post('/api/schedules/{id}/run')
     async def run_now(id: uuid.UUID, request: Request):
@@ -4887,6 +5464,384 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                 result = dg.final_text([(e['kind'], e['text']) for e in events], row['provider'])
             return {'turn_id': str(row['id']), 'thread_id': str(row['thread_id']), 'to_bot': row['to_bot'], 'status': row['status'],
                     'result': result, 'error': row['error'] if row['status'] == 'error' else None}
+
+    # --- Групповой чат ботов (раздел 21): общий тред `group`, ход каждого бота это обычный ход в его служебном треде `group_bot`,
+    # ответ ядро переписывает в общий тред. Автомат обсуждения живёт в строке group_runs и в group_tick (шаг по каждому запуску),
+    # поэтому перезапуск ядра его не теряет: ход, прерванный рестартом, закрывает запуск как failed (core_restart).
+    def group_refused(exc):
+        error('conflict' if exc.status == 409 else 'invalid', exc.status, exc.code)
+
+    async def group_members_view(con, thread_id):
+        rows = await con.fetch('select m.bot_id,b.name,b.avatar,m.position from bothub.group_members m join bothub.bots b on b.id=m.bot_id '
+                               'where m.thread_id=$1 order by m.position', thread_id)
+        return [{'bot_id': r['bot_id'], 'name': r['name'], 'avatar': r['avatar'], 'position': r['position']} for r in rows]
+
+    async def group_view(con, thread):
+        last = await con.fetchrow('select id,status,round,max_rounds,stop_reason from bothub.group_runs where thread_id=$1 order by started_at desc, id desc limit 1', thread['id'])
+        last_run = gc.run_summary(last)
+        if last_run: last_run = {**last_run, 'id': str(last['id']), 'stop_reason': last['stop_reason']}
+        return {'id': str(thread['id']), 'title': thread['title'], 'kind': 'group', 'members': await group_members_view(con, thread['id']),
+                'mode': thread['group_mode'], 'max_rounds': thread['group_max_rounds'], 'moderator_bot_id': thread['group_moderator'],
+                'token_budget': thread['group_token_budget'], 'created_at': jsonable_encoder(thread['created_at']), 'last_run': last_run}
+
+    async def own_group(con, thread_id, who, *, lock=False):
+        row = await con.fetchrow("select * from bothub.threads where id=$1 and owner_id=$2 and kind='group' and status='active'" + (' for update' if lock else ''),
+                                 thread_id, who['user_id'])
+        if not row: error('not_found', 404)
+        return row
+
+    async def group_tokens(con, run_id):
+        return int(await con.fetchval('select coalesce(sum(u.tokens_in::bigint+u.tokens_out::bigint+u.tokens_cache_read::bigint+u.tokens_cache_write::bigint),0) '
+                                      'from bothub.usage u join bothub.turns t on t.id=u.turn_id where t.group_run_id=$1', run_id))
+
+    @app.post('/api/groups', status_code=201)
+    async def add_group(body: GroupIn, request: Request):
+        who = await principal(request, owner=True)
+        try:
+            title = gc.clean_title(body.title)
+            bot_ids = gc.clean_bot_ids(body.bot_ids)
+            rounds = gc.check_rounds(body.max_rounds)
+            budget = gc.check_budget(body.token_budget)
+            moderator = gc.check_moderator(body.mode, body.moderator_bot_id, bot_ids)
+        except gc.GroupError as exc:
+            group_refused(exc)
+        async with app.state.pool.acquire() as con:
+            async with con.transaction():
+                owned = await con.fetchval('select count(*) from bothub.bots where owner_id=$1 and id=any($2::text[])', who['user_id'], bot_ids)
+                if owned != len(bot_ids): error('not_found', 404, 'bot_not_found')
+                thread = await con.fetchrow("insert into bothub.threads(bot_id,kind,title,owner_id,group_mode,group_max_rounds,group_moderator,group_token_budget) "
+                                            "values(null,'group',$1,$2,$3,$4,$5,$6) returning *", title, who['user_id'], body.mode, rounds, moderator, budget)
+                for position, bot_id in enumerate(bot_ids):
+                    shadow = await con.fetchval("insert into bothub.threads(bot_id,kind,title,owner_id,group_id,auto_compact_disabled) values($1,'group_bot',$2,$3,$4,true) returning id",
+                                                bot_id, f'Обсуждение «{title}»'[:512], who['user_id'], thread['id'])
+                    await con.execute('insert into bothub.group_members(thread_id,bot_id,position,turn_thread_id) values($1,$2,$3,$4)', thread['id'], bot_id, position, shadow)
+            return await group_view(con, thread)
+
+    @app.get('/api/groups')
+    async def list_groups(request: Request):
+        who = await principal(request, owner=True)
+        async with app.state.pool.acquire() as con:
+            rows = await con.fetch("select * from bothub.threads where owner_id=$1 and kind='group' and status='active' order by created_at desc, id", who['user_id'])
+            return [await group_view(con, row) for row in rows]
+
+    @app.get('/api/groups/{id}')
+    async def get_group(id: uuid.UUID, request: Request):
+        who = await principal(request, owner=True)
+        async with app.state.pool.acquire() as con:
+            return await group_view(con, await own_group(con, id, who))
+
+    @app.patch('/api/groups/{id}')
+    async def edit_group(id: uuid.UUID, body: GroupPatchIn, request: Request):
+        who = await principal(request, owner=True)
+        sent = body.model_fields_set
+        if not sent: error('invalid', 400, 'empty_patch')
+        async with app.state.pool.acquire() as con:
+            async with con.transaction():
+                thread = await own_group(con, id, who, lock=True)
+                running_now = await con.fetchval("select exists(select 1 from bothub.group_runs where thread_id=$1 and status='running')", id)
+                if running_now and sent - {'title'}: error('conflict', 409, 'group_busy')
+                member_ids = [m['bot_id'] for m in await group_members_view(con, id)]
+                try:
+                    title = gc.clean_title(body.title) if 'title' in sent else thread['title']
+                    rounds = gc.check_rounds(body.max_rounds) if 'max_rounds' in sent else thread['group_max_rounds']
+                    budget = gc.check_budget(body.token_budget) if 'token_budget' in sent else thread['group_token_budget']
+                    mode = body.mode if body.mode else thread['group_mode']
+                    given = body.moderator_bot_id if 'moderator_bot_id' in sent else (thread['group_moderator'] if mode == 'moderated' else None)
+                    moderator = gc.check_moderator(mode, given, member_ids)
+                except gc.GroupError as exc:
+                    group_refused(exc)
+                thread = await con.fetchrow('update bothub.threads set title=$2,group_mode=$3,group_max_rounds=$4,group_moderator=$5,group_token_budget=$6 where id=$1 returning *',
+                                            id, title, mode, rounds, moderator, budget)
+                await con.execute("update bothub.threads set title=$2 where group_id=$1", id, f'Обсуждение «{title}»'[:512])
+            return await group_view(con, thread)
+
+    async def stop_group_turn(turn_id):
+        """Ход бота внутри обсуждения: ожидающий в очереди просто закрывается, идущий останавливается как обычный."""
+        async with app.state.pool.acquire() as con:
+            row = await con.fetchrow('select t.id,t.status,t.thread_id from bothub.turns t where t.id=$1', turn_id)
+            if not row or row['status'] not in ('queued', 'running', 'waiting_approval', 'waiting_mac'): return
+            if row['status'] == 'queued':
+                changed = await con.fetchval("update bothub.turns set status='stopped',finished_at=now() where id=$1 and status='queued' returning id", turn_id)
+                if changed:
+                    await append_event(con, row['thread_id'], turn_id, 'status', 'system', {'turn_id': str(turn_id), 'status': 'stopped'})
+                    return
+        await stop_turn(turn_id, 'group_stopped')
+
+    async def group_finish(con, st, thread, status, reason, events):
+        """Закрывает запуск (только running): статус, расход, событие группы и запись в ленту активности."""
+        used = max(await group_tokens(con, st['id']), st.get('tokens_used') or 0)
+        row = await con.fetchrow("update bothub.group_runs set status=$2,stop_reason=$3,finished_at=now(),tokens_used=$4,round=$5,current_turn_id=null,current_bot_id=null,"
+                                 "pending='[]',phase=$6 where id=$1 and status='running' returning id", st['id'], status, reason, used, st['round'], st['phase'])
+        if not row: return False
+        events.append(await append_event(con, thread['id'], None, 'group_status', 'system',
+                                         {'run_id': str(st['id']), 'status': status, 'stop_reason': reason, 'round': st['round']}, fanout=False))
+        await log_activity(con, st['owner_id'], None, 'group', 'group_finished',
+                           {'title': thread['title'][:120], 'rounds': st['round'], 'status': status, 'run_id': str(st['id'])}, thread['id'])
+        return True
+
+    async def group_save(con, st):
+        await con.execute('update bothub.group_runs set round=$2,phase=$3,pending=$4::jsonb,agreed=$5::jsonb,current_turn_id=$6,current_bot_id=$7,waiting_notice=$8,tokens_used=$9 where id=$1',
+                          st['id'], st['round'], st['phase'], json.dumps(st['pending']), json.dumps(st['agreed']), st['current_turn_id'], st['current_bot_id'],
+                          st['waiting_notice'], st['tokens_used'])
+
+    async def group_system_event(con, thread_id, events, code, text, **extra):
+        events.append(await append_event(con, thread_id, None, 'system', 'system', {'text': text, 'code': code, **extra}, fanout=False))
+
+    async def group_start_turn(con, st, thread, member, names, events, *, moderator):
+        """Ход бота: служебный тред бота, промпт с репликами, строка turns с group_run_id. Реплики других ботов в промпте идут рамкой данных."""
+        rows = await con.fetch("select kind,actor,payload from bothub.events where thread_id=$1 and kind in ('user_msg','assistant_msg') and seq<>$2 "
+                               "order by seq desc limit $3", thread['id'], st['user_seq'] or 0, gc.HISTORY)
+        replies = [('Владелец' if r['kind'] == 'user_msg' else (r['payload'].get('bot_name') or r['actor']), r['payload'].get('text') or '') for r in reversed(rows)]
+        replies = [(author, text) for author, text in replies if text]
+        prompt = gc.build_prompt(title=thread['title'], names=list(names.values()), speaker=names[member['bot_id']], mode=thread['group_mode'],
+                                 round_no=st['round'], max_rounds=st['max_rounds'], owner_text=st['owner_text'], replies=replies, moderator=moderator,
+                                 last_round=st['round'] >= st['max_rounds'], member_ids=list(names.items()))
+        await con.execute('update bothub.threads set cli_session_id=null where id=$1', member['turn_thread_id'])  # каждый ход самодостаточен: контекст в промпте
+        turn = await con.fetchrow('insert into bothub.turns(thread_id,prompt,client,group_run_id) values($1,$2,$3,$4) returning id',
+                                  member['turn_thread_id'], prompt, gc.CLIENT, st['id'])
+        events.append(await append_event(con, member['turn_thread_id'], turn['id'], 'user_msg', 'system',
+                                         {'text': prompt, 'group': {'thread_id': str(thread['id']), 'run_id': str(st['id'])}}, gc.CLIENT, fanout=False))
+        st['current_turn_id'], st['current_bot_id'], st['waiting_notice'] = turn['id'], member['bot_id'], False
+        events.append(await append_event(con, thread['id'], None, 'group_turn', 'system',
+                                         {'run_id': str(st['id']), 'round': st['round'], 'bot_id': member['bot_id'],
+                                          'bot_name': names[member['bot_id']]}, fanout=False))
+
+    async def group_advance(con, st, thread, events):
+        """Один шаг автомата под блокировкой строки запуска. Возвращает (было ли изменение, ход бота, который надо остановить)."""
+        members = [dict(m) for m in await con.fetch('select m.bot_id,m.position,m.turn_thread_id,b.name from bothub.group_members m join bothub.bots b on b.id=m.bot_id '
+                                                   'where m.thread_id=$1 order by m.position', thread['id'])]
+        names = {m['bot_id']: m['name'] for m in members}
+        by_id = {m['bot_id']: m for m in members}
+        budget = st['token_budget']
+        changed = False
+
+        async def finish(status, reason):
+            await group_finish(con, st, thread, status, reason, events)
+
+        if st['current_turn_id']:
+            turn = await con.fetchrow('select id,status,error,thread_id from bothub.turns where id=$1', st['current_turn_id'])
+            if turn and turn['status'] in gc.BUSY_STATUSES:
+                st['tokens_used'] = await group_tokens(con, st['id'])
+                if budget and st['tokens_used'] >= budget:
+                    await finish('stopped', 'budget')
+                    return True, turn['id']
+                if turn['status'] == 'queued':
+                    bot = await con.fetchrow('select * from bothub.bots where id=$1', st['current_bot_id'])
+                    blocked = gc.queued_turn_block_reason(turn['status'], bot)
+                    if blocked:
+                        stopped = await con.fetchval("update bothub.turns set status='stopped',finished_at=now() "
+                                                     "where id=$1 and status='queued' returning id", turn['id'])
+                        if not stopped:
+                            return False, None  # claim_turn уже взял ход; следующий tick увидит новый статус
+                        events.append(await append_event(con, turn['thread_id'], turn['id'], 'status', 'system',
+                                                         {'turn_id': str(turn['id']), 'status': 'stopped'}, fanout=False))
+                        bot_id = st['current_bot_id']
+                        await group_system_event(con, thread['id'], events, 'group_skip', f"{names.get(bot_id, bot_id)} пропускает: {blocked}",
+                                                 bot_id=bot_id, reason=blocked)
+                        st['current_turn_id'] = st['current_bot_id'] = None
+                        st['waiting_notice'] = False
+                        if st['phase'] == 'moderator':
+                            await finish('failed', 'no_participants')
+                        else:
+                            await group_save(con, st)
+                        return True, None
+                if turn['status'] in ('waiting_approval', 'waiting_mac') and not st['waiting_notice']:
+                    st['waiting_notice'] = True
+                    await group_system_event(con, thread['id'], events, 'group_waiting_approval', f"{names.get(st['current_bot_id'], st['current_bot_id'])} ждёт решения владельца",
+                                             bot_id=st['current_bot_id'])
+                    await group_save(con, st)
+                    return True, None
+                return False, None
+            changed = True
+            bot_id = st['current_bot_id']
+            if not turn or turn['status'] != 'done':
+                if turn and turn['status'] == 'stopped':
+                    guard = await con.fetchval("select payload->>'reason' from bothub.events where turn_id=$1 and kind='guard' order by seq desc limit 1", turn['id'])
+                    reason = 'bot_error:' + (guard or 'turn_stopped')[:100]
+                else:
+                    auth_error = turn and await con.fetchval(
+                        "select 1 from bothub.events where turn_id=$1 and kind='guard' and payload->>'reason'=$2 limit 1",
+                        turn['id'], CLI_AUTH_EXPIRED)
+                    if auth_error:
+                        reason = f'bot_auth_expired:{bot_id}'
+                    else:
+                        reason = ((turn['error'] if turn else None) or 'turn_error')
+                        reason = 'core_restart' if reason == 'прервано рестартом ядра' else 'bot_error:' + reason[:100]
+                await finish('failed', reason)
+                return True, None
+            provider = await con.fetchval('select provider from bothub.bots where id=$1', bot_id)
+            rows = await con.fetch("select kind, payload->>'text' as text from bothub.events where turn_id=$1 and kind in ('assistant_msg','tool_call','tool_result') order by seq", turn['id'])
+            text = gc.clean_participant_reply(dg.final_text([(r['kind'], r['text']) for r in rows], provider), names.get(bot_id, bot_id))
+            finishing = False
+            if st['phase'] == 'moderator':
+                nxt, done, clean = gc.parse_moderator(text)
+                text = clean or text
+                finishing = done or st['round'] >= st['max_rounds']
+            payload = {'text': text, 'bot_id': bot_id, 'bot_name': names.get(bot_id, bot_id), 'round': st['round'], 'run_id': str(st['id']),
+                       'turn_id': str(turn['id'])}
+            if st['phase'] == 'moderator': payload['role'] = 'moderator'
+            if finishing: payload['summary'] = True
+            if text:
+                events.append(await append_event(con, thread['id'], None, 'assistant_msg', f'bot:{bot_id}', payload, gc.CLIENT, fanout=False))
+            else:
+                await group_system_event(con, thread['id'], events, 'group_empty_reply', f"{names.get(bot_id, bot_id)} ответил пустым сообщением", bot_id=bot_id)
+            st['current_turn_id'] = st['current_bot_id'] = None
+            st['tokens_used'] = await group_tokens(con, st['id'])
+            if st['phase'] == 'moderator':
+                if finishing:
+                    await finish('done', 'moderator_done' if done else 'max_rounds')
+                    return True, None
+                st['phase'] = 'bots'
+                await start_round(con, st, members, events, thread, nxt)
+            else:
+                st['agreed'].append(bool(text) and gc.is_agreement(text))
+            if budget and st['tokens_used'] >= budget:
+                await finish('stopped', 'budget')
+                return True, None
+
+        while True:
+            if st['phase'] == 'moderator':
+                member = by_id.get(thread['group_moderator'])
+                blocked = None
+                if member:
+                    bot = await con.fetchrow('select * from bothub.bots where id=$1', member['bot_id'])
+                    blocked = gc.block_reason(bot) if bot else 'missing'
+                if not member or blocked:
+                    await finish('failed', 'no_participants')
+                    return True, None
+                await group_start_turn(con, st, thread, member, names, events, moderator=True)
+                break
+            if st['pending']:
+                bot_id = st['pending'].pop(0)
+                member = by_id.get(bot_id)
+                bot = await con.fetchrow('select * from bothub.bots where id=$1', bot_id) if member else None
+                blocked = gc.block_reason(bot) if bot else 'missing'
+                if blocked:
+                    await group_system_event(con, thread['id'], events, 'group_skip', f"{names.get(bot_id, bot_id)} пропускает: {blocked}", bot_id=bot_id, reason=blocked)
+                    changed = True
+                    continue
+                await group_start_turn(con, st, thread, member, names, events, moderator=False)
+                break
+            if st['round'] == 0:
+                await start_round(con, st, members, events, thread, None)
+                continue
+            if not st['agreed']:
+                await finish('failed', 'no_participants')
+                return True, None
+            if thread['group_mode'] == 'debate' and all(st['agreed']):
+                await finish('done', 'agreed')
+                return True, None
+            if thread['group_mode'] == 'moderated':
+                st['phase'] = 'moderator'
+                continue
+            if st['round'] >= st['max_rounds']:
+                await finish('done', 'max_rounds')
+                return True, None
+            await start_round(con, st, members, events, thread, None)
+        await group_save(con, st)
+        return True, None
+
+    async def start_round(con, st, members, events, thread, first):
+        st['round'] += 1
+        speakers = [m['bot_id'] for m in members if not (thread['group_mode'] == 'moderated' and m['bot_id'] == thread['group_moderator'])]
+        st['pending'] = gc.round_order(speakers, first)
+        st['agreed'] = []
+        st['phase'] = 'bots'
+        events.append(await append_event(con, thread['id'], None, 'group_round', 'system',
+                                         {'run_id': str(st['id']), 'round': st['round'], 'max_rounds': st['max_rounds']}, fanout=False))
+
+    async def group_step(run_id):
+        events, stop_id = [], None
+        async with app.state.pool.acquire() as con:
+            async with con.transaction():
+                run = await con.fetchrow('select * from bothub.group_runs where id=$1 for update', run_id)
+                if not run or run['status'] != 'running': return False
+                st = dict(run)
+                st['pending'], st['agreed'] = list(run['pending']), list(run['agreed'])
+                thread = await con.fetchrow('select * from bothub.threads where id=$1', run['thread_id'])
+                changed, stop_id = await group_advance(con, st, thread, events)
+        for event in events:
+            publish(event)
+        if stop_id: await stop_group_turn(stop_id)
+        return changed
+
+    async def group_tick():
+        async with app.state.pool.acquire() as con:
+            ids = [r['id'] for r in await con.fetch("select id from bothub.group_runs where status='running' order by started_at")]
+        progressed = False
+        for run_id in ids:
+            try:
+                progressed = await group_step(run_id) or progressed
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception('group_step_failed', extra={'run_id': str(run_id)})
+        return progressed
+
+    app.state.group_tick = group_tick
+
+    @app.post('/api/groups/{id}/messages', status_code=202)
+    async def group_message(id: uuid.UUID, body: GroupMessageIn, request: Request):
+        who = await principal(request, owner=True)
+        try:
+            text = gc.clean_message(body.text)
+        except gc.GroupError as exc:
+            group_refused(exc)
+        events = []
+        async with app.state.pool.acquire() as con:
+            async with con.transaction():
+                thread = await own_group(con, id, who)
+                if await con.fetchval("select exists(select 1 from bothub.group_runs where thread_id=$1 and status='running')", id):
+                    error('conflict', 409, 'group_busy')
+                try:
+                    run = await con.fetchrow("insert into bothub.group_runs(thread_id,owner_id,mode,max_rounds,token_budget,owner_text) values($1,$2,$3,$4,$5,$6) returning id",
+                                             id, who['user_id'], thread['group_mode'], thread['group_max_rounds'], thread['group_token_budget'], text)
+                except asyncpg.UniqueViolationError:
+                    error('conflict', 409, 'group_busy')
+                user_event = await append_event(con, id, None, 'user_msg', 'owner', {'text': text}, 'api', fanout=False)
+                await con.execute('update bothub.group_runs set user_seq=$2 where id=$1', run['id'], user_event['seq'])
+                events.append(user_event)
+                events.append(await append_event(con, id, None, 'group_status', 'system', {'run_id': str(run['id']), 'status': 'running', 'round': 0}, fanout=False))
+                await log_activity(con, who['user_id'], None, 'group', 'group_started',
+                                   {'title': thread['title'][:120], 'rounds': thread['group_max_rounds'], 'status': 'running', 'run_id': str(run['id'])}, id)
+        for event in events:
+            publish(event)
+        return {'run_id': str(run['id'])}
+
+    @app.post('/api/groups/{id}/stop')
+    async def stop_group(id: uuid.UUID, request: Request):
+        who = await principal(request, owner=True)
+        events, turn_id = [], None
+        async with app.state.pool.acquire() as con:
+            async with con.transaction():
+                thread = await own_group(con, id, who)
+                run = await con.fetchrow("select * from bothub.group_runs where thread_id=$1 and status='running' for update", id)
+                if not run: error('conflict', 409, 'group_idle')
+                turn_id = run['current_turn_id']
+                await group_finish(con, dict(run), thread, 'stopped', 'stopped', events)
+        for event in events:
+            publish(event)
+        if turn_id: await stop_group_turn(turn_id)
+        return {'run_id': str(run['id']), 'status': 'stopped'}
+
+    @app.delete('/api/groups/{id}')
+    async def delete_group(id: uuid.UUID, request: Request):
+        """Тред и служебные треды архивируются (журнал событий не стирается, как у остальных тредов), участники удаляются."""
+        who = await principal(request, owner=True)
+        events, turn_id = [], None
+        async with app.state.pool.acquire() as con:
+            async with con.transaction():
+                thread = await own_group(con, id, who)
+                run = await con.fetchrow("select * from bothub.group_runs where thread_id=$1 and status='running' for update", id)
+                if run:
+                    turn_id = run['current_turn_id']
+                    await group_finish(con, dict(run), thread, 'stopped', 'stopped', events)
+                await con.execute("update bothub.threads set status='archived' where id=$1 or group_id=$1", id)
+                await con.execute('delete from bothub.group_members where thread_id=$1', id)
+        for event in events:
+            publish(event)
+        if turn_id: await stop_group_turn(turn_id)
+        return {'ok': True}
 
     # --- Процедуры (раздел 14): CRUD, из действий бота, импорт и экспорт, чтение запусков. Воспроизведение: следующая часть.
     PROCEDURE_STATUSES = ('draft', 'active', 'archived')
@@ -5151,31 +6106,62 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                                    who['user_id'])
         return [{'name': row['name'], 'bot_id': row['bot_id']} for row in rows]
 
-    async def read_hook_body(request: Request) -> bytes:
+    async def read_hook_body(request: Request, limit: int = hook_adapters.HOOK_MAX_BODY) -> bytes:
         # Лимит применяется до чтения всего тела: по Content-Length и по ходу потока (chunked без длины)
         declared = request.headers.get('content-length')
-        if declared is not None and declared.isascii() and declared.isdigit() and int(declared) > hook_adapters.HOOK_MAX_BODY: error('invalid', 413)
+        if declared is not None and declared.isascii() and declared.isdigit() and int(declared) > limit: error('invalid', 413)
         chunks, size = [], 0
         async for chunk in request.stream():
             size += len(chunk)
-            if size > hook_adapters.HOOK_MAX_BODY: error('invalid', 413)
+            if size > limit: error('invalid', 413)
             chunks.append(chunk)
         return b''.join(chunks)
+
+    async def deliver_slack_reply(turn, provider: str) -> None:
+        """Ответ hook-хода в исходный канал и тред Slack, если у расписания задан Bot Token."""
+        async with app.state.pool.acquire() as con:
+            row = await con.fetchrow(
+                "select s.id,s.slack_bot_token,p.payload from bothub.slack_hook_payloads p "
+                "join bothub.schedules s on s.id=p.schedule_id "
+                "join bothub.turns t on t.id=p.turn_id join bothub.threads th on th.id=t.thread_id "
+                "where s.kind='hook' and t.id=$1 and s.owner_id=th.owner_id", turn['id'])
+            if not row or not row['slack_bot_token']:
+                return
+            try:
+                token = decrypt_secret(bytes(row['slack_bot_token']), row['id'].bytes).decode()
+            except Exception:
+                log.exception('slack_bot_token_decrypt_failed', extra={'schedule_id': str(row['id'])})
+                return
+            try:
+                target = channels_slack.reply_target(row['payload'])
+            except (TypeError, ValueError):
+                target = None
+            if not target:
+                return
+            events = await con.fetch("select kind, payload->>'text' as text from bothub.events where turn_id=$1 and kind in ('assistant_msg','tool_call','tool_result') order by seq", turn['id'])
+            text = dg.final_text([(event['kind'], event['text']) for event in events], provider)
+            if not text:
+                return
+        for part in channels_slack.split_message(text):
+            await channels_slack.send_slack_message(token, target['channel'], target['thread_ts'], part)
 
     async def get_hook_schedule(con, schedule_id: uuid.UUID):
         schedule = await con.fetchrow("select s.* from bothub.schedules s join bothub.users u on u.id=s.owner_id where s.id=$1 and s.kind='hook' and s.enabled and u.status='active'", schedule_id)
         if not schedule: error('not_found', 404)
         return schedule
 
-    async def dispatch_hook_turn(con, schedule, prompt: str) -> dict:
-        # Раздел 16: ответ всегда 202 {"status":"accepted"}, без id turn: по форме и телу ответа отправитель не узнаёт, создан ли turn
+    async def dispatch_hook_turn(con, schedule, prompt: str, slack_payload: dict | None = None,
+                                 *, checked: bool = False, checked_reason: str | None = None) -> dict:
+        # Общий, GitHub и Slack маршруты отвечают 202, почта 200; тело без id turn.
         # или запуск пропущен (пауза, исполнитель, провайдер). Проверка и постановка в очередь (или запись пропуска) идут до ответа
         # в обоих случаях, поэтому и по времени ответа разница небольшая. Сбой самой проверки считается пропуском check_failed.
-        try:
-            reason = await trigger_block(con, schedule['bot_id'])
-        except Exception:
-            log.exception('trigger_block_failed', extra={'bot_id': schedule['bot_id'], 'schedule_id': str(schedule['id'])})
-            reason = 'check_failed'
+        reason = checked_reason
+        if not checked:
+            try:
+                reason = await trigger_block(con, schedule['bot_id'])
+            except Exception:
+                log.exception('trigger_block_failed', extra={'bot_id': schedule['bot_id'], 'schedule_id': str(schedule['id'])})
+                reason = 'check_failed'
         if not reason:
             try:
                 await require_available_bot(con, schedule['bot_id'])
@@ -5191,6 +6177,9 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             return {'status': 'accepted'}
         thread_id = await con.fetchval("insert into bothub.threads(bot_id,kind,title,owner_id) values($1,'routine',$2,$3) returning id", schedule['bot_id'], schedule['name'], schedule['owner_id'])
         turn = await create_turn(con, thread_id, prompt, 'hook')
+        if slack_payload is not None:
+            await con.execute('insert into bothub.slack_hook_payloads(turn_id,schedule_id,payload) values($1,$2,$3::jsonb)',
+                              uuid.UUID(turn['id']), schedule['id'], channels_slack.slack_payload(slack_payload))
         await con.execute('update bothub.schedules set last_turn_id=$2 where id=$1 and owner_id=$3', schedule['id'], uuid.UUID(turn['id']), schedule['owner_id'])
         if schedule['skipped_count'] or schedule['paused_by_unavailable']:
             events = []
@@ -5213,6 +6202,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         async with app.state.pool.acquire() as con:
             schedule = await get_hook_schedule(con, id)
             if not token_equals(token, schedule['hook_token']): error('forbidden', 403)
+            if schedule.get('email_signing_key') is not None: error('forbidden', 403)
             prompt = schedule['prompt'] + '\n\nДанные события:\n```json\n' + text + '\n```'
             return await dispatch_hook_turn(con, schedule, prompt)
 
@@ -5223,6 +6213,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         event_name = request.headers.get('x-github-event', '')
         async with app.state.pool.acquire() as con:
             schedule = await get_hook_schedule(con, id)
+            if schedule.get('email_signing_key') is not None: error('forbidden', 403)
             # Подпись сырого тела проверяется до любого разбора JSON
             if not hook_adapters.verify_github_signature(raw, schedule['hook_token'], sig):
                 error('forbidden', 403)
@@ -5245,6 +6236,7 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
         timestamp = request.headers.get('x-slack-request-timestamp')
         async with app.state.pool.acquire() as con:
             schedule = await get_hook_schedule(con, id)
+            if schedule.get('email_signing_key') is not None: error('forbidden', 403)
             # Подпись и окно в 5 минут по timestamp проверяются до любого разбора JSON
             # Slack подписывает своим Signing Secret приложения; без него (или при сбое расшифровки) всегда 403, hook_token не подходит
             stored = schedule['slack_signing_secret']
@@ -5261,11 +6253,72 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             if not isinstance(payload, dict): error('invalid')
             if payload.get('type') == 'url_verification':
                 return JSONResponse({'challenge': payload.get('challenge', '')}, status_code=200)
+            if not schedule['slack_team_id']:
+                return {'status': 'accepted'}
+            if payload.get('team_id') != schedule['slack_team_id']:
+                error('forbidden', 403)
             prompt_text = hook_adapters.build_slack_prompt(payload)
             if prompt_text is None:
                 return {'status': 'accepted'}
+            event_id = channels_slack.clean_event_id(payload)
             full_prompt = (schedule['prompt'] + '\n\n' if schedule['prompt'] else '') + prompt_text
-            return await dispatch_hook_turn(con, schedule, full_prompt)
+            try:
+                reason = await trigger_block(con, schedule['bot_id'])
+            except Exception:
+                log.exception('trigger_block_failed', extra={'bot_id': schedule['bot_id'], 'schedule_id': str(schedule['id'])})
+                reason = 'check_failed'
+            async with con.transaction():
+                if event_id:
+                    await con.execute("delete from bothub.slack_handled_events where created_at<now()-interval '1 day'")
+                    inserted = await con.fetchval(
+                        'insert into bothub.slack_handled_events(event_id) values($1) '
+                        'on conflict (event_id) do nothing returning event_id', event_id)
+                    if inserted is None:
+                        return {'status': 'accepted'}
+                return await dispatch_hook_turn(con, schedule, full_prompt, payload, checked=True, checked_reason=reason)
+
+    @app.post('/hooks/{id}/email')
+    async def hook_email(id: uuid.UUID):
+        error('forbidden', 403)
+
+    @app.post('/hooks/{id}/email/{token}/json')
+    async def hook_email_json(id: uuid.UUID, token: str, request: Request):
+        # Mailgun включает JSON-режим, когда путь URL заканчивается на json.
+        raw = await read_hook_body(request, hook_adapters.EMAIL_MAX_BODY)
+        async with app.state.pool.acquire() as con:
+            schedule = await get_hook_schedule(con, id)
+            # Signing Key общий на аккаунт Mailgun; отдельный email_route_token привязывает запрос к расписанию.
+            if not token_equals(token, schedule['email_route_token']): error('forbidden', 403)
+            # Mailgun подписывает timestamp и сырое JSON-тело.
+            stored = schedule['email_signing_key']
+            try:
+                signing_key = decrypt_secret(bytes(stored), schedule['id'].bytes).decode() if stored else None
+            except Exception:
+                log.exception('email_secret_decrypt_failed', extra={'schedule_id': str(schedule['id'])})
+                signing_key = None
+            if not signing_key:
+                error('forbidden', 403)
+            if request.headers.get('content-type', '').split(';', 1)[0].strip().lower() != 'application/json':
+                error('forbidden', 403)
+            timestamp = request.headers.get('x-mailgun-timestamp')
+            if not hook_adapters.verify_email_json_signature(raw, signing_key, request.headers.get('x-mailgun-signature'), timestamp):
+                error('forbidden', 403)
+            payload = hook_adapters.parse_email_payload(raw, 'application/json')
+            if payload is None: error('invalid')
+            prompt_text = hook_adapters.build_email_prompt(payload)
+            if prompt_text is None:
+                log.info('empty_signed_email', extra={'schedule_id': str(schedule['id'])})
+                return {'status': 'accepted'}
+            fingerprint_source = (timestamp + ':').encode() + raw
+            fingerprint = hashlib.sha256(fingerprint_source).digest()
+            full_prompt = (schedule['prompt'] + '\n\n' if schedule['prompt'] else '') + prompt_text
+            # Очистка старых квитанций не должна удерживать блокировку транзакции, создающей ход.
+            await con.execute("delete from bothub.email_webhook_receipts where received_at < now() - interval '31 minutes'")
+            async with con.transaction():
+                fresh = await con.fetchval('insert into bothub.email_webhook_receipts(schedule_id,fingerprint) values($1,$2) on conflict do nothing returning 1', schedule['id'], fingerprint)
+                if not fresh:
+                    return {'status': 'accepted'}
+                return await dispatch_hook_turn(con, schedule, full_prompt)
 
     @app.post('/api/files')
     async def upload_file(request: Request, file: UploadFile = File(...), thread_id: uuid.UUID = Form(...), origin: str = Form('upload')):
@@ -5299,35 +6352,61 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
     async def mac_status(request: Request):
         who = await principal(request,owner=True)
         async with app.state.pool.acquire() as con:
-            row = await con.fetchrow('select * from bothub.mac_status where owner_id=$1 order by id limit 1',who['user_id'])
+            row = await con.fetchrow('select m.id,m.last_seen_at,s.state,s.info from bothub.macs m '
+                'left join lateral (select state,info from bothub.mac_status where mac_id=m.id order by id limit 1) s on true '
+                'where m.owner_id=$1 order by m.created_at,m.id limit 1',who['user_id'])
             if not row: return {'state':'offline','last_seen':None,'info':{}}
-            result = data(row)
-            if str(who['user_id']) not in mac_socket or not row['last_seen'] or row['last_seen']<datetime.now(NOW)-timedelta(seconds=90): result['state']='offline'
-            return {k:result[k] for k in ('state','last_seen','info')}
+            state = row['state'] or 'offline'
+            if str(row['id']) not in mac_socket or not row['last_seen_at'] or row['last_seen_at']<datetime.now(NOW)-timedelta(seconds=90): state='offline'
+            return {'state':state,'last_seen':data(row)['last_seen_at'],'info':row['info'] or {}}
 
     @app.websocket('/agent/mac')
     async def mac_agent(ws: WebSocket):
-        token = ws_token(ws)
+        # Uvicorn logs even rejected WebSocket URLs; its loggers redact the query.
+        if 'token' in ws.query_params:
+            await ws.close(code=4401); return
+        header = ws.headers.get('authorization', '')
+        token = header.removeprefix('Bearer ') if header.startswith('Bearer ') else ''
+        if not auth.is_clean_text(token):
+            await ws.close(code=4401); return
         origin=ws.headers.get('origin','')
         scheme=ws.headers.get('x-forwarded-proto') or ('https' if ws.url.scheme=='wss' else 'http')
         if origin and not (auth.same_origin(origin,ws.headers.get('host',''),scheme=scheme) or
                            not ws.headers.get('x-forwarded-proto') and ws.url.scheme=='ws' and
                            auth.same_origin(origin,ws.headers.get('host',''),scheme='https')):
             await ws.close(code=4401); return
+        legacy_auth = False
         async with app.state.pool.acquire() as con:
-            if await legacy_enabled(con) and token_equals(token,os.getenv('MAC_AGENT_TOKEN')):
+            row=await con.fetchrow("select m.id,m.owner_id from bothub.macs m join bothub.users u on u.id=m.owner_id where m.token_hash=$1 and u.status='active'",auth.token_hash(token)) if token else None
+            if not row and await legacy_enabled(con) and token_equals(token,os.getenv('MAC_AGENT_TOKEN')):
+                legacy_auth = True
                 first=await setup_admin(con)
-                user_id=first['id'] if first else None
-            else:
-                user_id=await con.fetchval("select m.user_id from bothub.mac_tokens m join bothub.users u on u.id=m.user_id where m.token_hash=$1 and m.revoked_at is null and u.status='active'",auth.token_hash(token))
-        if not user_id:
+                if first:
+                    pinned_id = await pinned_legacy_mac(con,first['id'])
+                    if pinned_id:
+                        row={'id':pinned_id,'owner_id':first['id']}
+        if not row:
             await ws.close(code=4401); return
-        key=str(user_id)
-        previous=mac_socket.get(key)
-        if previous:
-            with suppress(Exception): await previous.close(code=4401)
-        await ws.accept()
-        mac_socket[key]=ws; mac_ready.set()
+        mac_id, user_id = row['id'], row['owner_id']
+        key=str(mac_id)
+        async with mac_locks.setdefault(key, asyncio.Lock()):
+            async with app.state.pool.acquire() as con:
+                valid = await con.fetchval('select 1 from bothub.macs where id=$1 and owner_id=$2',mac_id,user_id)
+                if valid and legacy_auth:
+                    admin = await setup_admin(con)
+                    valid = (await legacy_enabled(con) and token_equals(token,os.getenv('MAC_AGENT_TOKEN'))
+                        and admin is not None and admin['id'] == user_id
+                        and await pinned_legacy_mac(con,user_id) == mac_id)
+                elif valid:
+                    valid = await con.fetchval('select 1 from bothub.macs where id=$1 and token_hash=$2',mac_id,auth.token_hash(token))
+                if not valid:
+                    await ws.close(code=4401); return
+            previous=mac_socket.get(key)
+            if previous:
+                with suppress(Exception): await previous.close(code=4401)
+            await ws.accept()
+            mac_socket[key]=ws; mac_ready.set()
+            mac_owner[key]=user_id
         try:
             while True:
                 msg=await ws.receive_json()
@@ -5335,24 +6414,28 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                     if msg.get('type')=='hello':
                         async with con.transaction():
                             await con.execute('select pg_advisory_xact_lock(hashtext($1))',key)
-                            if not await con.fetchval('select 1 from bothub.mac_status where owner_id=$1',user_id):
-                                await con.execute("insert into bothub.mac_status(state,last_seen,info,owner_id) values('online',now(),$1::jsonb,$2)",canonical(msg),user_id)
-                            await con.execute("update bothub.mac_status set state='online',last_seen=now(),info=$2::jsonb where id=(select id from bothub.mac_status where owner_id=$1 order by id limit 1)",user_id,canonical(msg))
+                            if not await con.fetchval('select 1 from bothub.mac_status where mac_id=$1',mac_id):
+                                await con.execute("insert into bothub.mac_status(state,last_seen,info,owner_id,mac_id) values('online',now(),$1::jsonb,$2,$3)",canonical(msg),user_id,mac_id)
+                            await con.execute("update bothub.mac_status set state='online',last_seen=now(),info=$2::jsonb where id=(select id from bothub.mac_status where mac_id=$1 order by id limit 1)",mac_id,canonical(msg))
+                            await con.execute('update bothub.macs set last_seen_at=now() where id=$1',mac_id)
                     elif msg.get('type')=='heartbeat':
-                        await con.execute("update bothub.mac_status set state=$2,last_seen=now(),info=info || $3::jsonb where id=(select id from bothub.mac_status where owner_id=$1 order by id limit 1)",user_id,'locked' if msg.get('locked') else 'online',canonical(msg))
+                        await con.execute("update bothub.mac_status set state=$2,last_seen=now(),info=info || $3::jsonb where id=(select id from bothub.mac_status where mac_id=$1 order by id limit 1)",mac_id,'locked' if msg.get('locked') else 'online',canonical(msg))
+                        await con.execute('update bothub.macs set last_seen_at=now() where id=$1',mac_id)
                     elif msg.get('type')=='result':
                         future=pending_mac.get(key,{}).pop(msg.get('id'),None)
                         if future and not future.done(): future.set_result(msg)
         except WebSocketDisconnect:
             pass
         finally:
-            if mac_socket.get(key) is ws:
-                mac_socket.pop(key,None)
-                if not mac_socket: mac_ready.clear()
-                async with app.state.pool.acquire() as con:
-                    await con.execute("update bothub.mac_status set state='offline' where owner_id=$1",user_id)
-                for future in pending_mac.get(key,{}).values():
-                    if not future.done(): future.set_exception(ConnectionError('Mac disconnected'))
+            async with mac_locks.setdefault(key, asyncio.Lock()):
+                if mac_socket.get(key) is ws:
+                    mac_socket.pop(key,None)
+                    mac_owner.pop(key,None)
+                    if not mac_socket: mac_ready.clear()
+                    async with app.state.pool.acquire() as con:
+                        await con.execute("update bothub.mac_status set state='offline' where mac_id=$1",mac_id)
+                    for future in pending_mac.get(key,{}).values():
+                        if not future.done(): future.set_exception(ConnectionError('Mac disconnected'))
 
     def mac_wait_timeout(timeout) -> float:
         # delegate шлёт до 1800+60 с, поэтому потолок 1900.
@@ -5375,8 +6458,12 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             # статусе running/waiting_mac - раньше проверялось только владение.
             if not turn: error('not_found',404)
             if turn['status'] not in ('running', 'waiting_mac'): error('forbidden',403)
+            if turn['turn_type'] == 'proactive': error('forbidden',403,'read_only_turn')
             waited = turn['status']=='waiting_mac'
             bot = await con.fetchrow('select * from bothub.bots where id=$1 and owner_id=$2',thread['bot_id'],who['user_id'])
+            if not bot['mac_id']:
+                error('forbidden',403,'bot has no Mac')
+            mac_id = bot['mac_id']
             await ping_turn(con,body.turn_id)
             # Имя для auto_allow/риска - как видит инструмент Claude (раздел 4/5).
             mcp_tool = f"mcp__bothub__mac_{body.tool}"
@@ -5402,10 +6489,15 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                     if not allowed: error('forbidden',403)
             else:
                 error('invalid', 400, f'unknown mac tool: {body.tool}')
-            state=await con.fetchval("select state from bothub.mac_status where owner_id=$1 and last_seen>now()-interval '90 seconds' order by id limit 1",who['user_id'])
-        socket=mac_socket.get(str(who['user_id']))
+            state=await con.fetchval("select state from bothub.mac_status where mac_id=$1 and last_seen>now()-interval '90 seconds' order by id limit 1",mac_id)
+        socket=mac_socket.get(str(mac_id))
         if not socket or state!='online':
             wol=os.getenv('MAC_WOL_CMD')
+            if wol:
+                # Команда WOL без адреса Mac пригодна только при одном зарегистрированном устройстве.
+                async with app.state.pool.acquire() as con:
+                    if await con.fetchval('select count(*) from bothub.macs where owner_id=$1',who['user_id']) != 1:
+                        wol = None
             if wol:
                 waited=True
                 async with app.state.pool.acquire() as con:
@@ -5415,8 +6507,8 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                 deadline=asyncio.get_running_loop().time()+30
                 while asyncio.get_running_loop().time()<deadline:
                     async with app.state.pool.acquire() as con:
-                        state=await con.fetchval("select state from bothub.mac_status where owner_id=$1 and last_seen>now()-interval '90 seconds' order by id limit 1",who['user_id'])
-                    socket=mac_socket.get(str(who['user_id']))
+                        state=await con.fetchval("select state from bothub.mac_status where mac_id=$1 and last_seen>now()-interval '90 seconds' order by id limit 1",mac_id)
+                    socket=mac_socket.get(str(mac_id))
                     if socket and state=='online': break
                     await asyncio.sleep(.2)
             if not socket or state!='online':
@@ -5434,18 +6526,24 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
                     return JSONResponse({'error':'queued','detail':'лимит параллельных turn, ждём свободный слот','state':state or 'offline'},status_code=409)
         call_id=str(uuid.uuid4())
         future=asyncio.get_running_loop().create_future()
-        pending_mac.setdefault(str(who['user_id']),{})[call_id]=future
+        pending_mac.setdefault(str(mac_id),{})[call_id]=future
         try:
             try:
-                await socket.send_json({'type':'call','id':call_id,'tool':body.tool,'args':body.args,'timeout':body.timeout})
-            except ConnectionError:
+                async with mac_locks.setdefault(str(mac_id), asyncio.Lock()):
+                    async with app.state.pool.acquire() as con:
+                        valid = await con.fetchval('select 1 from bothub.macs m join bothub.bots b on b.mac_id=m.id '
+                            'where m.id=$1 and m.owner_id=$2 and b.id=$3 and b.owner_id=$2',mac_id,who['user_id'],thread['bot_id'])
+                    if not valid or mac_socket.get(str(mac_id)) is not socket:
+                        raise ConnectionError('Mac removed or disconnected')
+                    await socket.send_json({'type':'call','id':call_id,'tool':body.tool,'args':body.args,'timeout':body.timeout})
+            except (ConnectionError, WebSocketDisconnect, RuntimeError, OSError):
                 await release_approval()  # не отправлено: одобрение не потрачено
                 raise
             return await asyncio.wait_for(future, mac_wait_timeout(body.timeout))
-        except (asyncio.TimeoutError,ConnectionError):
+        except (asyncio.TimeoutError,ConnectionError,WebSocketDisconnect,RuntimeError,OSError):
             return JSONResponse({'error':'mac_unavailable','detail':'Mac agent unavailable','state':'offline'},status_code=409)
         finally:
-            pending_mac.get(str(who['user_id']),{}).pop(call_id,None)
+            pending_mac.get(str(mac_id),{}).pop(call_id,None)
 
     @app.post('/api/push/subscribe')
     async def subscribe(body: PushIn, request: Request):
@@ -5454,6 +6552,234 @@ def create_app(runner_factory=None, drafter=None, launcher=None) -> FastAPI:
             row=await con.fetchrow('insert into bothub.push_subscriptions(endpoint,keys,device,owner_id) values($1,$2::jsonb,$3,$4) on conflict(endpoint) do update set keys=$2::jsonb,device=$3 where bothub.push_subscriptions.owner_id=$4 returning *',body.endpoint,canonical(body.keys),body.device,who['user_id'])
             if not row: error('not_found',404)
             return data(row)
+
+    # --- Канал Telegram для бота ---
+    def telegram_channel_data(row):
+        plain = dict(row)
+        token_last4 = None
+        if plain.get('token_enc'):
+            try:
+                token = decrypt_secret(bytes(plain['token_enc']), row['id'].bytes).decode()
+                token_last4 = token[-4:] if len(token) >= 4 else token
+            except Exception:
+                token_last4 = None
+        plain.pop('token_enc', None)
+        plain.pop('webhook_secret', None)
+        return {**jsonable_encoder(plain), 'token_last4': token_last4}
+
+    def _resolve_public_url() -> str | None:
+        return os.getenv('BOTHUB_PUBLIC_ORIGIN')
+
+    async def _set_webhook_if_url(app, channel_row):
+        public_url = _resolve_public_url()
+        if not public_url or not channel_row['token_enc'] or not channel_row['webhook_secret']:
+            return None
+        try:
+            token = decrypt_secret(bytes(channel_row['token_enc']), channel_row['id'].bytes).decode()
+            webhook_url = f"{public_url.rstrip('/')}/bots/api/channels/telegram/{channel_row['id']}/webhook"
+            await channels_telegram.set_webhook(token, webhook_url, channel_row['webhook_secret'])
+            return webhook_url
+        except Exception:
+            log.error('telegram_webhook_failed', extra={'channel_id': str(channel_row['id'])})
+            return None
+
+    async def _delete_webhook_if_set(app, channel_row):
+        try:
+            if channel_row['token_enc']:
+                token = decrypt_secret(bytes(channel_row['token_enc']), channel_row['id'].bytes).decode()
+                await channels_telegram.delete_webhook(token)
+        except Exception:
+            log.error('telegram_webhook_delete_failed', extra={'channel_id': str(channel_row['id'])})
+
+    async def _reconcile_telegram_webhook(app, bot_id, owner_id, observed, *, effect):
+        async with app.state.pool.acquire() as con:
+            current = await con.fetchrow(
+                "select * from bothub.bot_channels where bot_id=$1 and kind='telegram' and owner_id=$2",
+                bot_id, owner_id)
+        if current and current['id'] == observed['id'] and current['webhook_secret'] == observed['webhook_secret'] and current['enabled'] == observed['enabled']:
+            return
+        if effect == 'set' and observed['token_enc']:
+            await _delete_webhook_if_set(app, observed)
+        if current and current['enabled']:
+            await _set_webhook_if_url(app, current)
+
+    @app.get('/api/bots/{bot_id}/channels/telegram')
+    async def get_telegram_channel(bot_id: str, request: Request):
+        who = await principal(request, owner=True)
+        async with app.state.pool.acquire() as con:
+            bot = await con.fetchrow('select id from bothub.bots where id=$1 and owner_id=$2', bot_id, who['user_id'])
+            if not bot: error('not_found', 404)
+            row = await con.fetchrow('select * from bothub.bot_channels where bot_id=$1 and kind=$2 and owner_id=$3', bot_id, 'telegram', who['user_id'])
+            if not row:
+                return JSONResponse({'kind': 'telegram', 'enabled': False, 'allowed_chat_ids': [], 'token_last4': None, 'bot_id': bot_id})
+            return telegram_channel_data(row)
+
+    @app.put('/api/bots/{bot_id}/channels/telegram')
+    async def put_telegram_channel(bot_id: str, body: JsonObject, request: Request):
+        who = await principal(request, owner=True)
+        body = body or {}
+        if set(body) - {'token', 'allowed_chat_ids', 'enabled'}: error('invalid')
+        token = body.get('token')
+        allowed = body.get('allowed_chat_ids', [])
+        enabled = body.get('enabled', True)
+        if not isinstance(allowed, list) or not all(type(x) is int and -(2**63) <= x < 2**63 for x in allowed):
+            error('invalid', 400, 'allowed_chat_ids')
+        if not isinstance(enabled, bool):
+            error('invalid', 400, 'enabled')
+        async with app.state.pool.acquire() as con:
+            async with con.transaction():
+                bot = await con.fetchrow('select id,owner_id from bothub.bots where id=$1 and owner_id=$2', bot_id, who['user_id'])
+                if not bot: error('not_found', 404)
+                if token is not None and (not isinstance(token, str) or len(token) > 256 or not channels_telegram.valid_token(token.strip())):
+                    error('invalid', 400, 'token')
+                await con.execute(
+                    "insert into bothub.bot_channels(id,bot_id,owner_id,kind,enabled) values($1,$2,$3,'telegram',false) "
+                    'on conflict(bot_id,kind) do nothing', uuid.uuid4(), bot_id, who['user_id'])
+                existing = await con.fetchrow(
+                    "select * from bothub.bot_channels where bot_id=$1 and kind='telegram' and owner_id=$2 for update",
+                    bot_id, who['user_id'])
+                if not existing: error('not_found', 404)
+                if token is None and not existing['token_enc']:
+                    error('invalid', 400, 'token is required for new channel')
+                token_changed = token is not None
+                if token is not None and existing['token_enc']:
+                    try:
+                        token_changed = decrypt_secret(bytes(existing['token_enc']), existing['id'].bytes).decode() != token.strip()
+                    except Exception:
+                        token_changed = True
+                try:
+                    token_enc_value = encrypt_secret(token.strip().encode(), existing['id'].bytes) if token is not None else existing['token_enc']
+                except ValueError:
+                    error('secret_keys_missing', 503, 'BOTHUB_SECRET_KEYS is not configured')
+                previous = existing if token_changed and existing['token_enc'] else None
+                webhook_secret = secrets.token_urlsafe(32) if token_changed else (existing['webhook_secret'] or secrets.token_urlsafe(32))
+                saved_allowed = allowed if 'allowed_chat_ids' in body else existing['allowed_chat_ids']
+                saved_enabled = enabled if 'enabled' in body else (existing['enabled'] if existing['token_enc'] else True)
+                row = await con.fetchrow(
+                    'update bothub.bot_channels set token_enc=$2, webhook_secret=$3, '
+                    'allowed_chat_ids=$4, enabled=$5 where id=$1 returning *',
+                    existing['id'], token_enc_value, webhook_secret, saved_allowed, saved_enabled)
+        if previous:
+            await _delete_webhook_if_set(app, previous)
+        webhook_url = await _set_webhook_if_url(app, row) if row['enabled'] else None
+        if not row['enabled']:
+            await _delete_webhook_if_set(app, row)
+        await _reconcile_telegram_webhook(app, bot_id, who['user_id'], row, effect='set' if row['enabled'] else 'delete')
+        result = telegram_channel_data(row)
+        if not webhook_url and row['enabled']:
+            result['webhook_hint'] = 'Задайте BOTHUB_PUBLIC_ORIGIN для автоматической установки webhook, или вызовите setWebhook вручную'
+        return result
+
+    @app.delete('/api/bots/{bot_id}/channels/telegram')
+    async def delete_telegram_channel(bot_id: str, request: Request):
+        who = await principal(request, owner=True)
+        async with app.state.pool.acquire() as con:
+            bot = await con.fetchrow('select id from bothub.bots where id=$1 and owner_id=$2', bot_id, who['user_id'])
+            if not bot: error('not_found', 404)
+            row = await con.fetchrow('select * from bothub.bot_channels where bot_id=$1 and kind=$2 and owner_id=$3', bot_id, 'telegram', who['user_id'])
+            if not row: error('not_found', 404)
+            await con.execute('delete from bothub.bot_channels where id=$1 and owner_id=$2', row['id'], who['user_id'])
+        await _delete_webhook_if_set(app, row)
+        await _reconcile_telegram_webhook(app, bot_id, who['user_id'], row, effect='delete')
+        return {'ok': True}
+
+    @app.post('/api/channels/telegram/{channel_id}/webhook', status_code=200)
+    async def telegram_webhook(channel_id: uuid.UUID, request: Request):
+        raw = await read_hook_body(request)
+        secret_header = request.headers.get('X-Telegram-Bot-Api-Secret-Token', '')
+        async with app.state.pool.acquire() as con:
+            async with con.transaction():
+                row = await con.fetchrow('select * from bothub.bot_channels where id=$1 and kind=$2 and enabled for share',
+                                         channel_id, 'telegram')
+                if not row or not row['webhook_secret'] or not row['token_enc']:
+                    error('not_found', 404)
+                if not hmac.compare_digest(secret_header, row['webhook_secret']):
+                    error('forbidden', 403)
+                try:
+                    update = json.loads(raw.decode())
+                except ValueError:
+                    error('invalid')
+                if not isinstance(update, dict): error('invalid')
+                update_id = update.get('update_id')
+                if type(update_id) is not int or not -(2**63) <= update_id < 2**63:
+                    error('invalid', 400, 'update_id')
+                msg = update.get('message')
+                if not isinstance(msg, dict): return {'status': 'ok'}
+                chat = msg.get('chat')
+                if not isinstance(chat, dict): return {'status': 'ok'}
+                chat_id = chat.get('id')
+                if type(chat_id) is not int or chat_id not in row['allowed_chat_ids']:
+                    return {'status': 'ok'}
+                text = msg.get('text')
+                if not isinstance(text, str) or not text.strip():
+                    return {'status': 'ok'}
+                inserted = await con.fetchval(
+                    'insert into bothub.telegram_updates(channel_id,update_id,chat_id) values($1,$2,$3) '
+                    'on conflict do nothing returning update_id', channel_id, update_id, chat_id)
+                if inserted is None:
+                    return {'status': 'ok'}
+                await con.execute('select pg_advisory_xact_lock(hashtextextended($1,0))', f'{channel_id}:{chat_id}')
+                mapped = await con.fetchrow(
+                    'select tt.thread_id, th.status from bothub.telegram_threads tt '
+                    'join bothub.threads th on th.id=tt.thread_id where tt.channel_id=$1 and tt.chat_id=$2',
+                    channel_id, chat_id)
+                if mapped and mapped['status'] == 'active':
+                    thread_id = mapped['thread_id']
+                else:
+                    thread_id = await con.fetchval(
+                        "insert into bothub.threads(bot_id,kind,title,owner_id) values($1,'direct',$2,$3) returning id",
+                        row['bot_id'], f'Telegram {chat_id}', row['owner_id'])
+                    if mapped:
+                        await con.execute(
+                            'update bothub.telegram_threads set thread_id=$3 where channel_id=$1 and chat_id=$2',
+                            channel_id, chat_id, thread_id)
+                    else:
+                        await con.execute(
+                            'insert into bothub.telegram_threads(channel_id,chat_id,thread_id) values($1,$2,$3)',
+                            channel_id, chat_id, thread_id)
+                turn = await create_turn(con, thread_id, text.strip(), 'hook')
+                await con.execute(
+                    'update bothub.telegram_updates set turn_id=$3 where channel_id=$1 and update_id=$2',
+                    channel_id, update_id, uuid.UUID(turn['id']))
+        return {'status': 'ok'}
+
+    async def _telegram_reply_data(con, turn_id: uuid.UUID):
+        row = await con.fetchrow(
+            'select t.*, th.bot_id, th.owner_id, tu.chat_id, tu.channel_id from bothub.turns t '
+            'join bothub.threads th on th.id=t.thread_id '
+            'join bothub.telegram_updates tu on tu.turn_id=t.id '
+            'where t.id=$1', turn_id)
+        if not row:
+            return
+        chat_id = row['chat_id']
+        channel = await con.fetchrow(
+            'select * from bothub.bot_channels where id=$1 and bot_id=$2 and kind=$3 and owner_id=$4 and enabled',
+            row['channel_id'], row['bot_id'], 'telegram', row['owner_id'])
+        if not channel or not channel['token_enc'] or chat_id not in (channel['allowed_chat_ids'] or []):
+            return
+        events = await con.fetch(
+            "select payload->>'text' as text from bothub.events where turn_id=$1 and kind='assistant_msg' order by seq",
+            turn_id)
+        reply = '\n'.join(e['text'] for e in events if e['text'])
+        if not reply:
+            return
+        token = decrypt_secret(bytes(channel['token_enc']), channel['id'].bytes).decode()
+        return token, chat_id, reply
+
+    async def _send_telegram_reply(turn_id: uuid.UUID):
+        try:
+            async with app.state.pool.acquire() as con:
+                message = await _telegram_reply_data(con, turn_id)
+        except Exception:
+            log.exception('telegram_reply_failed', extra={'turn_id': str(turn_id)})
+            return
+        if message:
+            token, chat_id, reply = message
+            try:
+                await channels_telegram.send_message(token, chat_id, reply)
+            except Exception:
+                log.error('telegram_send_reply_failed', extra={'turn_id': str(turn_id), 'chat_id': chat_id})
+
 
     # Ядро отдаёт PWA: смонтировано последним, чтобы /api, /agent, /hooks матчились раньше.
     pwa_dir = Path(os.getenv('PWA_DIR') or (Path(__file__).resolve().parents[2] / 'pwa'))

@@ -878,21 +878,38 @@ async def test_mac_status_no_longer_pinned_to_id_1(con):
     await rejected(Check, con, "update bothub.mac_status set state='broken' where id=1")
 
 
-async def test_api_mac_status_reads_row_1_when_other_rows_exist():
+async def test_api_mac_status_reads_first_registered_mac_for_owner():
     app = create_app(lambda provider: None)
     async with app.router.lifespan_context(app):
         try:
             async with app.state.pool.acquire() as con:
-                owner = await user(con)
-                await con.execute("insert into bothub.mac_status(id,state,last_seen,info) values(1,'online',now(),'{\"host\":\"first\"}')")
-                await con.execute(
-                    "insert into bothub.mac_status(owner_id,state,last_seen,info) values($1,'online',now(),'{\"host\":\"second\"}')", owner
+                owner = await con.fetchval("select (value #>> '{}')::uuid from bothub.settings where key='setup_user_id'")
+                other_owner = await user(con)
+                await con.execute("insert into bothub.mac_status(id,state,last_seen,info) values(1,'online',now(),'{\"host\":\"legacy\"}')")
+                first = await con.fetchval(
+                    "insert into bothub.macs(owner_id,name,created_at,last_seen_at) "
+                    "values($1,'First',now()-interval '2 minutes',now()) returning id", owner
                 )
+                second = await con.fetchval(
+                    "insert into bothub.macs(owner_id,name,created_at,last_seen_at) "
+                    "values($1,'Second',now()-interval '1 minute',now()) returning id", owner
+                )
+                outsider = await con.fetchval(
+                    "insert into bothub.macs(owner_id,name,created_at,last_seen_at) "
+                    "values($1,'Other',now()-interval '3 minutes',now()) returning id", other_owner
+                )
+                for mac_id, host, mac_owner in ((first, 'first', owner), (second, 'second', owner), (outsider, 'other', other_owner)):
+                    await con.execute(
+                        "insert into bothub.mac_status(owner_id,mac_id,state,last_seen,info) "
+                        "values($1,$2,'online',now(),jsonb_build_object('host',$3::text))",
+                        mac_owner, mac_id, host,
+                    )
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
                 response = await client.get("/api/mac/status", headers={"Authorization": "Bearer test-owner"})
             assert response.status_code == 200
             body = response.json()
             assert set(body) == {"state", "last_seen", "info"}
+            assert body["state"] == "offline"  # no live WebSocket
             assert body["info"] == {"host": "first"}
         finally:
             async with app.state.pool.acquire() as con:

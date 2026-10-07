@@ -267,6 +267,11 @@ def test_subscription_login_recreates_idle_bot_after_active_turn(monkeypatch):
             assert result.status_code == 201, result.text
         wait_bots_idle(client, 'idle-bot', 'busy-bot')
 
+        async def expire_provider():
+            async with app.state.pool.acquire() as con:
+                await con.execute("update bothub.providers set status='needs_login' where id=$1", uuid.UUID(provider_id))
+        client.portal.call(expire_provider)
+
         async def start_busy_turn():
             async with app.state.pool.acquire() as con:
                 thread_id = await con.fetchval("insert into bothub.threads(bot_id,owner_id) select id,owner_id from bothub.bots where id='busy-bot' returning id")
@@ -285,6 +290,7 @@ def test_subscription_login_recreates_idle_bot_after_active_turn(monkeypatch):
                 time.sleep(0.05)
         assert not bots['idle-bot']['need_restart']
         assert bots['busy-bot']['need_restart']
+        assert client.get('/api/providers', headers=OWNER).json()[0]['status'] == 'ok'
         assert any(call[0]=='recreate_bot' and call[1]=='idle-bot' for call in launcher.calls)
         assert not any(call[0]=='recreate_bot' and call[1]=='busy-bot' for call in launcher.calls)
 

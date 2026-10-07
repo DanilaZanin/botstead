@@ -31,14 +31,14 @@ class ClaudeRunner(SubprocessRunner):
         if turn.compact:
             # Служебный ход сжатия только пишет сводку: `--tools ""` отключает все встроенные инструменты (claude --help),
             # без --mcp-config и с --strict-mcp-config не поднимается ни один MCP-сервер, в том числе наш approve.
-            command += ["--tools", "", "--strict-mcp-config"]
+            command += ["--tools", "Read,Glob,Grep,WebSearch" if turn.turn_type == 'proactive' else "", "--strict-mcp-config"]
         else:
             command += ["--mcp-config", json.dumps(config), "--permission-prompt-tool", "mcp__bothub__approve"]
             if not turn.bot.get("mcp_allow"):
                 command += ["--strict-mcp-config"]  # пустой mcp_allow: только сервер bothub, чужие серверы из настроек CLI не поднимаются
         command += ["--append-system-prompt", "\n\n".join(filter(None, (
             turn.bot.get("instructions", ""), turn.memory_md)))]
-        if turn.dry_run:
+        if turn.dry_run or turn.turn_type == 'proactive':
             command += ["--permission-mode", "plan"]
         return command
 

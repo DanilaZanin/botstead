@@ -47,7 +47,7 @@ class CodexRunner(SubprocessRunner):
             # оболочку и unified exec (`--disable <FEATURE>`, `codex features list`), остальное запрещает слой ядра:
             # первый же tool_call хода сжатия его останавливает.
             command += ["--disable", "shell_tool", "--disable", "unified_exec"]
-        if not turn.bot.get("mcp_allow"):
+        if turn.compact or not turn.bot.get("mcp_allow"):
             command += ["--ignore-user-config"]
         if not turn.compact:
             command += BOTHUB_MCP_FLAGS

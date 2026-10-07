@@ -1,4 +1,4 @@
-"""Пределы длины полей: 422 {error, detail} на превышение, публичные маршруты не отвечают 500 на длинные поля."""
+"""Пределы длины полей и ответы без повтора входных данных."""
 import json
 import uuid
 from contextlib import asynccontextmanager
@@ -7,8 +7,11 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
-from bothub import auth
-from bothub.main import BotIn, BotPatch, DecisionIn, PushIn, ScheduleIn, TurnIn, create_app, parse_email
+from bothub import auth, delegation, group_chat, procedures, wakeups
+from bothub.main import (ApprovalIn, BotIn, BotPatch, BrowserCallIn, DecisionIn, DelegateIn, GroupIn, GroupMessageIn,
+                         GroupPatchIn, MemoryIn, ProcedureFromTurnIn, ProcedureImportIn, ProcedureIn,
+                         ProcedurePatch, ProcedureRunIn, PushIn, ScheduleIn, ThreadIn, TurnIn, WakeupIn,
+                         create_app, parse_email)
 
 pytestmark = pytest.mark.pure
 
@@ -72,9 +75,9 @@ async def post_escaped(client, url, body, field, **kwargs):
     return await client.post(url, content="{" + ", ".join(parts) + "}", headers={"content-type": "application/json"} | kwargs.get("headers", {}))
 
 
-def refused(response, detail=None):
+def refused(response, detail=None, status=422):
     body = response.json()
-    assert response.status_code == 422, response.text
+    assert response.status_code == status, response.text
     assert body["error"] == "invalid" and body["detail"]
     if detail:
         assert detail in body["detail"], body
@@ -105,10 +108,12 @@ def test_auto_allow_rule_bounds(model):
             model.model_validate(base | {"auto_allow": bad})
 
 
-async def test_list_limits_answer_422(client, app):
+async def test_list_limits_answer_400(client, app):
     headers = owner_headers(app)
-    for field, bad in (("mcp_allow", ["x" * 201]), ("mcp_allow", [""]), ("mcp_allow", ["x"] * 201),
-                       ("auto_allow", [{"tool": "x" * 201}]), ("auto_allow", [{"tool": ""}]), ("auto_allow", [{}] * 201)):
+    for field, bad in (("mcp_allow", ["x" * 201]), ("mcp_allow", ["x"] * 201),
+                       ("auto_allow", [{"tool": "x" * 201}]), ("auto_allow", [{}] * 201)):
+        refused(await client.post("/api/bots", json=BOT | {field: bad}, headers=headers), status=400)
+    for field, bad in (("mcp_allow", [""]), ("auto_allow", [{"tool": ""}])):
         refused(await client.post("/api/bots", json=BOT | {field: bad}, headers=headers))
 
 
@@ -140,28 +145,97 @@ def test_timezone_bounds_and_zoneinfo():
 
 
 def test_device_bounds():
-    PushIn.model_validate({"endpoint": "e", "keys": {}, "device": "d" * 200})
+    PushIn.model_validate({"endpoint": "e", "keys": {}, "device": "d" * 128})
     PushIn.model_validate({"endpoint": "e", "keys": {}})
     with pytest.raises(ValueError):
-        PushIn.model_validate({"endpoint": "e", "keys": {}, "device": "d" * 201})
+        PushIn.model_validate({"endpoint": "e", "keys": {}, "device": "d" * 129})
 
 
-async def test_turn_client_limit_answers_422(client, app):
+def test_push_subscription_bounds():
+    PushIn.model_validate({"endpoint": "e" * 2048, "keys": {"k" * 256: "v" * 256}})
+    for body in ({"endpoint": "e" * 2049, "keys": {}},
+                 {"endpoint": "e", "keys": {"k" * 257: "v"}},
+                 {"endpoint": "e", "keys": {"k": "v" * 257}}):
+        with pytest.raises(ValueError):
+            PushIn.model_validate(body)
+
+
+@pytest.mark.parametrize("model,base,field,limit", [
+    (BotIn, BOT, "provider", 200), (BotIn, BOT, "model", 200),
+    (BotPatch, {}, "provider", 200), (BotPatch, {}, "model", 200),
+    (ThreadIn, {}, "bot_id", 200), (ThreadIn, {"bot_id": "b"}, "title", 200),
+    (ApprovalIn, {"thread_id": str(OWNER), "title": "t", "tool": "tool", "args": {}}, "risk", 200),
+    (ApprovalIn, {"thread_id": str(OWNER), "risk": "r", "tool": "tool", "args": {}}, "title", 200),
+    (DecisionIn, {}, "decision", 200),
+    (MemoryIn, {"text": "memo"}, "bot_id", 200),
+    (ScheduleIn, {"name": "n", "kind": "cron", "prompt": "p"}, "bot_id", 200),
+    (ScheduleIn, {"bot_id": "b", "kind": "cron", "prompt": "p"}, "name", 200),
+    (ScheduleIn, {"bot_id": "b", "name": "n", "prompt": "p"}, "kind", 64),
+    (ScheduleIn, {"bot_id": "b", "name": "n", "kind": "cron", "prompt": "p"}, "cron", 200),
+    (WakeupIn, {"prompt": "p"}, "at", 64),
+    (DelegateIn, {"task": "t", "turn_id": str(OWNER)}, "bot", 200),
+    (GroupIn, {"title": "t", "bot_ids": ["b"], "mode": "round"}, "moderator_bot_id", 200),
+    (GroupPatchIn, {}, "moderator_bot_id", 200),
+    (BrowserCallIn, {"thread_id": str(OWNER), "turn_id": str(OWNER), "action": "click"}, "name", 200),
+    (ProcedureIn, {"name": "n"}, "bot_id", 200),
+    (ProcedurePatch, {}, "bot_id", 200),
+    (ProcedureImportIn, {"name": "n"}, "format", 200),
+    (ProcedureRunIn, {}, "bot_id", 200),
+])
+def test_free_string_bounds(model, base, field, limit):
+    model.model_validate(base | {field: "x" * limit})
+    with pytest.raises(ValueError):
+        model.model_validate(base | {field: "x" * (limit + 1)})
+
+
+@pytest.mark.parametrize("model,base,field,limit,validator,code", [
+    (WakeupIn, {}, "prompt", 2000, wakeups.clean_prompt, "prompt_too_long"),
+    (WakeupIn, {"prompt": "p"}, "reason", 200, wakeups.clean_reason, "reason_too_long"),
+    (DelegateIn, {"bot": "b", "turn_id": str(OWNER)}, "task", 4000, delegation.clean_task, "task_too_long"),
+    (GroupIn, {"bot_ids": ["b"], "mode": "round"}, "title", 120, group_chat.clean_title, "title_too_long"),
+    (GroupPatchIn, {}, "title", 120, group_chat.clean_title, "title_too_long"),
+    (GroupMessageIn, {}, "text", 8000, group_chat.clean_message, "text_too_long"),
+    (ProcedureIn, {}, "name", 120, procedures.check_name, "too_long"),
+    (ProcedureIn, {"name": "n"}, "description", 2000, procedures.check_description, "too_long"),
+    (ProcedurePatch, {}, "name", 120, procedures.check_name, "too_long"),
+    (ProcedurePatch, {}, "description", 2000, procedures.check_description, "too_long"),
+    (ProcedureImportIn, {}, "name", 120, procedures.check_name, "too_long"),
+    (ProcedureImportIn, {"name": "n"}, "description", 2000, procedures.check_description, "too_long"),
+    (ProcedureFromTurnIn, {"thread_id": str(OWNER)}, "name", 120, procedures.check_name, "too_long"),
+])
+def test_manual_validation_fields_reach_route(model, base, field, limit, validator, code):
+    value = "x" * (limit + 1)
+    model.model_validate(base | {field: value})
+    with pytest.raises(ValueError) as caught:
+        validator(value)
+    assert caught.value.code == code
+    if hasattr(caught.value, "status"):
+        assert caught.value.status == 422
+
+
+def test_group_bot_id_item_bound():
+    base = {"title": "t", "mode": "round"}
+    GroupIn.model_validate(base | {"bot_ids": ["x" * 200]})
+    with pytest.raises(ValueError):
+        GroupIn.model_validate(base | {"bot_ids": ["x" * 201]})
+
+
+async def test_turn_client_limit_answers_400(client, app):
     url = f"/api/threads/{uuid.uuid4()}/turns"
-    refused(await client.post(url, json={"prompt": "hi", "client": "c" * 65}, headers=owner_headers(app)), "client")
+    refused(await client.post(url, json={"prompt": "hi", "client": "c" * 65}, headers=owner_headers(app)), "client", 400)
     ok = await client.post(url, json={"prompt": "hi", "client": "c" * 64})
     assert ok.status_code == 401, "the boundary value passed validation and stopped at the authentication"
 
 
-async def test_decision_client_limit_answers_422(client, app):
+async def test_decision_client_limit_answers_400(client, app):
     url = f"/api/approvals/{uuid.uuid4()}/decide"
-    refused(await client.post(url, json={"decision": "approve", "client": "c" * 65}, headers=owner_headers(app)), "client")
+    refused(await client.post(url, json={"decision": "approve", "client": "c" * 65}, headers=owner_headers(app)), "client", 400)
 
 
-async def test_schedule_timezone_limits_answer_422(client, app):
+async def test_schedule_timezone_limits_answer_400(client, app):
     headers = owner_headers(app)
     base = {"bot_id": "scout", "name": "n", "kind": "cron", "cron": "0 9 * * *", "prompt": "p"}
-    refused(await client.post("/api/schedules", json=base | {"timezone": "x" * 65}, headers=headers), "64")
+    refused(await client.post("/api/schedules", json=base | {"timezone": "x" * 65}, headers=headers), "timezone", 400)
     refused(await client.post("/api/schedules", json=base | {"timezone": "Mars/Olympus"}, headers=headers), "time zone")
     refused(await client.post("/api/schedules", json=base | {"timezone": "../../etc/passwd"}, headers=headers), "time zone")
     ok = await client.post("/api/schedules", json=base | {"timezone": "Europe/Moscow"})
@@ -177,10 +251,10 @@ async def test_bot_schedule_timezone_limits_answer_422(client, app):
     assert wrong_type.status_code == 400
 
 
-async def test_push_device_limit_answers_422(client, app):
+async def test_push_device_limit_answers_400(client, app):
     headers = owner_headers(app)
-    refused(await client.post("/api/push/subscribe", json={"endpoint": "e", "keys": {}, "device": "d" * 201}, headers=headers), "device")
-    ok = await client.post("/api/push/subscribe", json={"endpoint": "e", "keys": {}, "device": "d" * 200})
+    refused(await client.post("/api/push/subscribe", json={"endpoint": "e", "keys": {}, "device": "d" * 129}, headers=headers), "device", 400)
+    ok = await client.post("/api/push/subscribe", json={"endpoint": "e", "keys": {}, "device": "d" * 128})
     assert ok.status_code == 401, "the boundary value passed validation and stopped at the authentication"
 
 
@@ -195,7 +269,7 @@ def test_email_check_bounds():
                 "a@x\x00.com", "a\n@x.com", "a@\ud800.com"):
         with pytest.raises(Exception) as caught:
             parse_email(bad)
-        assert caught.value.status_code == 422
+        assert caught.value.status_code == (400 if len(bad.strip()) > 254 else 422)
 
 
 def test_email_must_be_a_string():
@@ -205,10 +279,12 @@ def test_email_must_be_a_string():
         assert caught.value.status_code == 400
 
 
-async def test_invite_accept_with_a_huge_email_answers_422(client):
+async def test_invite_accept_with_a_huge_email_answers_400(client):
     base = {"token": "t" * 43, "password": "long-password"}
     for email in ("a" * MEGABYTE + "@example.com", "a" * 255 + "@x.com", "a" * 249 + "@x.com", "nope", "a@b@c.d", "a\x00@b.c", ""):
-        refused(await client.post("/api/invites/accept", json=base | {"email": email}), "email")
+        response = await client.post("/api/invites/accept", json=base | {"email": email})
+        refused(response, "email", 400 if len(email.strip()) > 254 else 422)
+        assert email not in response.text or not email
 
 
 async def test_invite_accept_limits_on_the_other_fields(client):
@@ -230,8 +306,8 @@ async def test_invite_check_with_a_huge_token_is_not_an_error(client):
 
 async def test_setup_limits_answer_422_before_the_database(client):
     base = {"email": "a@example.com", "password": "long-password"}
-    refused(await client.post("/api/setup", json=base | {"email": "a" * MEGABYTE + "@x.com"}), "email")
-    refused(await client.post("/api/setup", json=base | {"email": "a" * 255 + "@x.com"}), "email")
+    refused(await client.post("/api/setup", json=base | {"email": "a" * MEGABYTE + "@x.com"}), "email", 400)
+    refused(await client.post("/api/setup", json=base | {"email": "a" * 255 + "@x.com"}), "email", 400)
     refused(await client.post("/api/setup", json=base | {"email": "nope"}), "email")
     refused(await client.post("/api/setup", json=base | {"password": "p" * MEGABYTE}), "password")
     refused(await client.post("/api/setup", json=base | {"password": "p" * 513}), "password")
@@ -242,8 +318,8 @@ async def test_setup_limits_answer_422_before_the_database(client):
 
 async def test_login_limits_answer_422_before_the_database(client):
     base = {"email": "a@example.com", "password": "long-password"}
-    refused(await client.post("/api/auth/login", json=base | {"email": "a" * MEGABYTE + "@x.com"}), "email")
-    refused(await client.post("/api/auth/login", json=base | {"email": "a" * 255 + "@x.com"}), "email")
+    refused(await client.post("/api/auth/login", json=base | {"email": "a" * MEGABYTE + "@x.com"}), "email", 400)
+    refused(await client.post("/api/auth/login", json=base | {"email": "a" * 255 + "@x.com"}), "email", 400)
     refused(await client.post("/api/auth/login", json=base | {"email": "a\x00@x.com"}), "email")
     refused(await client.post("/api/auth/login", json=base | {"password": "p" * MEGABYTE}), "password")
     refused(await client.post("/api/auth/login", json=base | {"password": "p" * 513}), "password")

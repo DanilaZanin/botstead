@@ -2,6 +2,20 @@
 // Additional English translations for Botstead PWA (memory, usage, plurals, missing templates).
 
 export default {
+  'Подсказки': 'Suggestions',
+  'Подсказок пока нет.': 'No suggestions yet.',
+  'Сделать': 'Do it',
+  'Скрыть': 'Dismiss',
+  'Подсказки бота': 'Bot suggestions',
+  'Бот предложит до 3 действий, ничего не выполняя.': 'The bot suggests up to 3 actions without taking them.',
+  'Выключено': 'Off',
+  'Интервал подсказок в часах': 'Suggestion interval in hours',
+  'Интервал: от 1 до 720 часов. Пустое поле выключает подсказки.': 'Interval: 1 to 720 hours. Leave blank to turn suggestions off.',
+  'Каждый час': 'Every hour',
+  'Каждые 3 часа': 'Every 3 hours',
+  'Каждые 6 часов': 'Every 6 hours',
+  'Каждые 12 часов': 'Every 12 hours',
+  'Каждые 24 часа': 'Every 24 hours',
   // i18n-missing.json: exact interface strings
   '30 дней': '30 days',
   '· Общая для всех ботов': '· Shared across all bots',
@@ -290,7 +304,7 @@ export default {
   'Проверяю вход': 'Checking the sign-in',
   'Смотрю, выполнен ли вход на сервере.': 'Checking whether you are already signed in on the server.',
   'Вход уже выполнен': 'Already signed in',
-  'Подписка подключена, список моделей обновлён. Если нужен другой аккаунт, нажмите «Войти заново».': 'The subscription is connected and the model list is up to date. To use another account, press "Log in again".',
+  'Подписка подключена, список моделей обновлён. Если нужен другой аккаунт, нажмите «Войти заново».': 'The subscription is connected and the model list is up to date. To use another account, press "Sign in again".',
   'Терминал откроется, если вход нужно выполнить заново.': 'The terminal opens if you need to sign in again.',
   'Сервер проверяет подписку и обновляет список моделей.': 'The server is checking the subscription and refreshing the model list.',
   '${CLI_LABEL[cli] || cli} подключён. Окно входа можно закрыть, вход сохранён на сервере.': '${CLI_LABEL[cli] || cli} is connected. You can close the sign-in window; the sign-in is saved on the server.',

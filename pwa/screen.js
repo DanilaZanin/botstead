@@ -85,6 +85,7 @@ async function openRfb({ host, botId, viewOnly, fit, onConnect, onClose }) {
 // ---------------------------------------------------------------------------
 const W = 1280;
 const H = 800;
+const DEMO = api.MOCK && new URLSearchParams(location.search).get('demo') === '1';
 
 function drawPage(ctx, { caret, dots, hint }) {
   ctx.fillStyle = '#eef1f4';
@@ -93,18 +94,18 @@ function drawPage(ctx, { caret, dots, hint }) {
   ctx.fillRect(0, 0, W, 64);
   ctx.fillStyle = '#ffffff';
   ctx.font = '600 24px sans-serif';
-  ctx.fillText('status.example.org', 32, 40);
+  ctx.fillText(DEMO ? 'reports.example.com' : 'status.example.org', 32, 40);
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(360, 160, 560, 440);
   ctx.strokeStyle = '#c9ced4';
   ctx.strokeRect(360, 160, 560, 440);
   ctx.fillStyle = '#16181a';
   ctx.font = '600 32px sans-serif';
-  ctx.fillText('Вход в панель', 400, 220);
+  ctx.fillText(DEMO ? 'Sign in to reports' : 'Вход в панель', 400, 220);
   ctx.font = '400 20px sans-serif';
   ctx.fillStyle = '#565c62';
-  ctx.fillText('Логин', 400, 280);
-  ctx.fillText('Пароль', 400, 380);
+  ctx.fillText(DEMO ? 'Email' : 'Логин', 400, 280);
+  ctx.fillText(DEMO ? 'Password' : 'Пароль', 400, 380);
   ctx.strokeStyle = '#858b83';
   ctx.strokeRect(400, 296, 480, 52);
   ctx.strokeRect(400, 396, 480, 52);
@@ -116,7 +117,7 @@ function drawPage(ctx, { caret, dots, hint }) {
   ctx.fillRect(400, 490, 480, 56);
   ctx.fillStyle = '#ffffff';
   ctx.font = '600 22px sans-serif';
-  ctx.fillText('Войти', 604, 526);
+  ctx.fillText(DEMO ? 'Sign in' : 'Войти', 604, 526);
   if (hint) {
     ctx.fillStyle = '#7a3e06';
     ctx.font = '400 18px sans-serif';

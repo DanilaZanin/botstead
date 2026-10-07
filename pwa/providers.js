@@ -277,10 +277,10 @@ function detailHtml(p, allModels, bots) {
   const checkIdle = `${ICONS.retry}Проверить`;
   const pending = p.status === 'pending_admin';
   let recovery = '';
-  if (p.status === 'error' && problem) {
-    const action = cli ? `<a class="btn btn-primary" href="${loginHref}">Войти</a>`
+  if ((p.status === 'error' || p.status === 'needs_login') && problem) {
+    const action = cli ? `<a class="btn btn-primary" href="${loginHref}">${p.status === 'needs_login' ? 'Войти заново' : 'Войти'}</a>`
       : `<button type="button" class="btn btn-secondary" data-act="replace">${p.kind === 'openai_compatible' ? 'Изменить адрес или ключ' : 'Заменить ключ'}</button>`;
-    recovery = `<div class="banner ${problem.code === 'login' ? 'banner-attention' : 'banner-danger'}" role="status"><span class="banner-icon">${ICONS.alert}</span><span class="banner-text"><span class="banner-title">${esc(problem.title)}</span><span class="banner-sub">${esc(problem.text)}${dependent.length ? ` Затронуты боты: ${esc(dependent.map((b) => b.name).join(', '))}.` : ''}</span>${p.last_error ? `<details><summary class="t-footnote">Подробнее</summary><span class="t-log">${esc(p.last_error)}</span></details>` : ''}</span></div>${action ? `<div class="row gap-2">${action}</div>` : ''}`;
+    recovery = `<div class="banner ${problem.code === 'login' ? 'banner-attention' : 'banner-danger'}" role="status"><span class="banner-icon">${ICONS.alert}</span><span class="banner-text"><span class="banner-title">${esc(problem.title)}</span><span class="banner-sub">${esc(problem.text)}${dependent.length ? ` Затронуты боты: ${esc(dependent.map((b) => b.name).join(', '))}.` : ''}</span>${p.last_error && p.status !== 'needs_login' ? `<details><summary class="t-footnote">Подробнее</summary><span class="t-log">${esc(p.last_error)}</span></details>` : ''}</span></div>${action ? `<div class="row gap-2">${action}</div>` : ''}`;
   } else if (pending || p.status === 'unchecked') {
     recovery = pendingBlock(p, dependent);
   } else if (cli && p.status !== 'ok') {

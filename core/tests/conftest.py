@@ -54,6 +54,7 @@ async def _truncate_tables() -> None:
         await conn.execute(
             "truncate bothub.events, bothub.approvals, bothub.usage, "
             "bothub.files, bothub.schedules, bothub.memory, bothub.turns, "
+            "bothub.slack_handled_events, "
             "bothub.threads, bothub.bots, bothub.outbox, "
             "bothub.push_subscriptions, bothub.mac_status, "
             "bothub.secrets, bothub.procedure_runs, bothub.procedures, bothub.models, bothub.providers, "

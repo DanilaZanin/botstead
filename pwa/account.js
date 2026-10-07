@@ -3,7 +3,7 @@
 import * as api from './api.js';
 import { ICONS, esc, plural, fmtDate, fmtDateTime, alertHtml } from './ui.js';
 import { usableCount } from './registry.js';
-import { LANGS, getLang, setLang } from './i18n.js';
+import { LANGS, getLang, setLang, t } from './i18n.js';
 
 let ctx = null;
 const NOTES_KEY = 'bothub_invite_notes';
@@ -30,7 +30,7 @@ export function createAccount(context) {
   ctx = context;
   return {
     viewLogin, viewTokenGate, viewSetup, viewInvite, viewWelcome,
-    viewSettings, viewUsers, viewPassword, viewSessions, viewStub, takeWelcome, viewOffline,
+    viewSettings, viewMacs, viewUsers, viewPassword, viewSessions, viewStub, takeWelcome, viewOffline,
   };
 }
 
@@ -596,6 +596,7 @@ export async function viewSettings() {
       <section class="stack gap-2" aria-labelledby="st-bots"><h2 class="section-label" id="st-bots">Боты</h2>
         <div class="settings-group">
           ${settingsRow({ href: '#/settings/providers', iconHtml: ICONS.plug, title: 'Провайдеры', text: 'Модели для ботов' })}
+          ${settingsRow({ href: '#/settings/macs', iconHtml: ICONS.laptop, title: 'Mac-агенты', text: 'Устройства для ботов' })}
           ${settingsRow({ href: '#/memory', iconHtml: ICONS.memory, title: 'Память', text: 'Что боты запомнили' })}
           ${settingsRow({ href: '#/settings/permissions', iconHtml: ICONS.sliders, title: 'Разрешения', soon: true })}
           ${settingsRow({ href: '#/settings/activity', iconHtml: ICONS.activity, title: 'Активность', text: 'Журнал действий и пауза ботов' })}
@@ -637,6 +638,122 @@ export async function viewSettings() {
     langGroup.addEventListener('keydown', applyLang);
   }
   if (admin) paintRequestsBadge();
+}
+
+const MAC_STATES = {
+  online: 'На связи',
+  locked: 'Заблокирован',
+  sleep: 'Спит',
+  needs_permission: 'Требует разрешения',
+  offline: 'Не на связи',
+};
+
+function macStateLabel(state) {
+  return MAC_STATES[state] || MAC_STATES.offline;
+}
+
+function macCard(mac) {
+  const lastSeen = mac.last_seen_at ? (fmtDateTime(mac.last_seen_at) || t('Ещё не подключался')) : t('Ещё не подключался');
+  return `<article class="card card-pad stack gap-2" data-mac="${esc(mac.id)}">
+    <div class="row gap-2" style="align-items:flex-start;">
+      <div class="flex-1 stack gap-1">
+        <span class="t-headline" data-i18n-skip>${esc(mac.name)}</span>
+        <span class="t-footnote">${esc(macStateLabel(mac.state))}</span>
+        <span class="t-footnote"><span>Последняя связь</span>: <span data-i18n-skip>${esc(lastSeen)}</span></span>
+      </div>
+      <button type="button" class="btn btn-danger" data-mac-delete="${esc(mac.id)}" data-mac-name="${esc(mac.name)}">Удалить</button>
+    </div>
+  </article>`;
+}
+
+export async function viewMacs() {
+  let macs = await api.listMacs();
+  await ctx.frame({
+    title: 'Mac-агенты',
+    subtitle: 'Устройства, доступные ботам',
+    backHref: '#/settings',
+    body: `<div class="page-narrow stack gap-4">
+      <form id="mac-form" class="card card-pad stack gap-3" novalidate>
+        <div class="field">
+          <label for="mac-name">Имя Mac</label>
+          <input id="mac-name" class="input" type="text" maxlength="80" autocomplete="off" placeholder="Например, MacBook Pro" required>
+        </div>
+        <p class="t-footnote">После добавления появится одноразовый токен регистрации. Сохраните его сейчас, ядро больше его не покажет.</p>
+        <div class="form-alert" id="mac-form-alert"></div>
+        <button type="submit" class="btn btn-primary" id="mac-submit">Добавить Mac</button>
+      </form>
+      <section class="stack gap-2" aria-labelledby="mac-list-title">
+        <h2 class="section-label" id="mac-list-title">Список Mac</h2>
+        <div id="mac-token" hidden></div>
+        <div id="mac-list" class="stack gap-2">${macs.length ? macs.map(macCard).join('') : '<p class="t-footnote">Mac-агентов пока нет.</p>'}</div>
+      </section>
+    </div>`,
+  });
+
+  const form = $('#mac-form');
+  const nameInput = $('#mac-name');
+  const alertBox = $('#mac-form-alert');
+  const submit = $('#mac-submit');
+  const list = $('#mac-list');
+  const tokenBox = $('#mac-token');
+  let oneTimeMacId = null;
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const name = nameInput.value.trim();
+    if (!name || name.length > 80) {
+      alertBox.innerHTML = alertHtml('Не удалось добавить Mac', 'Введите имя длиной от 1 до 80 символов.');
+      nameInput.focus();
+      return;
+    }
+    submit.disabled = true;
+    alertBox.innerHTML = '';
+    try {
+      const created = await api.createMac({ name });
+      const { token, ...registeredMac } = created;
+      macs = [registeredMac, ...macs];
+      list.innerHTML = macs.map(macCard).join('');
+      tokenBox.hidden = false;
+      tokenBox.innerHTML = `<div class="banner banner-attention" role="status">
+        <span class="banner-icon">${ICONS.lock}</span>
+        <span class="banner-text"><span class="banner-title">Токен регистрации</span>
+          <span class="banner-sub">Он доступен только сейчас. Передайте его настройке Mac-агента.</span>
+          <code class="invite-link" data-i18n-skip>${esc(token || '')}</code>
+        </span>
+      </div>`;
+      oneTimeMacId = created.id;
+      nameInput.value = '';
+    } catch (error) {
+      const message = error.status === 422 ? 'Проверьте имя Mac и повторите.'
+        : error.status ? 'Не удалось добавить Mac. Попробуйте ещё раз.'
+          : 'Сервер не ответил. Проверьте сеть и повторите.';
+      alertBox.innerHTML = alertHtml('Не удалось добавить Mac', message);
+    } finally {
+      submit.disabled = false;
+    }
+  });
+
+  list.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-mac-delete]');
+    if (!button) return;
+    const id = button.getAttribute('data-mac-delete');
+    const name = button.getAttribute('data-mac-name') || '';
+    if (!window.confirm(t('Удалить Mac «${name}»? Боты потеряют к нему доступ.', { name }))) return;
+    button.disabled = true;
+    try {
+      await api.deleteMac(id);
+      macs = macs.filter((mac) => mac.id !== id);
+      list.innerHTML = macs.length ? macs.map(macCard).join('') : '<p class="t-footnote">Mac-агентов пока нет.</p>';
+      if (oneTimeMacId === id) {
+        tokenBox.hidden = true;
+        tokenBox.innerHTML = '';
+        oneTimeMacId = null;
+      }
+    } catch {
+      button.disabled = false;
+      alert(t('Не удалось удалить Mac. Попробуйте ещё раз.'));
+    }
+  });
 }
 
 // Счётчик запросов на внутренние адреса в строке настроек: не задерживает экран, при ошибке бейджа просто нет.

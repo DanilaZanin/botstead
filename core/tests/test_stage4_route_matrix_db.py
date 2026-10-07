@@ -1,6 +1,7 @@
 """Every registered route has an A/B access probe; Postgres is required."""
 import hashlib
 import hmac
+import base64
 import uuid
 
 import httpx
@@ -31,6 +32,7 @@ CASES = {
     ('PATCH','/api/users/{id}'):'admin', ('GET','/api/sessions'):'sessions',
     ('DELETE','/api/sessions/{id}'):'session',
     ('POST','/api/mac/token'):'own_create', ('DELETE','/api/mac/token'):'own_delete',
+    ('GET','/api/macs'):'list', ('POST','/api/macs'):'own_create', ('DELETE','/api/macs/{id}'):'resource',
     ('GET','/api/providers'):'provider_list', ('POST','/api/providers'):'own_create',
     ('PATCH','/api/providers/{id}'):'resource', ('DELETE','/api/providers/{id}'):'resource',
     ('POST','/api/providers/{id}/check'):'resource',
@@ -42,6 +44,7 @@ CASES = {
     ('POST','/api/bots'):'own_create', ('PATCH','/api/bots/{id}'):'resource',
     ('DELETE','/api/bots/{id}'):'resource', ('POST','/api/bots/{id}/recreate'):'resource',
     ('POST','/api/bots/import'):'own_create', ('GET','/api/bots/{id}/export'):'resource',
+    ('GET','/api/templates/catalog'):'list', ('GET','/api/templates/catalog/{id}'):'list',
     ('GET','/api/bots/{id}/browser'):'resource',
     ('POST','/api/bots/{id}/browser/takeover'):'resource',
     ('POST','/api/bots/{id}/browser/return'):'resource',
@@ -52,6 +55,8 @@ CASES = {
     ('GET','/api/threads'):'list', ('POST','/api/threads'):'resource',
     ('PATCH','/api/threads/{id}'):'resource', ('POST','/api/threads/{id}/turns'):'resource',
     ('GET','/api/threads/{id}'):'resource', ('POST','/api/threads/{id}/compact'):'resource',
+    ('GET','/api/suggestions'):'list', ('POST','/api/suggestions/{id}/accept'):'resource',
+    ('POST','/api/suggestions/{id}/dismiss'):'resource',
     ('POST','/api/turns/{id}/stop'):'resource', ('GET','/api/threads/{id}/events'):'resource',
     ('WS','/api/ws'):'ws_resource',
     ('GET','/api/approvals'):'list', ('POST','/api/approvals'):'bot_resource',
@@ -65,6 +70,12 @@ CASES = {
     ('PATCH','/api/schedules/{id}'):'resource', ('POST','/api/schedules/{id}/run'):'resource',
     ('POST','/hooks/{id}'):'hook',
     ('POST','/hooks/{id}/github'):'hook_github', ('POST','/hooks/{id}/slack'):'hook_slack',
+    ('POST','/api/channels/telegram/{channel_id}/webhook'):'telegram_hook',
+    ('GET','/api/bots/{bot_id}/channels/telegram'):'resource',
+    ('PUT','/api/bots/{bot_id}/channels/telegram'):'resource',
+    ('DELETE','/api/bots/{bot_id}/channels/telegram'):'resource',
+    ('POST','/hooks/{id}/email'):'hook_email',
+    ('POST','/hooks/{id}/email/{token}/json'):'hook_email',
     ('POST','/api/files'):'file_upload',
     ('GET','/api/files/{id}'):'resource', ('GET','/api/mac/status'):'mac_status',
     ('WS','/agent/mac'):'ws_mac', ('POST','/api/mac/call'):'bot_resource',
@@ -76,10 +87,13 @@ CASES = {
     ('GET','/api/procedures/{id}/runs'):'resource', ('POST','/api/procedures/{id}/run'):'resource',
     ('GET','/api/procedure-runs/{id}'):'resource', ('POST','/api/procedure-runs/{id}/stop'):'resource',
     ('POST','/api/procedure-runs/{id}/decide'):'resource', ('GET','/api/secrets'):'secret_list',
-    ('GET','/api/activity'):'activity', ('POST','/api/bots/{id}/pause'):'resource', ('POST','/api/bots/{id}/resume'):'resource',
+    ('GET','/api/activity'):'activity', ('GET','/api/activity/export.csv'):'activity_csv',
+    ('POST','/api/bots/{id}/pause'):'resource', ('POST','/api/bots/{id}/resume'):'resource',
     ('POST','/api/bots/pause-all'):'pause_all', ('POST','/api/bots/resume-all'):'pause_all',
     ('POST','/api/bots/wakeups'):'bot_resource', ('GET','/api/bots/{id}/wakeups'):'resource', ('DELETE','/api/wakeups/{id}'):'wakeup_cancel',
     ('POST','/api/bots/delegations'):'bot_resource', ('GET','/api/bots/delegations/{turn_id}'):'bot_resource',
+    ('POST','/api/groups'):'resource', ('GET','/api/groups'):'list', ('GET','/api/groups/{id}'):'resource', ('PATCH','/api/groups/{id}'):'resource',
+    ('DELETE','/api/groups/{id}'):'resource', ('POST','/api/groups/{id}/messages'):'resource', ('POST','/api/groups/{id}/stop'):'resource',
     **{(method,'/gateway/{provider_id}/{path:path}'):'gateway' for method in ('GET','POST','PUT','PATCH','DELETE','HEAD','OPTIONS','TRACE')},
 }
 
@@ -122,8 +136,11 @@ async def test_route_a_to_b_access_matrix(method,path,kind,monkeypatch,tmp_path)
             invite=(await client.post('/api/invites',json={},headers=OWNER)).json()
             b=(await client.post('/api/invites/accept',json={'token':invite['token'],'email':'b@example.com','password':'long-password'})).json()
             a_bot=(await client.post('/api/bots',json={'id':'alpha','name':'Alpha','provider':'fake','model':'fake'},headers=OWNER)).json()
+            a_mac=(await client.post('/api/macs',json={'name':'A Mac'},headers=OWNER)).json()
             a_thread=(await client.post('/api/threads',json={'bot_id':a_bot['id']},headers=OWNER)).json()
             a_memory=(await client.post('/api/memory',json={'text':'private'},headers=OWNER)).json()
+            a_bot2=(await client.post('/api/bots',json={'id':'alpha2','name':'Alpha2','provider':'fake','model':'fake'},headers=OWNER)).json()
+            a_group=(await client.post('/api/groups',json={'title':'A group','bot_ids':[a_bot['id'],a_bot2['id']],'mode':'round'},headers=OWNER)).json()
             a_schedule=(await client.post('/api/schedules',json={'bot_id':a_bot['id'],'name':'A','kind':'hook','prompt':'hello'},headers=OWNER)).json()
             async with app.state.pool.acquire() as con:
                 a_turn=await con.fetchval("insert into bothub.turns(thread_id,prompt,status) values($1,$2,'done') returning id",uuid.UUID(a_thread['id']),'hello')
@@ -137,6 +154,7 @@ async def test_route_a_to_b_access_matrix(method,path,kind,monkeypatch,tmp_path)
                 a_run=await con.fetchval("insert into bothub.procedure_runs(procedure_id,procedure_version) values($1,1) returning id",a_procedure)
                 await con.execute("insert into bothub.secrets(owner_id,bot_id,name,value_encrypted) values($1,null,'a-private-secret',$2)",uuid.UUID(a['id']),b'ciphertext')
                 a_wakeup=await con.fetchval("insert into bothub.wakeups(bot_id,thread_id,scheduled_at,prompt) values($1,$2,now()+interval '1 day','private wakeup') returning id",a_bot['id'],uuid.UUID(a_thread['id']))
+                a_suggestion=await con.fetchval("insert into bothub.suggestions(owner_id,bot_id,text) values($1,$2,'private suggestion') returning id",uuid.UUID(a['id']),a_bot['id'])
             login=await client.post('/api/auth/login',json={'email':'b@example.com','password':'long-password'})
             csrf=login.json()['csrf_token']
             b_headers={'X-CSRF':csrf,'Origin':'https://testserver'}
@@ -152,12 +170,14 @@ async def test_route_a_to_b_access_matrix(method,path,kind,monkeypatch,tmp_path)
             assert foreign_patch.status_code==400,foreign_patch.text
             digest=hmac.new(b'test-secret',b_bot['id'].encode(),hashlib.sha256).hexdigest()
             bot_headers={'Authorization':f"Bearer bot:{b_bot['id']}:{digest}"}
-            ids={'bot':a_bot['id'],'thread':a_thread['id'],'turn':str(a_turn),'approval':str(a_approval),'memory':a_memory['id'],'schedule':a_schedule['id'],'file':str(a_file),'session':a_session,'user':a['id'],'invite':invite['token_hash'],'provider':str(a_provider),'model':str(a_model),'procedure':str(a_procedure),'run':str(a_run),'wakeup':str(a_wakeup)}
+            ids={'bot':a_bot['id'],'mac':a_mac['id'],'thread':a_thread['id'],'turn':str(a_turn),'approval':str(a_approval),'memory':a_memory['id'],'schedule':a_schedule['id'],'file':str(a_file),'session':a_session,'user':a['id'],'invite':invite['token_hash'],'provider':str(a_provider),'model':str(a_model),'procedure':str(a_procedure),'run':str(a_run),'wakeup':str(a_wakeup),'suggestion':str(a_suggestion),'group':a_group['id']}
             if kind.startswith('ws_'):
-                url='/api/ws?thread_id='+ids['thread'] if kind=='ws_resource' else '/api/providers/'+ids['provider']+'/login' if kind=='ws_provider' else '/api/bots/'+ids['bot']+'/screen' if kind=='ws_screen' else '/agent/mac?token=bad'
+                url='/api/ws?thread_id='+ids['thread'] if kind=='ws_resource' else '/api/providers/'+ids['provider']+'/login' if kind=='ws_provider' else '/api/bots/'+ids['bot']+'/screen' if kind=='ws_screen' else '/agent/mac'
+                ws_headers={'Cookie':f"bothub_session={login.cookies['bothub_session']}",'Origin':'https://testserver'}
+                if kind=='ws_mac': ws_headers['Authorization']='Bearer bad'
                 with TestClient(create_app(launcher=FakeLauncherClient()),base_url='https://testserver') as websocket_client:
                     with pytest.raises(WebSocketDisconnect) as failure:
-                        with websocket_client.websocket_connect(url,headers={'Cookie':f"bothub_session={login.cookies['bothub_session']}",'Origin':'https://testserver'}) as ws:
+                        with websocket_client.websocket_connect(url,headers=ws_headers) as ws:
                             ws.receive_json()
                 assert failure.value.code == (4404 if kind in ('ws_resource','ws_provider','ws_screen') else 4401)
                 return
@@ -188,6 +208,9 @@ async def test_route_a_to_b_access_matrix(method,path,kind,monkeypatch,tmp_path)
             elif path=='/api/bots/wakeups': response=await client.post(path,json={'prompt':'x','in_minutes':5,'thread_id':ids['thread']},headers=bot_headers)  # бот B, тред бота A
             elif path=='/api/bots/delegations': response=await client.post(path,json={'bot':ids['bot'],'task':'x','turn_id':ids['turn']},headers=bot_headers)  # бот B, ход бота A
             elif path=='/api/bots/delegations/{turn_id}': response=await client.get('/api/bots/delegations/'+ids['turn'],headers=bot_headers)  # ход поручил бот A, читает бот B
+            elif path=='/api/groups' and method=='POST': response=await client.post(path,json={'title':'G','bot_ids':[ids['bot'],b_bot['id']],'mode':'round'},headers=b_headers)  # бот A чужой
+            elif path=='/api/groups/{id}/messages': response=await client.post('/api/groups/'+ids['group']+'/messages',json={'text':'x'},headers=b_headers)
+            elif path.startswith('/api/groups/{id}'): response=await getattr(client,method.lower())('/api/groups/'+ids['group']+path.removeprefix('/api/groups/{id}'),headers=b_headers,**({'json':{'title':'x'}} if method=='PATCH' else {}))
             elif path=='/api/wakeups/{id}': response=await client.delete('/api/wakeups/'+ids['wakeup'],headers=b_headers)
             elif path=='/api/mac/call': response=await client.post(path,json={'thread_id':ids['thread'],'turn_id':ids['turn'],'tool':'read_file','args':{}},headers=bot_headers)
             elif path in ('/api/browser/authorize','/api/browser/step'): response=await client.post(path,json={'thread_id':ids['thread'],'turn_id':ids['turn'],'action':'snapshot'},headers=bot_headers)
@@ -196,8 +219,10 @@ async def test_route_a_to_b_access_matrix(method,path,kind,monkeypatch,tmp_path)
             elif path=='/api/memory' and method=='POST': response=await client.post(path,json={'text':'x','bot_id':ids['bot']},headers=b_headers)
             elif path=='/api/schedules' and method=='POST': response=await client.post(path,json={'bot_id':ids['bot'],'name':'B','kind':'hook','prompt':'x'},headers=b_headers)
             elif path=='/api/bots' and method=='POST': response=await client.post(path,json={'name':'Own','provider':'fake','model':'fake'},headers=b_headers)
+            elif path=='/api/macs' and method=='POST': response=await client.post(path,json={'name':'B Mac'},headers=b_headers)
             elif path=='/api/bots/draft': response=await client.post(path,json={'description':'valid draft text'},headers=b_headers)
             elif path=='/api/bots/import': response=await client.post(path,json={'name':'B imported bot'},headers=b_headers)
+            elif path=='/api/templates/catalog/{id}': response=await client.get('/api/templates/catalog/researcher',headers=b_headers)
             elif path=='/api/providers' and method=='POST': response=await client.post(path,json={'kind':'cli_subscription','cli':'claude','name':'B CLI'},headers=b_headers)
             elif path=='/api/models/refresh': response=await client.post(path,headers=b_headers)
             elif path=='/api/procedures' and method=='POST': response=await client.post(path,json={'name':'B procedure','params':[],'steps':[]},headers=b_headers)
@@ -207,13 +232,28 @@ async def test_route_a_to_b_access_matrix(method,path,kind,monkeypatch,tmp_path)
             elif path=='/hooks/{id}': response=await client.post('/hooks/'+ids['schedule'],params={'token':'wrong'},json={})
             elif path=='/hooks/{id}/github': response=await client.post('/hooks/'+ids['schedule']+'/github',headers={'x-hub-signature-256':'sha256=wrong','x-github-event':'ping'},json={})
             elif path=='/hooks/{id}/slack': response=await client.post('/hooks/'+ids['schedule']+'/slack',headers={'x-slack-signature':'v0=wrong','x-slack-request-timestamp':'123'},json={})
+            elif kind=='telegram_hook':
+                monkeypatch.setenv('BOTHUB_SECRET_KEYS', '1:' + base64.b64encode(b'k' * 32).decode())
+                channel=await client.put('/api/bots/'+ids['bot']+'/channels/telegram',json={'token':'123456:test-token','enabled':True},headers=OWNER)
+                assert channel.status_code==200,channel.text
+                async with app.state.pool.acquire() as con:
+                    secret=await con.fetchval('select webhook_secret from bothub.bot_channels where id=$1',uuid.UUID(channel.json()['id']))
+                client.cookies.clear()
+                accepted=await client.post('/api/channels/telegram/'+channel.json()['id']+'/webhook',json={'update_id':1},headers={'X-Telegram-Bot-Api-Secret-Token':secret})
+                assert accepted.status_code==200,accepted.text
+                response=await client.post('/api/channels/telegram/'+channel.json()['id']+'/webhook',json={},headers={'X-Telegram-Bot-Api-Secret-Token':'wrong'})
+            elif path.endswith('/channels/telegram'):
+                url='/api/bots/'+ids['bot']+'/channels/telegram'
+                response=await client.request(method,url,headers=b_headers,**({'json':{'token':'123456:test-token'}} if method=='PUT' else {}))
+            elif path=='/hooks/{id}/email': response=await client.post('/hooks/'+ids['schedule']+'/email',json={})
+            elif path=='/hooks/{id}/email/{token}/json': response=await client.post('/hooks/'+ids['schedule']+'/email/wrong/json',json={})
             elif path in ('/api/bots/{id}/pause','/api/bots/{id}/resume'): response=await client.post('/api/bots/'+ids['bot']+'/'+path.rsplit('/',1)[1],json={},headers=b_headers)
             elif path in ('/api/bots/pause-all','/api/bots/resume-all'):
                 if path.endswith('resume-all'):
                     async with app.state.pool.acquire() as con: await con.execute('update bothub.bots set paused=true where id=$1',ids['bot'])
                 response=await client.post(path,json={},headers=b_headers)
             else:
-                url=path.format(id=ids['procedure'] if path.startswith('/api/procedures/') else ids['run'] if path.startswith('/api/procedure-runs/') else ids['provider'] if path.startswith('/api/providers/') else ids['model'] if path.startswith('/api/models/') else ids['user'] if path.startswith('/api/users/') else ids['session'] if path.startswith('/api/sessions/') else ids['invite'] if path.startswith('/api/invites/') else ids['bot'] if path.startswith('/api/bots/') else ids['turn'] if path.startswith('/api/turns/') else ids['approval'] if path.startswith('/api/approvals/') else ids['memory'] if path.startswith('/api/memory/') else ids['schedule'] if path.startswith('/api/schedules/') else ids['file'] if path.startswith('/api/files/') else ids['thread'])
+                url=path.format(id=ids['mac'] if path.startswith('/api/macs/') else ids['suggestion'] if path.startswith('/api/suggestions/') else ids['procedure'] if path.startswith('/api/procedures/') else ids['run'] if path.startswith('/api/procedure-runs/') else ids['provider'] if path.startswith('/api/providers/') else ids['model'] if path.startswith('/api/models/') else ids['user'] if path.startswith('/api/users/') else ids['session'] if path.startswith('/api/sessions/') else ids['invite'] if path.startswith('/api/invites/') else ids['bot'] if path.startswith('/api/bots/') else ids['turn'] if path.startswith('/api/turns/') else ids['approval'] if path.startswith('/api/approvals/') else ids['memory'] if path.startswith('/api/memory/') else ids['schedule'] if path.startswith('/api/schedules/') else ids['file'] if path.startswith('/api/files/') else ids['thread'])
                 body={'name':'taken'} if path.startswith('/api/bots/') or path.startswith('/api/providers/') or path=='/api/procedures/{id}' else {'action':'retry'} if path=='/api/procedure-runs/{id}/decide' else {} if path.startswith('/api/procedure') else {'enabled':False} if path.startswith('/api/models/') else {'status':'archived'} if path.startswith('/api/threads/') and method=='PATCH' else {'prompt':'x'} if path.endswith('/turns') else {'decision':'reject'} if path.endswith('/decide') else {'text':'x'} if path.startswith('/api/memory/') else {'enabled':False} if path.startswith('/api/schedules/') else {} if path.endswith('/compact') else {'disabled':True}
                 if path=='/api/auth/me' or path=='/api/sessions' or path=='/api/mac/status' or path=='/api/usage/summary' or method=='GET': response=await client.get(url,headers=b_headers)
                 elif method=='PATCH': response=await client.patch(url,json=body,headers=b_headers)
@@ -221,10 +261,14 @@ async def test_route_a_to_b_access_matrix(method,path,kind,monkeypatch,tmp_path)
                 else: response=await client.post(url,json=body,headers=bot_headers if path.endswith('/wait') else b_headers)
             if kind=='resource' or kind=='bot_resource' or kind=='session' or kind=='file_upload' or kind=='wakeup_cancel': assert response.status_code==404,response.text
             elif kind=='admin': assert response.status_code==403,response.text
+            elif kind=='telegram_hook': assert response.status_code==403,response.text
             elif kind=='list':
                 assert response.status_code==200,response.text
                 assert ids['bot'] not in response.text and ids['thread'] not in response.text and ids['memory'] not in response.text and ids['schedule'] not in response.text
             elif kind=='provider_list': assert response.status_code==200 and ids['provider'] not in response.text
+            elif kind=='activity_csv':  # у B в выгрузке только строка заголовка, записей A нет
+                lines=[l for l in response.text.lstrip('\ufeff').splitlines() if l.strip()]
+                assert response.status_code==200 and len(lines)==1,response.text
             elif kind=='activity': assert response.status_code==200 and response.json()=={'items':[],'next':None},response.text  # у A в ленте есть записи, у B пусто
             elif kind=='pause_all':
                 assert response.status_code==200 and ids['bot'] not in response.text,response.text
@@ -240,7 +284,7 @@ async def test_route_a_to_b_access_matrix(method,path,kind,monkeypatch,tmp_path)
             elif kind=='accept': assert response.status_code==410
             elif kind=='me': assert response.json()['id']==b['id']
             elif kind=='sessions': assert a_session not in response.text
-            elif kind in ('hook', 'hook_github', 'hook_slack'): assert response.status_code==403  # расписание существует, токен неверный: 403 по контракту раздела 8
+            elif kind in ('hook', 'hook_github', 'hook_slack', 'hook_email'): assert response.status_code==403  # расписание существует, токен неверный: 403 по контракту раздела 8
             elif kind=='mac_status': assert response.json()['state']=='offline'
             elif kind=='own_create': assert response.status_code in (200,201),response.text
             elif kind=='own_delete' or kind=='logout': assert response.status_code==200,response.text

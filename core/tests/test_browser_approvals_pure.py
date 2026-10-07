@@ -273,7 +273,7 @@ async def test_element_name_is_cut_and_role_is_checked(monkeypatch):
     app = _app(monkeypatch)
     too_long = await _post(app, "/api/browser/step", _call("click", target="e1", role="button", name="x" * 201))
     bad_role = await _post(app, "/api/browser/step", _call("click", target="e1", role="Button Bar", name="x"))
-    assert too_long.status_code == 422 and bad_role.status_code in (400, 422)
+    assert too_long.status_code == 400 and bad_role.status_code in (400, 422)
     assert SECRET not in too_long.text + bad_role.text
     assert app.state.pool.events == []
 

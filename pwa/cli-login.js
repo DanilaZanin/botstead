@@ -224,12 +224,13 @@ export async function viewProviderLogin(providerId) {
   function clearLinkTimer() {
     clearTimeout(linkTimer);
     linkTimer = null;
+    if (linkTimeoutMs < 0 && window.__loginMock) window.__loginMock.linkTimeout = null;
   }
   // Минута на ссылку (и код устройства у codex) после открытия соединения. Не дождались: сессию закрываем, чтобы не
   // держать вход на сервере, терминал остаётся на экране для разбора, предлагаем начать заново.
   function armLinkTimer() {
     clearLinkTimer();
-    linkTimer = setTimeout(() => {
+    const onTimeout = () => {
       linkTimer = null;
       if (disposed || st.phase !== 'waiting' || ready()) return;
       const socket = st.socket;
@@ -241,7 +242,12 @@ export async function viewProviderLogin(providerId) {
       }
       if (st.link) setPhase('failed', { failStep: 1, reason: 'Код для входа не появился', reasonText: 'Ссылка есть, но терминал не показал код за минуту. Сессия на сервере закрыта: начните вход заново.', retryLabel: 'Начать заново' });
       else setPhase('failed', { failStep: 1, reason: 'Ссылка для входа не появилась', reasonText: 'Терминал не показал ссылку входа за минуту. Сессия на сервере закрыта: начните вход заново.', retryLabel: 'Начать заново' });
-    }, linkTimeoutMs);
+    };
+    // Мок с &login_timeout=manual: таймер не идёт, тест сам вызывает window.__loginMock.linkTimeout().
+    if (linkTimeoutMs < 0) {
+      window.__loginMock = window.__loginMock || { frames: [] };
+      window.__loginMock.linkTimeout = onTimeout;
+    } else linkTimer = setTimeout(onTimeout, linkTimeoutMs);
   }
   function setPhase(phase, extra = {}) {
     if (disposed) return;

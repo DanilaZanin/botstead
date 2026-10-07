@@ -68,6 +68,12 @@ async def make_bot(client, bot_id="scout", **changes):
     return response.json()
 
 
+async def make_mac(client, name="Test Mac"):
+    response = await client.post("/api/macs", json={"name": name}, headers=OWNER)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
 async def make_thread(client, bot_id="scout"):
     response = await client.post("/api/threads", json={"bot_id": bot_id, "title": "Test"}, headers=OWNER)
     assert response.status_code in (200, 201), response.text
@@ -732,7 +738,8 @@ async def test_mac_call_without_agent_is_409_mac_unavailable():
         await asyncio.sleep(10)
     hang.run = stay
     async with api(hang) as (client, _, _):
-        await make_bot(client, mac_full_control=True)
+        mac = await make_mac(client)
+        await make_bot(client, mac_id=mac["id"], mac_full_control=True)
         thread = await make_thread(client)
         turn = (await client.post(f"/api/threads/{thread['id']}/turns", json={"prompt": "screen", "client": "api"}, headers=OWNER)).json()
         for _ in range(50):
@@ -767,7 +774,8 @@ async def _post_turn_and_wait_running(client, thread_id, prompt="hi"):
 @pytest.mark.asyncio
 async def test_mac_call_requires_mac_executor_or_full_control():
     async with api(await _hang_runner()) as (client, _, _):
-        await make_bot(client)  # executor='container', mac_full_control=False по умолчанию
+        mac = await make_mac(client)
+        await make_bot(client, mac_id=mac["id"])  # executor='container', mac_full_control=False по умолчанию
         thread = await make_thread(client)
         turn = await _post_turn_and_wait_running(client, thread["id"], "screen")
         response = await client.post("/api/mac/call", json={"thread_id": thread["id"], "turn_id": turn["id"], "tool": "screenshot", "args": {}}, headers=bot_token("scout"))
@@ -777,7 +785,8 @@ async def test_mac_call_requires_mac_executor_or_full_control():
 @pytest.mark.asyncio
 async def test_mac_call_delegate_needs_operation_approval_for_any_bot():
     async with api(await _hang_runner()) as (client, _, _):
-        await make_bot(client)  # container, без mac_full_control
+        mac = await make_mac(client)
+        await make_bot(client, mac_id=mac["id"])  # container, без mac_full_control
         thread = await make_thread(client)
         turn = await _post_turn_and_wait_running(client, thread["id"], "research")
         body = {"thread_id": thread["id"], "turn_id": turn["id"], "tool": "delegate", "args": {"engine": "gemini", "prompt": "x"}, "timeout": 1860}
@@ -798,7 +807,8 @@ async def test_mac_call_delegate_needs_operation_approval_for_any_bot():
 @pytest.mark.asyncio
 async def test_mac_call_risky_tool_needs_approval_even_with_full_control():
     async with api(await _hang_runner()) as (client, _, _):
-        await make_bot(client, mac_full_control=True)
+        mac = await make_mac(client)
+        await make_bot(client, mac_id=mac["id"], mac_full_control=True)
         thread = await make_thread(client)
         turn = await _post_turn_and_wait_running(client, thread["id"], "clean")
         # mac_full_control не покрывает риск delete (раздел 4) - без approval ядро отказывает.
@@ -816,7 +826,8 @@ async def test_mac_call_risky_tool_needs_approval_even_with_full_control():
 @pytest.mark.asyncio
 async def test_mac_call_read_tool_via_auto_allow_without_full_control():
     async with api(await _hang_runner()) as (client, _, _):
-        await make_bot(client, executor="mac", auto_allow=[{"tool": "mcp__bothub__mac_screenshot", "match": {}}])
+        mac = await make_mac(client)
+        await make_bot(client, mac_id=mac["id"], executor="mac", auto_allow=[{"tool": "mcp__bothub__mac_screenshot", "match": {}}])
         thread = await make_thread(client)
         turn = await _post_turn_and_wait_running(client, thread["id"], "look")
         response = await client.post("/api/mac/call", json={"thread_id": thread["id"], "turn_id": turn["id"], "tool": "screenshot", "args": {}}, headers=bot_token("scout"))
@@ -829,7 +840,8 @@ async def test_mac_call_read_tool_via_auto_allow_without_full_control():
 @pytest.mark.asyncio
 async def test_mac_call_rejects_turn_not_running_or_waiting_mac():
     async with api() as (client, _, _):
-        await make_bot(client, mac_full_control=True)
+        mac = await make_mac(client)
+        await make_bot(client, mac_id=mac["id"], mac_full_control=True)
         thread = await make_thread(client)
         turn = (await client.post(f"/api/threads/{thread['id']}/turns", json={"prompt": "hi", "client": "api"}, headers=OWNER)).json()
         await wait_done(client, thread["id"])  # быстрый fake-раннер -> done

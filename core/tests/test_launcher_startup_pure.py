@@ -642,7 +642,7 @@ async def test_invalid_body_gets_its_error_before_the_launcher_503(monkeypatch):
             valid_draft = await client.post("/api/bots/draft", json={"description": "valid draft text"}, headers=owner)
             valid_bot = await client.post("/api/bots", json={"name": "Own", "provider": "fake", "model": "fake"},
                                           headers=owner)
-    assert secret.status_code == 400 and draft.status_code == 400 and bot.status_code == 422
+    assert secret.status_code == 400 and draft.status_code == 400 and bot.status_code == 400
     assert valid_draft.status_code == 503 and valid_bot.status_code == 503
     assert valid_bot.json()["error"] == "launcher_unavailable"
     assert set(pool.bots) == {"alpha", "beta"}, "no bot was written before the 503"

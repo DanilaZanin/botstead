@@ -152,6 +152,7 @@ test.describe('выпадающая панель', () => {
     await openThread(page, '&ctx=38');
     const button = indicator(page, 'Контекст заполнен на 38%');
     await expect(button).toBeVisible();
+    await page.waitForFunction(() => { const app = document.getElementById('app'); return !!app && !app.inert; });
     await button.focus();
     await page.keyboard.press('Enter');
     await expect(panelOf(page)).toBeVisible();

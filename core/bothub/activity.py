@@ -16,7 +16,7 @@ from typing import Iterable, Mapping
 
 from bothub.browser_control import mask_browser_text, mask_url
 
-KINDS = ('turn', 'approval', 'browser', 'takeover', 'schedule', 'procedure', 'memory', 'pause')
+KINDS = ('turn', 'approval', 'browser', 'takeover', 'schedule', 'procedure', 'memory', 'pause', 'group')
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 100
 
@@ -27,6 +27,24 @@ SKIP_EVENT_INTERVAL = timedelta(hours=1)  # не чаще одного собы�
 
 TEXT_MAX = 200
 CURSOR_MAX = 400
+CSV_HEADER = ('time', 'bot', 'kind', 'code', 'title', 'detail')
+CSV_TITLES = {
+    'turn_started': 'Task started', 'turn_done': 'Task finished', 'turn_error': 'Task failed',
+    'turn_stopped': 'Task stopped', 'compact_started': 'Context compaction started',
+    'compact_done': 'Context compacted', 'compact_failed': 'Context compaction failed',
+    'approval_requested': 'Approval requested', 'approval_approved': 'Approval approved',
+    'approval_rejected': 'Approval rejected', 'checker_denied': 'Checker denied action',
+    'approval_expired': 'Approval expired', 'browser_step': 'Browser step',
+    'takeover_started': 'Control taken over', 'takeover_returned': 'Control returned',
+    'takeover_bot': 'Bot controls the browser again', 'takeover_changed': 'Browser control changed',
+    'schedule_run': 'Scheduled run', 'hook_run': 'Webhook run', 'schedule_resumed': 'Schedule resumed',
+    'wakeup_scheduled': 'Wakeup scheduled', 'wakeup_fired': 'Wakeup fired', 'delegation_sent': 'Task delegated',
+    'delegation_done': 'Delegation finished', 'procedure_started': 'Procedure started',
+    'procedure_finished': 'Procedure finished', 'memory_proposed': 'Memory proposed',
+    'bot_paused': 'Bot paused', 'bot_resumed': 'Bot resumed',
+}
+CSV_MAX_ROWS = 10000
+EXPORT_DAYS = (1, 7, 30, 90)
 # Курсор разбирается строго: дата ISO 8601 с зоной и id элемента ленты (prefix:uuid[:суффикс]). Всё остальное: 422 `before`.
 CURSOR_STAMP = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})')
 CURSOR_ID = re.compile(r'(?:turn|approval|event|run|procedure|memory|log):[A-Za-z0-9:_-]{1,120}')
@@ -67,6 +85,21 @@ def parse_limit(value) -> int:
         value = int(text)
     if not isinstance(value, int) or not 1 <= value <= MAX_LIMIT:
         raise ActivityError('limit')
+    return value
+
+
+def parse_export_days(value) -> int:
+    if value is None:
+        return 7
+    if isinstance(value, bool):
+        raise ActivityError('days')
+    if isinstance(value, str):
+        text = value.strip()
+        if not text.isascii() or not text.isdigit():
+            raise ActivityError('days')
+        value = int(text)
+    if not isinstance(value, int) or value not in EXPORT_DAYS:
+        raise ActivityError('days')
     return value
 
 
@@ -220,9 +253,10 @@ def log_item(row):
     params = payload_of({'payload': row.get('params')})
     kind = row['log_kind']
     safe = {key: params[key] for key in ('reason', 'count', 'paused', 'schedule_id', 'name', 'catch_up', 'by_all',
-                                         'wakeup_id', 'scheduled_at', 'from_bot', 'to_bot', 'to_bot_id', 'turn_id', 'outcome')
+                                         'wakeup_id', 'scheduled_at', 'from_bot', 'to_bot', 'to_bot_id', 'turn_id', 'outcome',
+                                         'title', 'rounds', 'status', 'run_id')
             if key in params and isinstance(params[key], (str, int, bool))}
-    for key in ('reason', 'name', 'from_bot', 'to_bot'):
+    for key in ('reason', 'name', 'from_bot', 'to_bot', 'title'):
         if key in safe and isinstance(safe[key], str):
             safe[key] = short(safe[key], 120)
     # Самопробуждение (раздел 17): зачем бот его запросил (`note`, свободный текст бота) идёт в detail, как текст памяти
@@ -241,9 +275,9 @@ BUILDERS = {
 # вид ленты -> источники (SQL ниже); у schedule и pause общий источник activity_log с отбором по виду
 KIND_SOURCES = {
     'turn': ('turn',), 'approval': ('approval',), 'browser': ('browser_step',), 'takeover': ('browser_control',),
-    'schedule': ('schedule_run', 'log'), 'procedure': ('procedure',), 'memory': ('memory',), 'pause': ('log',),
+    'schedule': ('schedule_run', 'log'), 'procedure': ('procedure',), 'memory': ('memory',), 'pause': ('log',), 'group': ('log',),
 }
-LOG_KINDS = ('schedule', 'pause')
+LOG_KINDS = ('schedule', 'pause', 'group')
 
 
 def sources_for(kinds: list[str] | None) -> list[str]:
@@ -277,6 +311,35 @@ def finish_page(page: list[dict], next_cursor: str | None) -> dict:
                 entry['title']['params'][key] = str(value)
         out.append({key: value for key, value in entry.items() if value is not None or key in ('bot_id', 'thread_id')})
     return {'items': out, 'next': next_cursor}
+
+
+def _csv_cell(value) -> str:
+    if value is None:
+        return ''
+    if value is True:
+        value = 'true'
+    elif value is False:
+        value = 'false'
+    text = value if isinstance(value, str) else str(value)
+    if text.startswith(('=', '+', '-', '@')):
+        text = "'" + text
+    if any(char in text for char in (',', '"', '\n', '\r')):
+        text = '"' + text.replace('"', '""') + '"'
+    return text
+
+
+def build_csv(page: Iterable[Mapping], bot_names: Mapping | None = None) -> bytes:
+    """CSV для Excel: UTF-8 с BOM, RFC 4180 и защита от формул."""
+    lines = [','.join(CSV_HEADER)]
+    names = bot_names or {}
+    for row in list(page)[:CSV_MAX_ROWS]:
+        code = row['title']['code']
+        bot = names.get(row['bot_id'], '') or row['bot_id'] or ''
+        title = CSV_TITLES.get(code, code)
+        stamp = row['at'].astimezone(timezone.utc).isoformat(timespec='microseconds').replace('+00:00', 'Z')
+        cells = (stamp, bot, row['kind'], code, title, row.get('detail') or '')
+        lines.append(','.join(_csv_cell(cell) for cell in cells))
+    return ('\ufeff' + '\r\n'.join(lines) + '\r\n').encode('utf-8')
 
 
 # ---- SQL: каждая выборка отдаёт строки одного вида события, уже после курсора, не больше $5 штук ----

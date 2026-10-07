@@ -31,6 +31,21 @@ async def test_run_call_success(monkeypatch, config):
     assert ws.sent == [{"type": "result", "id": "c1", "ok": True, "data": {"echo": "hi"}}]
 
 
+async def test_connect_sends_token_only_in_authorization_header(monkeypatch, config):
+    calls = []
+
+    async def fake_connect(url, **kwargs):
+        calls.append((url, kwargs))
+        return "connected"
+
+    monkeypatch.setattr(client.websockets, "connect", fake_connect)
+    assert await client._try_connect("https://x", config) == "connected"
+    assert calls == [(
+        "wss://x/agent/mac",
+        {"additional_headers": {"Authorization": "Bearer t"}, "ping_interval": 20, "ping_timeout": 20},
+    )]
+
+
 async def test_run_call_tool_error(monkeypatch, config):
     async def fake_dispatch(tool, args, cfg):
         raise ToolError("bad args")

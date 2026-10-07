@@ -5,13 +5,15 @@ import { openThreadStream } from './ws.js';
 import { ICONS, icon, esc, backHeader, alertHtml, modelTitle, fmtDateTime } from './ui.js';
 import { createAccount, failure, isServerFault } from './account.js';
 import { viewProviders, loadModelOptions, renderModelPicker, botModelCardHtml, mountBotModelCard, botCheckerCardHtml, mountBotCheckerCard, botStateBanner, botStartHint, recreateBotAction, confirmDeleteBot } from './providers.js';
-import { botNoModel, runnerKind, usableModels, providerStatus } from './registry.js';
+import { botNoModel, runnerKind, quotaPanelMode, usableModels, providerStatus } from './registry.js';
 import { viewProviderRequests } from './provider-requests.js';
 import { hasBrowser, browserBodyHtml, browserAsideHtml, mountBrowser, controlTitle } from './browser.js';
 import { viewProcedureRoute, openSaveProcedureDialog } from './procedures.js';
 import { viewMemory } from './memory.js';
 import { viewActivity, skipNoteHtml } from './activity.js';
 import { wakeupsCardHtml, mountWakeups } from './wakeups.js';
+import { parseTelegramChatIds, renderTelegramState, mountTelegram } from './telegram.js';
+import { createGroups } from './groups.js';
 import { getLang, loadLang, locale } from './i18n.js';
 import { startTranslator } from './i18n-dom.js';
 
@@ -93,7 +95,7 @@ function botView(b) {
   const startFailed = b.status === 'error_starting';
   const provider = providerById.get(b.provider_id);
   // Проблема провайдера (ключ отклонён, адрес не отвечает, нужен вход, ждёт администратора, не проверен): точка статуса не зелёная, пока модель бота недоступна.
-  const providerError = !noModel && !startFailed && provider && ['error', 'pending_admin', 'unchecked'].includes(provider.status) && (!b.status || HEALTHY_BOT_STATUS.includes(b.status))
+  const providerError = !noModel && !startFailed && provider && ['error', 'needs_login', 'pending_admin', 'unchecked'].includes(provider.status) && (!b.status || HEALTHY_BOT_STATUS.includes(b.status))
     ? providerStatus(provider) : null;
   return {
     ...b,
@@ -141,6 +143,9 @@ function parseHash() {
   if (parts[0] === 'usage') return { name: 'usage', qs };
   if (parts[0] === 'memory') return { name: 'memory', qs };
   if (parts[0] === 'activity') return { name: 'activity', qs };
+  if (parts[0] === 'groups' && parts[1] === 'new') return { name: 'group-new', qs };
+  if (parts[0] === 'groups' && parts[1]) return { name: 'group', id: safeDecode(parts[1]), qs };
+  if (parts[0] === 'groups') return { name: 'groups', qs };
   return { name: 'main', qs };
 }
 // fetch без ответа: Chrome пишет «Failed to fetch», Safari «Load failed», Firefox «NetworkError…».
@@ -183,6 +188,9 @@ async function render() {
     if (['procedures', 'procedure', 'procedure-run'].includes(route.name)) { await viewProcedureRoute(route); return; }
     if (route.name === 'memory') { await viewMemory(); return; }
     if (route.name === 'activity') { await viewActivity(); return; }
+    if (route.name === 'groups') { await groups.viewList(); return; }
+    if (route.name === 'group-new') { await groups.viewNew(); return; }
+    if (route.name === 'group') { await groups.viewGroup(route.id); return; }
     // Новый бот: полноэкранный флоу описание → черновик, одинаков на телефоне и Mac.
     if (route.name === 'bot-new') { await viewBotNew(route.qs); return; }
     // Старый адрес экрана #/threads/<id>/handoff ведёт на экран браузера бота этого треда.
@@ -215,6 +223,7 @@ async function viewSettingsRoute({ section, sub, action }) {
   if (section === 'users') return account.viewUsers();
   if (section === 'password') return account.viewPassword();
   if (section === 'sessions') return account.viewSessions();
+  if (section === 'macs') return account.viewMacs();
   if (section === 'providers') return viewProviders(sub, action);
   if (section === 'provider-requests') return viewProviderRequests();
   if (section === 'activity') return viewActivity();
@@ -270,8 +279,18 @@ app.addEventListener('input', (e) => {
   if (out) out.textContent = `${e.target.value}%`;
 });
 app.addEventListener('change', (e) => {
-  if (e.target.id !== 'ac-range') return;
-  updateBotSetting('set-autocompact-percent', e.target);
+  if (e.target.matches('[data-hook-adapter]')) {
+    const box = e.target.closest('[data-hook-adapter-box]');
+    if (!box) return;
+    hookAdapterSelection.set(box.getAttribute('data-schedule-id'), e.target.value);
+    box.querySelectorAll('[data-hook-panel]').forEach((panel) => { panel.hidden = panel.getAttribute('data-hook-panel') !== e.target.value; });
+  } else if (e.target.id === 'ac-range') {
+    updateBotSetting('set-autocompact-percent', e.target);
+  } else if (e.target.id === 'proactive-interval') {
+    updateBotSetting('set-proactive-interval', e.target);
+  } else if (e.target.id === 'bot-mac-select') {
+    updateBotSetting('set-mac', e.target);
+  }
 });
 
 app.addEventListener('keydown', (e) => {
@@ -320,10 +339,59 @@ async function handleAction(action, el) {
       if (!error || error.status !== 409) { el.disabled = false; throw error; }  // 409: уже решено или срок вышел, экран перечитает список
     }
     render();
+  } else if (action === 'accept-suggestion' || action === 'dismiss-suggestion') {
+    el.disabled = true;
+    try {
+      const id = el.getAttribute('data-id');
+      const accepted = action === 'accept-suggestion';
+      const turn = accepted ? await api.acceptSuggestion(id) : await api.dismissSuggestion(id);
+      if (accepted && turn?.thread_id) {
+        location.hash = `#/threads/${encodeURIComponent(turn.thread_id)}`;
+      } else {
+        render();
+      }
+    } catch (error) { el.disabled = false; throw error; }
   } else if (action === 'run-schedule') {
     el.disabled = true;
     await api.runSchedule(el.getAttribute('data-id'));
     render();
+  } else if (action === 'save-telegram-token') {
+    const scope = el.closest('[data-bot]');
+    const botId = scope ? scope.dataset.bot : null;
+    if (!botId) return;
+    const tokenInput = scope.querySelector('#tg-token');
+    const token = tokenInput ? tokenInput.value.trim() : null;
+    const chatIdsInput = scope.querySelector('#tg-chat-ids');
+    const chatIdsRaw = chatIdsInput ? chatIdsInput.value.trim() : '';
+    const enabledCheck = scope.querySelector('#tg-enabled');
+    const enabled = enabledCheck ? enabledCheck.checked : true;
+    try {
+      const body = { enabled, allowed_chat_ids: parseTelegramChatIds(chatIdsRaw) };
+      if (token) body.token = token;
+      el.disabled = true;
+      await api.putTelegramChannel(botId, body);
+      await renderTelegramState(scope, botId, api.getTelegramChannel);
+    } catch (err) {
+      el.disabled = false;
+      const state = scope.querySelector('[data-telegram-state]');
+      if (state) state.querySelector('[role="alert"]')?.remove();
+      const validationErrors = ['Укажите целые Chat ID через запятую', 'Chat ID выходит за допустимый диапазон'];
+      const detail = validationErrors.includes(err?.message) ? err.message : 'Проверьте токен и повторите попытку';
+      state?.insertAdjacentHTML('afterbegin', alertHtml('Не удалось сохранить настройки Telegram', detail));
+    }
+  } else if (action === 'delete-telegram-channel') {
+    const scope = el.closest('[data-bot]');
+    const botId = scope ? scope.dataset.bot : null;
+    if (!botId) return;
+    el.disabled = true;
+    try {
+      await api.deleteTelegramChannel(botId);
+      await renderTelegramState(scope, botId, api.getTelegramChannel);
+    } catch (err) {
+      el.disabled = false;
+      const state = scope.querySelector('[data-telegram-state]');
+      state?.insertAdjacentHTML('afterbegin', alertHtml('Не удалось удалить канал Telegram'));
+    }
   } else if (action === 'toggle-schedule') {
     const id = el.getAttribute('data-id');
     const list = await api.listSchedules();
@@ -335,13 +403,31 @@ async function handleAction(action, el) {
     const wanted = el.checked;
     try { await api.patchSchedule(el.getAttribute('data-id'), { catch_up: wanted }); } catch (error) { el.checked = !wanted; throw error; }
   } else if (action === 'save-slack-secret' || action === 'clear-slack-secret') {
-    // Секрет только на запись: поле после сохранения пустеет, сервер отдаёт лишь признак has_slack_signing_secret.
+    // Секреты только на запись: поля после сохранения пустеют, сервер отдаёт лишь признаки.
     const id = el.getAttribute('data-id');
-    const input = document.getElementById('sch-slack-secret');
-    const value = action === 'save-slack-secret' ? (input ? input.value.trim() : '') : null;
-    if (action === 'save-slack-secret' && !value) { input?.focus(); return; }
+    const panel = el.closest('[data-hook-panel="slack"]');
+    const secretInput = panel?.querySelector('[id^="sch-slack-secret-"]');
+    const tokenInput = panel?.querySelector('#sch-slack-token');
+    const value = action === 'save-slack-secret'
+      ? { ...(secretInput?.value.trim() ? { slack_signing_secret: secretInput.value.trim() } : {}),
+          ...(tokenInput?.value.trim() ? { slack_bot_token: tokenInput.value.trim() } : {}) }
+      : { slack_signing_secret: null, slack_bot_token: null };
+    if (action === 'save-slack-secret' && !Object.keys(value).length) {
+      (secretInput || tokenInput)?.focus();
+      return;
+    }
     el.disabled = true;
-    try { await api.patchSchedule(id, { slack_signing_secret: value }); } catch (error) { el.disabled = false; throw error; }
+    try { await api.patchSchedule(id, value); } catch (error) { el.disabled = false; throw error; }
+    render();
+  } else if (action === 'save-email-key' || action === 'clear-email-key') {
+    // Ключ только на запись: поле после сохранения пустеет, сервер отдаёт признак наличия.
+    const id = el.getAttribute('data-id');
+    const input = el.closest('[data-hook-panel="email"]')?.querySelector('input');
+    const saving = action.startsWith('save-');
+    const value = saving ? (input ? input.value.trim() : '') : null;
+    if (saving && !value) { input?.focus(); return; }
+    el.disabled = true;
+    try { await api.patchSchedule(id, { email_signing_key: value }); } catch (error) { el.disabled = false; throw error; }
     render();
   } else if (action === 'send-message') {
     await sendMessage(el.getAttribute('data-thread'));
@@ -400,6 +486,10 @@ function paintBotSettings(scope, bot) {
   if (slot) slot.innerHTML = botStateBanner(bot);
   const mfc = scope.querySelector('#mfc');
   if (mfc) mfc.checked = !!bot.mac_full_control;
+  const macSelect = scope.querySelector('#bot-mac-select');
+  if (macSelect) macSelect.value = bot.mac_id || '';
+  const proactive = scope.querySelector('#proactive-interval');
+  if (proactive) proactive.value = String(bot.proactive_interval_hours ?? '');
   const acSwitch = scope.querySelector('#ac-switch');
   const acRange = scope.querySelector('#ac-range');
   if (acSwitch && acRange) {
@@ -458,11 +548,18 @@ async function updateBotSetting(action, el) {
   if (!before) return;
   const patch = action === 'pick-avatar' ? { avatar: el.getAttribute('data-avatar') }
     : action === 'set-executor' ? { executor: el.getAttribute('data-value') }
+    : action === 'set-mac' ? { mac_id: el.value || null }
     : action === 'toggle-autocompact' ? { auto_compact_percent: el.checked ? Number(scope.querySelector('#ac-range').value) : null }
     : action === 'set-autocompact-percent' ? { auto_compact_percent: Number(el.value) }
+    : action === 'set-proactive-interval' ? { proactive_interval_hours: el.value ? Number(el.value) : null }
     : action === 'save-mcp-allow' ? { mcp_allow: parseMcpAllow(scope.querySelector('#mcp-allow').value) }
     : { mac_full_control: el.checked };
   const alertBox = scope.querySelector('#bot-alert');
+  if (action === 'set-proactive-interval' && patch.proactive_interval_hours !== null &&
+      (!Number.isInteger(patch.proactive_interval_hours) || patch.proactive_interval_hours < 1 || patch.proactive_interval_hours > 720)) {
+    if (alertBox) alertBox.innerHTML = alertHtml('Изменение не сохранено', 'Интервал: от 1 до 720 часов. Пустое поле выключает подсказки.');
+    return;
+  }
   if (action === 'save-mcp-allow' && (patch.mcp_allow.length > MCP_ALLOW_MAX || patch.mcp_allow.some((name) => name.length > MCP_ALLOW_NAME_MAX))) {
     alertBox.innerHTML = alertHtml('Изменение не сохранено', `Не больше ${MCP_ALLOW_MAX} строк, в каждой до ${MCP_ALLOW_NAME_MAX} символов.`);
     alertBox.firstElementChild.focus();
@@ -592,6 +689,7 @@ function desktopSidebar({ bots, approvals, activeBotId = null, activeNav = '' })
       <span class="stack min-w-0"><span class="t-callout" style="font-size:14px;" data-i18n-skip>${esc(b.name)}</span><span class="t-footnote status-line" style="font-size:12px;">${esc(b.status_label)}</span></span>
     </a>`).join('')}
     <div style="height:12px;"></div>
+    ${link('groups', '#/groups', ICONS.users, 'Обсуждения')}
     ${link('routines', '#/routines', ICONS.routines, 'Рутины')}
     ${link('approvals', '#/approvals', ICONS.approvals, `Решения${approvals.length ? ' · ' + approvals.length : ''}`)}
     ${link('memory', '#/memory', ICONS.memory, 'Память')}
@@ -625,6 +723,15 @@ async function frame({ title, subtitle = '', backHref = null, body, mobileAction
   </div>`;
 }
 
+// Полный экран Mac с боковой панелью вокруг готовой разметки main (тред группы со своим полем ввода).
+async function desktopPage({ mainHtml, activeNav = '' }) {
+  const [bots, approvals] = await Promise.all([listBotsView(), api.listApprovals('pending')]);
+  app.innerHTML = `<div class="desktop-shell">${SKIP_LINK}${desktopSidebar({ bots, approvals, activeNav })}${mainHtml}</div>`;
+  const main = app.querySelector('.desktop-main');
+  main.id = 'content';
+  main.tabIndex = -1;
+}
+
 const account = createAccount({
   app,
   session,
@@ -638,12 +745,15 @@ const account = createAccount({
   setCleanup,
 });
 
+const groups = createGroups({ app, frame, desktopPage, setCleanup, isDesktop: () => window.matchMedia(DESKTOP_QUERY).matches });
+
 // ---------------------------------------------------------------------------
 // TabBar / Header
 // ---------------------------------------------------------------------------
 function tabBar(active, pendingCount) {
   const tabs = [
     { key: 'main', href: '#/', label: 'Боты', icon: ICONS.bots },
+    { key: 'groups', href: '#/groups', label: 'Обсуждения', icon: ICONS.users },
     { key: 'routines', href: '#/routines', label: 'Рутины', icon: ICONS.routines },
     { key: 'approvals', href: '#/approvals', label: 'Решения', icon: ICONS.approvals, dot: pendingCount > 0 },
     { key: 'usage', href: '#/usage', label: 'Расход', icon: ICONS.usage },
@@ -659,7 +769,9 @@ function tabBar(active, pendingCount) {
 // Main: Боты
 // ---------------------------------------------------------------------------
 async function viewMain() {
-  const [bots, approvals, mac] = await Promise.all([listBotsView(), api.listApprovals('pending'), api.macStatus()]);
+  const [bots, approvals, mac, suggestions] = await Promise.all([
+    listBotsView(), api.listApprovals('pending'), api.macStatus(), api.listSuggestions(),
+  ]);
   const macRow = `<a href="#/threads/t-mac/handoff" class="bot-card" style="align-items:center;">
     <span style="display:flex;color:var(--fg-default);">${ICONS.laptop}</span>
     <span class="flex-1 stack">
@@ -675,6 +787,12 @@ async function viewMain() {
     ${icon('<path d="M9 6l6 6-6 6"></path>', 16, 2.2)}
   </a>` : '';
   const cards = bots.map((b) => botCard(b)).join('');
+  const suggestionCards = suggestions.map((s) => `<article class="bot-card" data-suggestion-id="${esc(s.id)}">
+    <div class="stack flex-1"><p class="t-body" data-i18n-skip>${esc(s.text)}</p>
+      <span class="t-footnote" data-i18n-skip>${esc(bots.find((b) => b.id === s.bot_id)?.name || s.bot_id)}</span></div>
+    <div class="row gap-2"><button type="button" class="btn btn-primary" data-action="accept-suggestion" data-id="${esc(s.id)}">Сделать</button>
+      <button type="button" class="btn btn-secondary" data-action="dismiss-suggestion" data-id="${esc(s.id)}">Скрыть</button></div>
+  </article>`).join('');
   app.innerHTML = `<div class="screen">
     <div class="root-header"><h1 class="h-large-title">Боты</h1>
       <span class="row gap-2">
@@ -684,6 +802,7 @@ async function viewMain() {
       </span>
     </div>
     <div class="bot-list">${macRow}${banner}${cards}</div>
+    ${suggestions.length ? `<section class="stack"><h2 class="t-headline">Подсказки</h2>${suggestionCards}</section>` : ''}
     ${tabBar('main', approvals.length)}
   </div>`;
 }
@@ -910,6 +1029,12 @@ function createThreadEventHandler(body, botAvatar, approvalDecisions, threadId, 
   // Плашка об оборванном ходе. Причина из payload показывается как есть (data-i18n-skip), своя подпись переводится.
   function showTurnError(turnKey, payload) {
     if (body.querySelector(`[data-turn-error="${CSS.escape(turnKey)}"]`)) return;
+    if (payload.code === 'cli_auth_expired') {
+      const login = payload.provider_id
+        ? `<a class="btn btn-primary" href="#/settings/providers/${encodeURIComponent(payload.provider_id)}/login">Войти заново</a>` : '';
+      body.insertAdjacentHTML('beforeend', `<div class="system-pill" role="status" data-turn-error="${esc(turnKey)}" style="color:var(--danger-fg);"><span>Ход прерван: вход в подписку истёк</span>${login}</div>`);
+      return;
+    }
     const given = [payload.reason, payload.detail].find((v) => typeof v === 'string' && v.trim());
     const reason = given ? given.trim() : failureReasons.get(turnKey) || '';
     body.insertAdjacentHTML('beforeend', `<div class="system-pill" role="status" data-turn-error="${esc(turnKey)}" style="color:var(--danger-fg);"><span>Ход прерван</span>${reason ? `<span>: </span><span${given ? ' data-i18n-skip' : ''}>${esc(reason)}</span>` : ''}</div>`);
@@ -1508,18 +1633,48 @@ function procedureEntryRow(procedures) {
 // ---------------------------------------------------------------------------
 // Рутина (расписание, событие): параметры и запуск
 // ---------------------------------------------------------------------------
-function slackHookHtml(s) {
-  const url = `${location.origin}/bots/hooks/${s.id}/slack`;
-  return `<div class="stack gap-2" data-slack-hook>
-    <span class="t-headline" style="font-size:15px;">Slack</span>
-    <span class="t-footnote">Адрес для Request URL в Event Subscriptions приложения Slack.</span>
-    <code class="t-footnote mono" data-i18n-skip data-slack-url style="word-break:break-all;">${esc(url)}</code>
-    <label for="sch-slack-secret"><span class="t-footnote">Секрет подписи Slack</span></label>
+const hookAdapterSelection = new Map();
+function hookAdapterHtml(s) {
+  const base = `${location.origin}/bots/hooks/${s.id}`;
+  const selected = hookAdapterSelection.get(s.id) || (s.has_email_signing_key ? 'email' : 'slack');
+  return `<div class="stack gap-2" data-hook-adapter-box data-schedule-id="${esc(s.id)}">
+    <label for="sch-adapter-${esc(s.id)}" class="t-footnote">Адаптер вебхука</label>
+    <select id="sch-adapter-${esc(s.id)}" class="input" data-hook-adapter>
+      <option value="github"${selected === 'github' ? ' selected' : ''}>GitHub</option>
+      <option value="slack"${selected === 'slack' ? ' selected' : ''}>Slack</option>
+      <option value="email"${selected === 'email' ? ' selected' : ''}>Почта (Mailgun)</option>
+    </select>
+    <div class="stack gap-2" data-hook-panel="github"${selected === 'github' ? '' : ' hidden'}>
+      <span class="t-footnote">Адрес для Payload URL в настройках GitHub.</span>
+      <code class="t-footnote mono" data-i18n-skip style="word-break:break-all;">${esc(base + '/github')}</code>
+      <span class="t-footnote">Секрет GitHub (hook_token)</span>
+      <code class="t-footnote mono" data-i18n-skip style="word-break:break-all;">${esc(s.hook_token || '')}</code>
+    </div>
+    <div class="stack gap-2" data-hook-panel="slack" data-slack-hook${selected === 'slack' ? '' : ' hidden'}>
+      <span class="t-footnote">Адрес для Request URL в Event Subscriptions приложения Slack.</span>
+      <code class="t-footnote mono" data-i18n-skip data-slack-url style="word-break:break-all;">${esc(base + '/slack')}</code>
+    <label for="sch-slack-secret-${esc(s.id)}"><span class="t-footnote">Секрет подписи Slack</span></label>
     <span class="t-footnote" data-slack-secret-state>${s.has_slack_signing_secret ? 'Секрет задан. Его значение не показывается.' : 'Секрет не задан: запросы Slack отклоняются.'}</span>
-    <input id="sch-slack-secret" class="input mono" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" maxlength="256" placeholder="Signing Secret из Basic Information">
+    <input id="sch-slack-secret-${esc(s.id)}" class="input mono" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" maxlength="256" placeholder="Signing Secret из Basic Information">
+    <label for="sch-slack-token"><span class="t-footnote">Bot Token Slack</span></label>
+    <span class="t-footnote" data-slack-token-state>${s.has_slack_bot_token ? 'Токен задан. Его значение не показывается.' : 'Токен не задан: ответ бота в Slack не отправляется.'}</span>
+    <input id="sch-slack-token" class="input mono" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" maxlength="256" placeholder="Bot User OAuth Token из OAuth & Permissions">
     <div class="row gap-2">
-      <button type="button" class="btn btn-secondary" data-action="save-slack-secret" data-id="${esc(s.id)}">Сохранить секрет</button>
-      ${s.has_slack_signing_secret ? `<button type="button" class="btn btn-secondary" data-action="clear-slack-secret" data-id="${esc(s.id)}">Удалить секрет</button>` : ''}
+      <button type="button" class="btn btn-secondary" data-action="save-slack-secret" data-id="${esc(s.id)}">Сохранить секреты</button>
+      ${(s.has_slack_signing_secret || s.has_slack_bot_token) ? `<button type="button" class="btn btn-secondary" data-action="clear-slack-secret" data-id="${esc(s.id)}">Удалить секреты</button>` : ''}
+    </div>
+    </div>
+    <div class="stack gap-2" data-hook-panel="email"${selected === 'email' ? '' : ' hidden'}>
+      <span class="t-footnote">Адрес для JSON-режима входящей почты Mailgun:</span>
+      ${s.email_route_token ? `<code class="t-footnote mono" data-i18n-skip style="word-break:break-all;">${esc(base + '/email/' + encodeURIComponent(s.email_route_token) + '/json')}</code>` : `<span class="t-footnote">Адрес почты пока недоступен. Обновите страницу.</span>`}
+      <span class="t-footnote">Когда ключ Mailgun задан, остальные вебхуки этого расписания отключены.</span>
+      <label for="sch-email-key-${esc(s.id)}"><span class="t-footnote">Ключ подписи Mailgun</span></label>
+      <span class="t-footnote">${s.has_email_signing_key ? 'Ключ задан. Его значение не показывается.' : 'Ключ не задан: письма Mailgun отклоняются.'}</span>
+      <input id="sch-email-key-${esc(s.id)}" class="input mono" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" maxlength="256" placeholder="Signing Key из Mailgun">
+      <div class="row gap-2">
+        <button type="button" class="btn btn-secondary" data-action="save-email-key" data-id="${esc(s.id)}">Сохранить ключ</button>
+        ${s.has_email_signing_key ? `<button type="button" class="btn btn-secondary" data-action="clear-email-key" data-id="${esc(s.id)}">Удалить ключ</button>` : ''}
+      </div>
     </div>
   </div>`;
 }
@@ -1537,7 +1692,7 @@ async function viewSchedule(id) {
         <div class="t-body" data-i18n-skip>${esc(s.kind === 'cron' ? (s.cron || '') : s.kind)}</div>
         <div class="t-footnote" data-i18n-skip>${esc(s.prompt || '')}</div>
         ${skipNoteHtml(s)}
-        ${s.kind === 'hook' ? slackHookHtml(s) : ''}
+        ${s.kind === 'hook' ? hookAdapterHtml(s) : ''}
         ${s.kind === 'cron' ? `<div class="switch-row"><label for="sch-catch-up">Один запуск после возобновления<span class="t-footnote">Если расписание стояло из-за недоступного компьютера бота, после возвращения выполнится один запуск. Пропущенные пачкой не догоняются.</span></label><input id="sch-catch-up" type="checkbox" role="switch" data-action="toggle-catch-up" data-id="${esc(s.id)}"${s.catch_up ? ' checked' : ''}></div>` : ''}
       </div>
     </div>
@@ -1569,6 +1724,18 @@ function formatTokensShort(num) {
     return `${val}\u202Fтыс.`;
   }
   return formatTokens(num);
+}
+
+// Оценка стоимости в USD: «≈ $X,XX» или «≈ $X,XXXX» для очень малых значений (< 1 цента). null/не-число → null (не рисуем).
+function formatCostUsd(value) {
+  if (value === null || value === undefined) return null;
+  const num = Number(value);
+  if (!isFinite(num)) return null;
+  // Округление половины вверх (toFixed даёт банкирское, 11.655→11.65, нам нужно 11.66).
+  const round = (factor, digits) => (Math.round(Math.abs(num) * factor + Number.EPSILON) / factor).toFixed(digits);
+  if (num === 0) return `≈\u202F$0,00`;
+  if (Math.abs(num) < 0.01) return `≈\u202F$${round(10000, 4).replace('.', ',')}`;
+  return `≈\u202F$${round(100, 2).replace('.', ',')}`;
 }
 
 const MONTH_NAMES_SHORT = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
@@ -1611,22 +1778,31 @@ function meterRow(label, pct, colorVar) {
 // Боковая панель треда (десктоп), раздел «Квоты». Метры подписок (Claude/Codex) показываем только
 // боту, привязанному к провайдеру-подписке (запись kind cli_subscription: cli совпадает с runner-провайдером
 // бота); у ботов на API-ключе или OpenAI-совместимом сервере (OpenRouter) ядро не знает квоту, поэтому
-// показываем их расход за сегодня из той же сводки, что уже загружена для экрана расхода.
+// показываем расход этого бота за сегодня и за месяц в долларах и токенах из той же сводки, что уже
+// загружена для экрана расхода. Чужие подписки сюда не попадают: выбор режима делает quotaPanelMode.
 function threadQuotasHtml(bot, usage) {
   const provider = bot.provider_id ? providerById.get(bot.provider_id) : null;
   const label = PROVIDER_LABEL[bot.provider] || bot.provider || 'Квота';
-  if (provider && provider.kind === 'cli_subscription' && runnerKind(provider) === bot.provider) {
+  if (quotaPanelMode(bot, provider) === 'subscription') {
     const row = (usage.providers || []).find((p) => p.provider === bot.provider);
     return row ? meterRow(label, row.pct_week, { claude: 'var(--claude-fg)', codex: 'var(--codex-fg)', gemini: 'var(--gemini-fg)' }[bot.provider]) : '';
   }
-  // Метр расхода подписываем именем бота: у API-ключа/Codex-раннера «Codex» пометило бы чужую квоту.
-  const used = (usage.bots || []).find((b) => b.bot_id === bot.id);
-  if (used) {
-    const today = used.tokens_today || 0;
-    const budget = used.budget || bot.budget_daily_tokens || 200000;
-    const pct = budget > 0 ? Math.round((today / budget) * 100) : 0;
+  const summary = (usage.bots || []).find((b) => b.bot_id === bot.id) || {};
+  const spendLine = (caption, tokens, cost) => `<div class="row" style="justify-content:space-between;">
+    <span class="t-footnote">${caption}</span>
+    <span class="t-footnote">${cost === null || cost === undefined ? '' : `${formatCostUsd(cost)} · `}${formatTokens(tokens || 0)} токенов</span>
+  </div>`;
+  let html = `<div class="card card-pad stack gap-1">
+    ${spendLine('Сегодня', summary.tokens_today, summary.cost_usd_today)}
+    ${spendLine('За месяц', summary.tokens_month, summary.cost_usd_month)}
+  </div>`;
+  // Дневной бюджет в токенах: метр заполнения и стоп-правило действуют у любого бота, поэтому показываем его и здесь.
+  const today = summary.tokens_today || 0;
+  const budget = summary.budget ?? bot.budget_daily_tokens ?? 200000;
+  if (budget > 0) {
+    const pct = Math.round((today / budget) * 100);
     const fill = pct >= 100 ? 'var(--danger-fg)' : pct >= 80 ? 'var(--attention-fg)' : 'var(--codex-fg)';
-    return `<div class="meter-row">
+    html += `<div class="meter-row">
       <span class="meter-label" data-i18n-skip>${esc(bot.name || bot.id)}</span>
       <div role="meter" aria-label="${esc(bot.name || bot.id)}: ${formatTokens(today)} из ${formatTokens(budget)} токенов" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100" class="meter-track">
         <div class="meter-fill" style="width:${Math.min(pct, 100)}%;background:${fill};"></div>
@@ -1635,7 +1811,7 @@ function threadQuotasHtml(bot, usage) {
     </div>
     <div class="t-footnote">Сегодня: ${formatTokens(today)} из ${formatTokens(budget)} токенов дневного бюджета</div>`;
   }
-  return '<div class="t-footnote"><a href="#/usage">Расход по токенам: экран «Расход»</a></div>';
+  return html;
 }
 
 function usageBodyHtml(summary, bots, days) {
@@ -1659,12 +1835,17 @@ function usageBodyHtml(summary, bots, days) {
   const periodLabel = periodLabels[days] || `за ${days} дн.`;
   const maxTokens = Math.max(...daily.map((d) => d.total_tokens || 0), 1);
 
+  const costTotalText = formatCostUsd(summary.cost_usd_total);
+  const costPartialNote = summary.cost_partial ? `<span class="t-footnote usage-cost-note">частично: не у всех моделей есть цена</span>` : '';
+  const costTotalLine = costTotalText !== null ? `
+        <span class="t-footnote">Оценка стоимости: <span class="t-callout" style="font-weight:600;">${costTotalText}</span></span>${costPartialNote}` : '';
   const chartCard = `
     <div class="card usage-chart-card">
       <div class="usage-chart-header">
         <div class="stack gap-1">
           <span class="t-footnote">Всего за период (${esc(periodLabel)})</span>
           <span class="usage-chart-total">${formatTokens(total)} <span class="t-footnote" style="font-weight:400;">токенов</span></span>
+          ${costTotalLine}
         </div>
         <span class="badge badge-sunken">${formatTokensShort(total)}</span>
       </div>
@@ -1733,7 +1914,7 @@ function usageBodyHtml(summary, bots, days) {
               </div>
               <div class="usage-bot-meta t-footnote">
                 <span>${formatTokens(today)} / ${formatTokens(budget)}</span>
-                <span>за период: ${formatTokens(u.tokens_period || today)}</span>
+                <span>за период: ${formatTokens(u.tokens_period || today)}${(() => { const c = formatCostUsd(u.cost_usd); return c ? ` · ${c}` : ''; })()}</span>
               </div>
             </div>
           `;
@@ -1757,10 +1938,13 @@ function usageBodyHtml(summary, bots, days) {
                 <th scope="col" style="text-align:right;">Кэш запись</th>
                 <th scope="col" style="text-align:right;">Итого</th>
                 <th scope="col" style="text-align:right;">Ходы</th>
+                <th scope="col" style="text-align:right;">Стоимость</th>
               </tr>
             </thead>
             <tbody>
-              ${models.map((m) => `
+              ${models.map((m) => {
+                const cost = formatCostUsd(m.cost_usd);
+                return `
                 <tr>
                   <td>
                     <div class="stack gap-1">
@@ -1774,8 +1958,9 @@ function usageBodyHtml(summary, bots, days) {
                   <td style="text-align:right;" class="t-log">${formatTokens(m.tokens_cache_write)}</td>
                   <td style="text-align:right;font-weight:600;" class="t-log">${formatTokens(m.total_tokens)}</td>
                   <td style="text-align:right;" class="t-log">${formatTokens(m.turns)}</td>
-                </tr>
-              `).join('')}
+                  <td style="text-align:right;font-weight:600;" class="t-log">${cost || ''}</td>
+                </tr>`;
+              }).join('')}
             </tbody>
           </table>
         </div>
@@ -1889,6 +2074,19 @@ function avatarDraftSet(kind) {
   try { sessionStorage.setItem(NEW_BOT_AVATAR_KEY, kind); } catch { /* приватный режим: выбор не сохранится */ }
 }
 
+function macAssignmentField(macs, selectedId, { fieldId, selectId } = {}) {
+  const rows = Array.isArray(macs) ? macs : [];
+  const options = rows.map((mac) => `<option value="${esc(mac.id)}" data-i18n-skip ${mac.id === selectedId ? 'selected' : ''}>${esc(mac.name)}</option>`).join('');
+  return `<div id="${fieldId}" class="form-field stack gap-1">
+    <label for="${selectId}">Mac для бота</label>
+    <select id="${selectId}" class="input">
+      <option value="">Нет доступа к Mac</option>
+      ${options}
+    </select>
+    ${rows.length ? '' : '<span class="t-footnote"><span>Mac-агентов пока нет.</span> <a href="#/settings/macs">Добавить Mac в настройках</a></span>'}
+  </div>`;
+}
+
 async function viewBotNew(qs) {
   // Печатать текст в textarea через симулятор не всегда получается: в mock-режиме
   // можно подставить описание сразу через #/bots/new?d=... (только ?mock=1).
@@ -1908,8 +2106,9 @@ async function viewBotNew(qs) {
           </div>
           <p id="bn-desc-error" class="t-footnote" style="color:var(--danger-fg);" hidden></p>
           <button type="button" id="bn-desc-submit" class="btn btn-primary">Собрать</button>
-          <div class="row gap-2" style="margin-top:4px;">
+          <div class="row gap-2" style="margin-top:4px;flex-wrap:wrap;">
             <span class="t-footnote" style="color:var(--fg-muted);">или</span>
+            <button type="button" id="bn-from-catalog" class="btn btn-secondary">${ICONS.folder}Из каталога</button>
             <button type="button" id="bn-from-file" class="btn btn-secondary">${ICONS.share}Создать из файла</button>
             <input type="file" id="bn-file-input" accept=".botstead.json,application/json" hidden>
           </div>
@@ -1951,6 +2150,22 @@ async function viewBotNew(qs) {
     const fileBtn = document.getElementById('bn-from-file');
     const fileInput = document.getElementById('bn-file-input');
     const fileErr = document.getElementById('bn-file-error');
+    const catalogBtn = document.getElementById('bn-from-catalog');
+    catalogBtn.addEventListener('click', async () => {
+      catalogBtn.disabled = true;
+      catalogBtn.setAttribute('aria-busy', 'true');
+      const idleHtml = catalogBtn.innerHTML;
+      catalogBtn.innerHTML = loadingBtnHtml('Каталог…');
+      try {
+        await renderCatalog();
+      } catch (err) {
+        catalogBtn.disabled = false;
+        catalogBtn.removeAttribute('aria-busy');
+        catalogBtn.innerHTML = idleHtml;
+        fileErr.textContent = `Каталог недоступен: ${err.message || String(err)}`;
+        fileErr.hidden = false;
+      }
+    });
     fileBtn.addEventListener('click', () => fileInput.click());
     fileInput.addEventListener('change', async (e) => {
       const file = e.target.files && e.target.files[0];
@@ -2043,6 +2258,7 @@ async function viewBotNew(qs) {
             <button type="button" data-bn-executor="container" role="radio" aria-checked="${d.executor === 'container'}">Сервер</button>
             <button type="button" data-bn-executor="mac" role="radio" aria-checked="${d.executor === 'mac'}">Mac</button>
           </div>
+          ${d.mac_selection_enabled ? macAssignmentField(d.macs, d.mac_id, { fieldId: 'bn-mac-field', selectId: 'bn-mac-id' }) : ''}
           <div class="switch-row">
             <label for="bn-mfc"><span class="t-body">Полный контроль Mac</span><span class="t-footnote" style="font-size:12px;">Файлы, приложения, клики и ввод, скриншоты</span></label>
             <input id="bn-mfc" type="checkbox" role="switch" ${d.mac_full_control ? 'checked' : ''}>
@@ -2080,11 +2296,11 @@ async function viewBotNew(qs) {
 
   async function renderStep2(draft, description) {
     // Модель берётся из включённых моделей своих провайдеров; предложенную черновиком берём, если она есть среди них.
-    const options = await loadModelOptions();
+    const [options, macs] = await Promise.all([loadModelOptions(), api.listMacs()]);
     const available = usableModels(options.groups);
     const first = available.find((x) => x.model.name === draft.model) || available[0];
     if (!chosenAvatar) { chosenAvatar = randomAvatar(); avatarDraftSet(chosenAvatar); }
-    const d = { ...draft, avatar: chosenAvatar, scheduleEnabled: !!draft.schedule, provider_id: first ? first.provider.id : null, model_id: first ? first.model.id : null };
+    const d = { ...draft, avatar: chosenAvatar, scheduleEnabled: !!draft.schedule, macs, mac_id: draft.mac_id || null, mac_selection_enabled: true, provider_id: first ? first.provider.id : null, model_id: first ? first.model.id : null };
     if (first) { d.model = first.model.name; d.provider = runnerKind(first.provider); }
 
     function paint() { app.innerHTML = step2Html(d); wire(); }
@@ -2102,6 +2318,7 @@ async function viewBotNew(qs) {
       document.getElementById('bn-name').addEventListener('input', (e) => { d.name = e.target.value; });
       document.getElementById('bn-role').addEventListener('input', (e) => { d.role = e.target.value; });
       document.getElementById('bn-instructions')?.addEventListener('input', (e) => { d.instructions = e.target.value; });
+      document.getElementById('bn-mac-id')?.addEventListener('change', (e) => { d.mac_id = e.target.value || null; });
       document.getElementById('bn-mfc')?.addEventListener('change', (e) => { d.mac_full_control = e.target.checked; });
       document.getElementById('bn-sched')?.addEventListener('change', (e) => { d.scheduleEnabled = e.target.checked; });
       document.querySelectorAll('[data-bn-avatar]').forEach((b) => b.addEventListener('click', () => setAvatar(b.getAttribute('data-bn-avatar'), false)));
@@ -2136,7 +2353,8 @@ async function viewBotNew(qs) {
         try {
           const payload = {
             id: d.id, name: d.name, role: d.role, avatar: d.avatar, provider: d.provider, model: d.model,
-            executor: d.executor, mac_full_control: d.mac_full_control, auto_allow: d.auto_allow,
+            executor: d.executor, mac_id: d.mac_id || null,
+            mac_full_control: d.mac_full_control, auto_allow: d.auto_allow,
             instructions: d.instructions, start_container: true,
           };
           if (d.schedule && d.scheduleEnabled) payload.schedule = d.schedule;
@@ -2168,13 +2386,56 @@ async function viewBotNew(qs) {
     paint();
   }
 
+  async function renderCatalog() {
+    // Каталог готовых шаблонов: список карточек, выбор открывает тот же поток импорта, что и файл.
+    // Список читается при открытии каталога.
+    const items = await api.listCatalog();
+    function paint() {
+      app.innerHTML = `<div class="screen">
+        ${backHeader({ title: 'Новый бот', backHref: '#/bots/new' })}
+        <div class="thread-body" style="gap:12px;">
+          <p class="t-footnote" style="color:var(--fg-muted);">Выберите шаблон бота. Перед созданием можно изменить имя, роль и модель.</p>
+          ${items.length ? `<div class="stack gap-2">${items.map((t) => `
+            <button type="button" class="card card-pad row gap-3" data-catalog-pick="${esc(t.id)}" style="text-align:left;align-items:flex-start;">
+              <span aria-hidden="true">${avatarHtml(t.avatar, null, 40)}</span>
+              <span class="stack gap-1" style="flex:1;min-width:0;">
+                <span class="t-headline" style="font-size:15px;" data-i18n-skip>${esc(t.name)}</span>
+                <span class="t-footnote" style="color:var(--fg-muted);" data-i18n-skip>${esc(t.description || t.role || '')}</span>
+              </span>
+              <span aria-hidden="true" style="color:var(--fg-muted);">${ICONS.chevronRight}</span>
+            </button>
+          `).join('')}</div>` : `<p class="t-footnote" style="color:var(--fg-muted);">В каталоге пока нет шаблонов.</p>`}
+          <p id="bn-catalog-error" class="t-footnote" style="color:var(--danger-fg);" hidden></p>
+        </div>
+      </div>`;
+      app.querySelectorAll('[data-catalog-pick]').forEach((btn) => btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-catalog-pick');
+        btn.disabled = true;
+        btn.setAttribute('aria-busy', 'true');
+        try {
+          const doc = await api.getCatalogTemplate(id);
+          // Тот же шаг 2, что у файла: имя и роль из шаблона, дальше выбор модели и «Создать».
+          await renderStep2FromTemplate(doc);
+        } catch (err) {
+          btn.disabled = false;
+          btn.removeAttribute('aria-busy');
+          const catalogErr = document.getElementById('bn-catalog-error');
+          catalogErr.textContent = `Не получилось взять шаблон: ${err.message || String(err)}`;
+          catalogErr.hidden = false;
+        }
+      }));
+    }
+    paint();
+  }
+
   async function renderStep2FromTemplate(doc) {
     // Шаблон из файла: показываем карточку как draft, имя и роль берём из файла, расписания/правила — оттуда же.
     // Модель человек выбирает из включённых, при импорте передаём её в POST /api/bots/import.
     const options = await loadModelOptions();
     const available = usableModels(options.groups);
     const first = available[0];
-    if (!chosenAvatar) { chosenAvatar = randomAvatar(); avatarDraftSet(chosenAvatar); }
+    chosenAvatar = AVATAR_KINDS.includes(doc.avatar) ? doc.avatar : 'robot';
+    avatarDraftSet(chosenAvatar);
     const d = {
       name: doc.name,
       role: doc.role || '',
@@ -2192,6 +2453,7 @@ async function viewBotNew(qs) {
       model_id: first ? first.model.id : null,
       budget_daily_tokens: doc.budget_daily_tokens,
       auto_compact_percent: doc.auto_compact_percent,
+      proactive_interval_hours: doc.proactive_interval_hours,
       _templateDoc: doc,
       _importSummary: `${doc.name}${doc.role ? ` · ${doc.role}` : ''} · расписаний: ${(doc.schedules || []).length} · процедур: ${(doc.procedures || []).length}`,
     };
@@ -2243,6 +2505,7 @@ async function viewBotNew(qs) {
         errEl.hidden = true;
         try {
           const templateDoc = { ...d._templateDoc };
+          delete templateDoc.mac_id;
           templateDoc.name = d.name;
           templateDoc.role = d.role;
           templateDoc.instructions = d.instructions || '';
@@ -2251,6 +2514,7 @@ async function viewBotNew(qs) {
           templateDoc.auto_allow = d.auto_allow;
           templateDoc.mcp_allow = d.mcp_allow;
           if (templateDoc.auto_compact_percent === undefined) templateDoc.auto_compact_percent = d.auto_compact_percent;
+          if (templateDoc.proactive_interval_hours === undefined) templateDoc.proactive_interval_hours = d.proactive_interval_hours ?? null;
           if (!d.scheduleEnabled) templateDoc.schedules = [];  // галочка «расписание» снята: в бота они не попадут
           const bot = await api.importBotTemplate({ ...templateDoc, provider_id: d.provider_id, model_id: d.model_id });
           draftSet('');
@@ -2284,7 +2548,7 @@ async function viewBotNew(qs) {
 // BotSettings
 // ---------------------------------------------------------------------------
 // Карточки настроек бота: одни и те же на телефоне и на Mac. Родитель с data-bot нужен делегированию в handleAction.
-function botSettingsCards(bot) {
+function botSettingsCards(bot, macs) {
   botState.set(bot.id, bot);
   const acOn = bot.auto_compact_percent !== null; // нет поля (старое ядро) считаем включённым по умолчанию 80
   const acPercent = Number.isInteger(bot.auto_compact_percent) ? bot.auto_compact_percent : 80;
@@ -2310,6 +2574,7 @@ function botSettingsCards(bot) {
           <button type="button" data-action="set-executor" data-value="container" role="radio" aria-checked="${bot.executor === 'container'}">Сервер</button>
           <button type="button" data-action="set-executor" data-value="mac" role="radio" aria-checked="${bot.executor === 'mac'}">Mac</button>
         </div>
+        ${macAssignmentField(macs, bot.mac_id, { fieldId: 'bot-mac-field', selectId: 'bot-mac-select' })}
         <div class="switch-row">
           <label for="mfc"><span class="t-body">Полный контроль Mac</span><span class="t-footnote" style="font-size:12px;">Файлы, приложения, клики и ввод, скриншоты</span></label>
           <input id="mfc" data-action="toggle-mfc" type="checkbox" role="switch" ${bot.mac_full_control ? 'checked' : ''}>
@@ -2326,7 +2591,19 @@ function botSettingsCards(bot) {
           <output class="ac-value" for="ac-range" data-ac-value>${acPercent}%</output>
         </div>
       </div>
+      <div class="card card-pad stack gap-2" id="telegram-channel-card">
+        <span class="t-headline" style="font-size:15px;">Telegram</span>
+        <div data-telegram-state>
+          <span class="t-footnote">Загрузка...</span>
+        </div>
+      </div>
       ${wakeupsCardHtml()}
+      <div class="card card-pad stack gap-2">
+        <label for="proactive-interval" class="t-headline" style="font-size:15px;">Подсказки бота</label>
+        <span class="t-footnote">Бот предложит до 3 действий, ничего не выполняя.</span>
+        <input id="proactive-interval" class="input" type="number" min="1" max="720" step="1"
+          placeholder="Выключено" value="${bot.proactive_interval_hours ?? ''}" aria-label="Интервал подсказок в часах">
+      </div>
       <div class="card card-pad stack gap-2" id="mcp-allow-card">
         <label for="mcp-allow"><span class="t-headline" style="font-size:15px;">Разрешённые MCP</span></label>
         <span class="t-footnote" id="mcp-allow-hint">Одно правило на строку: имя сервера (весь сервер) или сервер.инструмент, например github или github.create_issue. Пусто: у бота только инструменты bothub. Разрешённый инструмент всё равно спросит вас, пока нет правила.</span>
@@ -2359,17 +2636,18 @@ function settingsBackHref(qs) {
 }
 
 async function viewBotSettings(id, qs) {
-  const bots = await listBotsView();
+  const [bots, macs] = await Promise.all([listBotsView(), api.listMacs()]);
   const bot = bots.find((b) => b.id === id);
   if (!bot) { app.innerHTML = `<div class="center-screen"><p class="t-body">Бот не найден.</p><a class="btn btn-secondary" href="#/">На главную</a></div>`; return; }
   app.innerHTML = `<div class="screen" data-bot="${esc(bot.id)}">
     ${backHeader({ title: bot.name, subtitle: 'Настройки бота', backHref: settingsBackHref(qs), avatar: avatarSlot(bot, 36) })}
     <div class="thread-body" style="gap:10px;">
-      ${botSettingsCards(bot)}
+      ${botSettingsCards(bot, macs)}
     </div>
   </div>`;
   mountBotModel(app.querySelector('.screen[data-bot]'), bot.id);
   mountWakeups(app.querySelector('.screen[data-bot]'), bot.id);
+  mountTelegram(app.querySelector('.screen[data-bot]'), bot.id, api.getTelegramChannel);
 }
 
 // Выбор модели в настройках бота: подгружает реестр и сохраняет выбор в ядре (provider_id и model_id вместе).
@@ -2449,7 +2727,7 @@ async function renderDesktop(route, mine) {
     const procedures = await api.listProcedures().catch(() => null);
     mainHtml = `<main class="desktop-main"><div class="desktop-thread-head"><div class="t-headline">Рутины</div></div><div class="desktop-thread-body" style="max-width:640px;">
       ${procedureEntryRow(procedures)}
-      ${schedules.map((s) => `<div class="card card-pad row gap-3"><span class="row-icon">${scheduleIconFor(s.kind)}</span><span class="flex-1 stack"><span class="row-title" data-i18n-skip>${esc(s.name)}</span><span class="row-sub">${esc(bots.find((b) => b.id === s.bot_id)?.name || s.bot_id)}</span>${skipNoteHtml(s)}</span><button type="button" class="icon-btn sunken" data-action="run-schedule" data-id="${s.id}">${ICONS.play}</button></div>${s.kind === 'hook' ? `<div class="card card-pad">${slackHookHtml(s)}</div>` : ''}`).join('')}
+      ${schedules.map((s) => `<div class="card card-pad row gap-3"><span class="row-icon">${scheduleIconFor(s.kind)}</span><span class="flex-1 stack"><span class="row-title" data-i18n-skip>${esc(s.name)}</span><span class="row-sub">${esc(bots.find((b) => b.id === s.bot_id)?.name || s.bot_id)}</span>${skipNoteHtml(s)}</span><button type="button" class="icon-btn sunken" data-action="run-schedule" data-id="${s.id}">${ICONS.play}</button></div>${s.kind === 'hook' ? `<div class="card card-pad">${hookAdapterHtml(s)}</div>` : ''}`).join('')}
     </div></main>`;
   } else if (route.name === 'approvals') {
     const a = (route.id && approvals.find((x) => x.id === route.id)) || approvals[0];
@@ -2461,6 +2739,14 @@ async function renderDesktop(route, mine) {
         <div class="btn-row btn-row-2"><button type="button" class="btn btn-secondary" data-action="reject" data-id="${a.id}">Отклонить</button><button type="button" class="btn btn-attention" data-action="approve" data-id="${a.id}">Разрешить</button></div>
       </div>` : `<p class="t-body">Нет ожидающих решений.</p>`}
     </div></main>`;
+  } else if (route.name === 'main') {
+    const suggestions = await api.listSuggestions();
+    mainHtml = `<main class="desktop-main"><div class="desktop-thread-head"><h1 class="t-headline">Подсказки</h1></div>
+      <div class="desktop-thread-body stack gap-3">${suggestions.map((s) => `<article class="card card-pad stack gap-2">
+        <p class="t-body" data-i18n-skip>${esc(s.text)}</p><span class="t-footnote" data-i18n-skip>${esc(bots.find((b) => b.id === s.bot_id)?.name || s.bot_id)}</span>
+        <div class="row gap-2"><button type="button" class="btn btn-primary" data-action="accept-suggestion" data-id="${esc(s.id)}">Сделать</button>
+        <button type="button" class="btn btn-secondary" data-action="dismiss-suggestion" data-id="${esc(s.id)}">Скрыть</button></div>
+      </article>`).join('') || '<p class="t-body">Подсказок пока нет.</p>'}</div></main>`;
   } else if (route.name === 'bot-settings') {
     const bot = bots.find((b) => b.id === route.id);
     mainHtml = bot
@@ -2479,6 +2765,7 @@ async function renderDesktop(route, mine) {
   if (route.name === 'bot-settings') {
     mountBotModel(app.querySelector('main[data-bot]'), route.id);
     mountWakeups(app.querySelector('main[data-bot]'), route.id);
+    mountTelegram(app.querySelector('main[data-bot]'), route.id, api.getTelegramChannel);
   }
   if (route.name === 'browser') mountBrowser({ app, bot: bots.find((b) => b.id === route.id), botId: route.id, setCleanup });
 

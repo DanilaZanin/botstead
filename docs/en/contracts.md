@@ -183,6 +183,8 @@ create table mac_status (
 
 `seq` is issued like this: `update threads set last_seq = last_seq + 1 where id = $1 returning last_seq` in the same transaction as the insert into events.
 
+<a id="contract-2"></a>
+
 ## 2. Core HTTP API (prefix `/api`, JSON)
 
 Authorization: header `Authorization: Bearer <token>`.
@@ -213,11 +215,11 @@ Authorization: header `Authorization: Bearer <token>`.
 | POST /api/memory | owner, [bot] | `{"text","bot_id"?,"expires_at"?}`; from bot status proposed |
 | PATCH /api/memory/{id} | owner | `{"text"?,"status"?,"bot_id"?,"expires_at"?}`; text edit increments version; bot_id=null moves to shared; `text` non-empty, no NUL, up to 16 KiB, `expires_at` without timezone is assumed UTC, otherwise 400; edit is atomic (`for update`) |
 | DELETE /api/memory/{id} | owner | `{"ok": true}` (own records only; foreign id gives 404, bot token gives 403) |
-| GET /api/usage/summary?days=7 | owner | `{"days","total_tokens","bots":[{"bot_id","tokens_today","tokens_period","budget","last_activity"}],"models":[{"provider","model","tokens_in","tokens_out","tokens_cache_read","tokens_cache_write","total_tokens","turns"}],"daily":[{"date","total_tokens"}],"providers":[{"provider","pct_week"\|null,"reset_at"\|null}]}` |
+| GET /api/usage/summary?days=7 | owner | Usage by bot, model, day, and provider, with `cost_usd_total`, `cost_partial`, and bot and model cost estimates; see below |
 | POST /api/usage | [bot] | `{"thread_id","turn_id","provider","model","tokens_in","tokens_out"}` |
 | GET /api/schedules | owner | `[Schedule]` |
-| POST /api/schedules | owner | ScheduleIn → Schedule (generates hook_token for hook) |
-| PATCH /api/schedules/{id} | owner | `{"enabled"?,"cron"?,"prompt"?,"catch_up"?,"slack_signing_secret"?}`; the Slack secret is for kind=hook only, a string up to 256 chars or `null` (clear), never returned: responses carry `has_slack_signing_secret` instead (section 18) |
+| POST /api/schedules | owner | ScheduleIn → Schedule (generates separate hook and email route tokens for hooks) |
+| PATCH /api/schedules/{id} | owner | `{"enabled"?,"cron"?,"prompt"?,"catch_up"?,"slack_signing_secret"?,"slack_bot_token"?,"email_signing_key"?}`; secrets are write-only and reported through `has_*` flags (section 18) |
 | POST /api/schedules/{id}/run | owner | creates thread kind=routine (or last one) and turn client=schedule; bot paused: 409 `bot_paused` |
 | POST /api/bots/wakeups | [bot] | `{"at"?,"in_minutes"?,"prompt","reason"?,"thread_id"?}` → Wakeup and `deduplicated` (201, repeat 200), section 17 |
 | GET /api/bots/{id}/wakeups?status= | owner | `[Wakeup]` of the bot: active ones by nearest time, then history, up to 100 (section 17) |
@@ -229,8 +231,12 @@ Authorization: header `Authorization: Bearer <token>`.
 | GET /api/files/{id} | owner | serves file (Content-Disposition) |
 | GET /api/mac/status | owner | `{"state","last_seen","info"}` |
 | POST /api/mac/call | [bot] | `{"thread_id","turn_id","tool","args","timeout"?}` → Mac tool result (section 5) or 409 `{"state"}` if Mac is not online |
+| GET /api/macs; POST /api/macs; DELETE /api/macs/{id} | owner | List, register, and remove the owner's Macs (section 5) |
 | POST /api/push/subscribe | owner | `{"endpoint","keys","device"}` |
 | GET /api/activity?bot_id=&kind=&before=&limit= | owner | activity feed (section 16): `{"items":[Item],"next":cursor or null}` |
+| GET /api/activity/export.csv?days=1\|7\|30\|90 | owner | activity feed as CSV (section 16): `text/csv; charset=utf-8`, up to 10000 rows |
+| GET /api/suggestions; POST /api/suggestions/{id}/accept; POST /api/suggestions/{id}/dismiss | owner | List, accept, or dismiss the owner's proactive suggestions (section 22) |
+| GET /api/bots/{id}/channels/telegram; PUT /api/bots/{id}/channels/telegram; DELETE /api/bots/{id}/channels/telegram | owner | Manage the bot's Telegram channel (section 23) |
 | POST /api/bots/{id}/pause, /resume | owner | `{"reason"?}` / without body → `{"bot_id","paused","paused_at","paused_reason","running_turn"}` (section 16) |
 | POST /api/bots/pause-all, /resume-all | owner | `{"reason"?}` / without body → `{"bots":[as above]}` for each of own bots |
 
@@ -241,12 +247,14 @@ The period is calculated in whole days: it starts at midnight of the day `days -
 The response contains:
 - `days`: requested period in days (integer).
 - `total_tokens`: sum of `total_tokens` from `daily`, that is, usage of all user bots over the period.
-- `bots`: all user bots (even without usage) ordered by creation age, then by `id`; fields `bot_id`, `tokens_today` (usage since start of current day), `tokens_period` (usage over the period), `budget` (`bots.budget_daily_tokens`, default 200,000), `last_activity` (timestamp of the latest usage record for the bot across all time, ISO 8601, or `null` if there was no usage).
+- `bots`: all user bots (even without usage) ordered by creation age, then by `id`; fields `bot_id`, `tokens_today`, `tokens_period`, `tokens_month`, `budget` (`bots.budget_daily_tokens`, default 200,000), `last_activity` (timestamp of the latest usage record for the bot across all time, ISO 8601, or `null` if there was no usage), `cost_usd`, `cost_usd_today`, and `cost_usd_month`.
 - `models`: usage over the period grouped by `(provider, model)` pair, sorted by descending `total_tokens`, then by `provider` and `model`; fields `provider`, `model`, `tokens_in`, `tokens_out`, `tokens_cache_read`, `tokens_cache_write`, `total_tokens` (sum of the four), `turns` (number of distinct `turn_id` values in records of the group; a record without `turn_id` is counted as a separate turn). A model without usage during the period does not appear in the list.
 - `daily`: exactly `days` elements from oldest day to today, `date` (`YYYY-MM-DD`) and `total_tokens`. Days without usage are present in the series with value `0`, including in the middle of the period.
 - `providers`: distinct `provider` values of user bots alphabetically, `pct_week` and `reset_at` currently `null` (no subscription quota tracking yet).
 
 There is no `guard` field in the response: the route does not return it now or previously. A bot stoppage by guard is visible as a `guard` event in the thread (section 3).
+
+**Estimated cost.** Each `models` entry has `cost_usd`, calculated from the model's stored input and output prices per million tokens; cache tokens use the input price. A bot's `cost_usd` covers the selected period, while `cost_usd_today` and `cost_usd_month` cover the current day and calendar month. A missing model price makes the relevant bot estimate `null`; `cost_partial` flags incomplete totals. The PWA's "Quotas" panel shows the bot's dollar and token usage for an API provider, or the matching CLI subscription quota meter when that data is available. Subscription quota tracking fields in this API remain `null`.
 
 ## 3. Events (`events.kind` and `payload`)
 
@@ -276,6 +284,8 @@ There is no `guard` field in the response: the route does not return it now or p
 
 Outgoing Event JSON: `{"thread_id","seq","ts","turn_id","kind","actor","client","payload"}`.
 
+<a id="contract-4"></a>
+
 ## 4. auto_allow Rules and Approvals
 
 `bots.auto_allow` = list of objects `{"tool": "<name or prefix*>", "match"?: {"<args key>": "<value>"}, "op_hash"?: "<SHA256>"}`. `match` values are compared with the argument exactly (string as is, other types via canonical JSON), without glob; missing key = no match; metacharacters `* ? [` in value are literal. Glob is allowed only in the tool name. If `op_hash` is specified, matching hash of the tool and the entire `args` object is additionally required: an extra argument changes the operation. A rule with non-empty `match` without `op_hash` has no effect (this was the shape of legacy "remember"); migration 006 deletes such rules, as well as rules without `match` for `Bash`, `WebFetch`, and `mcp__bothub__mac_delegate`, and stores them in `auto_allow_removed(bot_id, rule, removed_at)`.
@@ -300,7 +310,11 @@ Never pass under rules, under `mac_full_control`, or under "remember": risks `pa
 
 For Claude: `--permission-prompt-tool mcp__bothub__approve`. The MCP server's `approve` tool receives `{"tool_name","input"}` and returns `{"behavior":"allow","updatedInput":input}` or `{"behavior":"deny","message":"..."}`. Risk is determined by table in `bothub/risk.py` (owner: runner): tool name and arguments → risk. Read, search, screenshot = `other` and are allowed under `mac_full_control` or by rules.
 
+<a id="contract-5"></a>
+
 ## 5. Mac Agent ↔ Core (WebSocket `/agent/mac`)
+
+An owner can register several Macs with `GET /api/macs`, `POST /api/macs`, and `DELETE /api/macs/{id}`. Each Mac has its own token. The routes require the signed-in owner and only return that owner's devices. The older `/api/mac/token` route updates the first Mac for existing agents.
 
 Connection: `wss://<host>/agent/mac?token=MAC_AGENT_TOKEN`. The agent maintains the connection, reconnects with exponential backoff 1 to 30 s.
 
@@ -417,6 +431,8 @@ The model gateway is accessible to bots over internal Docker network via `BOTHUB
 - On core startup, turns in `running`/`waiting_approval`/`waiting_mac` with expired (or absent) `lease_until` are marked `error` ("interrupted by core restart") + `status` event; under `BOTHUB_RUNNER_EXEC=docker`, `docker exec bot-<id> pkill -f <turn_id>` is additionally sent (TERM, then KILL).
 - In `docker` mode, `stop()`/timeout/guard kill not only the `docker exec` client, but also the CLI inside the container: the command is wrapped so its `argv[0]` inside the container contains `turn_id` (`bothub-turn-<turn_id>`), and `stop()` sends there `docker exec <container> pkill -TERM -f <turn_id>`, after 5 s `-KILL`.
 
+<a id="contract-9"></a>
+
 ## 9. Bot Builder (2026-09-25)
 
 The owner creates a bot with a single natural language description. Existing bots do not change.
@@ -455,22 +471,26 @@ Schedule and procedure run (section 14): scheduler skips `cron` schedule of a bo
 
 A template file moves a bot to another installation or shares its settings without history. The format is defined by the core; the client serves it as-is.
 
-`GET /api/bots/{id}/export` (bot owner; another owner's bot is 404) — JSON document:
+`GET /api/bots/{id}/export` (bot owner; another owner's bot is 404) returns a JSON document:
 ```json
 {"format": "botstead-bot", "version": 1, "name": "Scout", "role": "...", "instructions": "...",
  "avatar": "scout", "executor": "container", "auto_allow": [{"tool": "..."}], "mcp_allow": ["..."],
- "budget_daily_tokens": 200000, "auto_compact_percent": 80,
+ "budget_daily_tokens": 200000, "auto_compact_percent": 80, "proactive_interval_hours": null,
  "schedules": [{"cron": "0 9 * * 1-5", "timezone": "Europe/Moscow", "prompt": "...", "enabled": true, "name": "..."}],
  "procedures": [{"format": "bothub-procedure/1", "name": "Login", "description": "...", "params": [...], "steps": [...]}]}
 ```
 
 The export omits: `id`, `owner_id`, `provider_id`/`model_id`, provider/model as strings, secrets, memory, threads, tokens, usage, status, created/updated timestamps, container. `auto_allow` and `mcp_allow` are validated as regular rules. Procedures go through `procedures.export_document` (section 14); schedules through `SELECT cron, timezone, prompt, enabled, name FROM bothub.schedules WHERE bot_id=$1 AND kind='cron'` (cron only, no hook or mac_folder).
 
-`POST /api/bots/import` (owner) — body: the same document plus optional `provider_id` and `model_id` (both or neither, UUID strings). Body ≤ 256 KiB (`Content-Length` over the limit → 413). Document fields are exactly the ones listed above; an unknown key returns 422 `{"error":"invalid","detail":"body: unknown_field: unknown field"}` (the key value is not included in the response). Each field uses the same validator as `BotIn`/`ScheduleIn`/`procedures.parse_import` (`name`, `role`, `instructions`, `avatar`, `executor`, `auto_allow`, `mcp_allow`, `budget_daily_tokens`, `auto_compact_percent`); `procedures` — `procedures.parse_import` per item; schedules — `check_timezone` and `croniter`. `provider_id`/`model_id` are validated as UUID strings; in the DB the core verifies the "owner's provider and enabled model" pair with the same query as in `POST /api/bots`.
+`POST /api/bots/import` (owner) accepts the same document plus optional `provider_id` and `model_id` (both or neither, UUID strings). Body ≤ 256 KiB (`Content-Length` over the limit → 413). Document fields are exactly the ones listed above; an unknown key returns 422 `{"error":"invalid","detail":"body: unknown_field: unknown field"}` (the key value is not included in the response). Each field uses the same validator as `BotIn`/`ScheduleIn`/`procedures.parse_import` (`name`, `role`, `instructions`, `avatar`, `executor`, `auto_allow`, `mcp_allow`, `budget_daily_tokens`, `auto_compact_percent`, `proactive_interval_hours`); `procedures` use `procedures.parse_import` per item, and schedules use `check_timezone` and `croniter`. `provider_id`/`model_id` are validated as UUID strings; in the DB the core verifies the "owner's provider and enabled model" pair with the same query as in `POST /api/bots`.
 
 The import creates a new bot, its schedules, and procedures in one transaction: a failure at any step leaves no half-created bot. The bot name and procedure names (procedures have `unique (owner_id, name)`) get ` (2)`, ` (3)` and so on on collision; the base is shortened to fit the length limit. `executor` is `container` or `mac` only (otherwise 422 `executor: unsupported`). The bot is created by the shared `insert_bot` function, the same one `POST /api/bots` uses: the `provider_id`/`model_id` pair is checked with the same query (`runner_provider`/`binding.name`). Without `provider_id` the runner is `fake`, as with `provider: "fake"` in `POST /api/bots`: the PWA always sends the chosen model, a direct call without one creates a bot with no working model. Procedures are bound to the new bot (`bot_id` is set at insert), source `'import'`. `mac_full_control` is always `false`. The container starts the same way as after `POST /api/bots` (`BOTHUB_RUNNER_EXEC=docker`: response `"container": "starting"`, started in the background after commit); without docker the response is `"container": "skipped"`. The response is the bot row plus `recreate_url: null`, status 201.
 
 PWA: a "Export template" card on bot settings (file `<name>.botstead.json`); on the `#/bots/new` screen a "Create from file" button next to "Build" (`.botstead.json` or `.json`, up to 1 MB; after parsing it shows name, role, schedule and procedure counts, then the same model picker and "Create" button).
+
+### Ready-made template catalog (2026-10-07)
+
+The `templates/*.json` files use the bot export format. `GET /api/templates/catalog` returns validated cards to a signed-in user; `GET /api/templates/catalog/{id}` returns one validated import document. The PWA offers "From catalog" when creating a bot. The owner still chooses a provider and model. A template does not include a hook or its secret, so a PR Reviewer bot needs a separate GitHub hook schedule.
 
 ## 10. Users, Invites, Sessions (2026-10-04, migration `004_users_providers.sql`)
 
@@ -611,6 +631,8 @@ Only the client parses the output (`pwa/terminal.js`), in page memory; core and 
 - **Wait.** If there is no link 60 seconds after the socket opens (for codex, no link or no code), the client closes the session with a `close` frame and shows "The sign-in link did not appear" or "The sign-in code did not appear" with a "Start over" button. After that, the general session limits above apply (10 minutes without input, 30 minutes total); the codex device code is valid for 15 minutes.
 
 The login screen is localized in Russian and English: Russian strings live in `pwa/cli-login.js`, English ones in `pwa/i18n/en-extra.js`.
+
+<a id="contract-13"></a>
 
 ## 13. Bot browser: control states and noVNC
 
@@ -931,6 +953,8 @@ If after auto-compaction size dropped by less than 30 percent (`tokens_after` ve
 
 `tokens_after` is estimated: exact value will appear after usage of next turn.
 
+<a id="contract-16"></a>
+
 ## 16. Activity feed, bot pause, trigger pause (stage 8, migrations `021_activity_pause.sql` and `023_review_fixes.sql`)
 
 Owner: core (`core/bothub/activity.py` pure logic, routes in `main.py`), PWA (`pwa/activity.js`). All routes user-only: foreign resource 404, bot token 403, unauthenticated 401, cookie mutating requests require `X-CSRF` and `Origin`.
@@ -940,6 +964,10 @@ Owner: core (`core/bothub/activity.py` pure logic, routes in `main.py`), PWA (`p
 Parameters: `bot_id` (own bots only: foreign or nonexistent yields empty feed), `kind`, `before`, `limit`. `kind` from list `turn`, `approval`, `browser`, `takeover`, `schedule`, `procedure`, `memory`, `pause`; comma-separated values allowed (`kind=turn,approval`), omitted parameter returns all. `limit` from 1 to 100, default 50. `before` opaque cursor from previous response. Unknown `kind`, invalid `limit`, `before`, or long `bot_id`: 422 `{"error":"invalid","detail":"kind|limit|before|bot_id"}` (value not returned in response). A cursor whose time does not fit into UTC (`0001-01-01T00:00:00+14:00`, `9999-12-31T23:59:59-14:00`) is an invalid `before` (422), not a server error. Memory `expires_at` outside the UTC range is rejected the same way: `POST /api/memory` and `PATCH /api/memory/{id}` respond 400, a value without offset is read as UTC.
 
 Response `{"items":[...],"next":"<cursor>"|null}`: events across all user bots, newest first; `next` is `null` on last page. Total ordering: `(at, id)` descending, `id` compared as code points string (SQL `collate "C"`), so at equal timestamps pages do not overlap and lose nothing. Cursor encodes timestamp (UTC, microseconds) and id of last item on page.
+
+### Export `GET /api/activity/export.csv?days=1|7|30|90`
+
+Owner only (unauthenticated 401, bot token 403). `days` must be one of the listed values; without the parameter the default is 7, any other value gives 422 `{"error":"invalid","detail":"days"}`. Response: `text/csv; charset=utf-8`, UTF-8 with BOM (for Excel), attachment `activity.csv`. Header: `time,bot,kind,code,title,detail`; then up to 10000 events for the period, newest first, with the same visibility rules, sources and owner filter as the feed. `bot` is the name of the user's bot, `title` is a short English event label, `detail` is freeform text. Values are escaped per RFC 4180; a cell starting with `=`, `+`, `-`, or `@` gets a `'` prefix so Excel does not interpret it as a formula.
 
 Item: `{id, at, bot_id, thread_id, turn_id?, kind, title, detail?, risk?, status?}`.
 
@@ -997,6 +1025,8 @@ If the check itself raised an exception (database or launcher failure), the trig
 - Hook: response is always `202 {"status":"accepted"}`, both when a turn is created and on a skip (pause, executor, provider, check failure). The response has no turn id, so an external sender cannot learn bot state from code, body, or headers. The order of actions is the same: the check and queueing (or recording the skip) happen before the response in both cases, so response time differs little (creating a turn writes a few more rows than recording a skip). The owner sees the created turn in the schedule thread (`user_msg` event with the prompt). The turn id from the hook response was not used by the product (PWA, Mac agent, e2e do not read it); if it is ever needed, it may be returned only by a route authenticated as the owner. A bot that broke between the check and queueing (`require_available_bot`, 409) also yields a skip and the same 202. Invalid token remains 403 and is not considered skip. Five consecutive skips mark schedule `paused_by_unavailable` (for display), first accepted hook after executor returns writes `schedule_resumed`.
 - Decisions (reason, counter, throttling, resumption) are pure functions `activity.skip_reason`, `plan_skip`, `plan_resume`; core only executes them.
 
+<a id="contract-17"></a>
+
 ## 17. Bot self-wakeup (migration `025_wakeups.sql`)
 
 A bot asks the core to wake it up later: the MCP tool `schedule_wakeup` puts a row into `bothub.wakeups`, and at the right moment the schedule scheduler creates a turn. The owner sees what is planned in the bot settings, cancels it, and finds the firings in the feed. Pure logic is in `core/bothub/wakeups.py`, routes and execution in `main.py`, the tool in `mcp_server.py`.
@@ -1053,14 +1083,17 @@ State-changing requests by cookie need `X-CSRF` and `Origin`, as everywhere.
 
 In the bot settings (`#/bots/<id>`, phone and Mac) the card "Пробуждения бота" (`[data-wakeups]`, "Bot wakeups"): active wakeups with time, reason and a "Cancel" button (`DELETE /api/wakeups/{id}`), an empty state, a load error with a "Retry" button. Mock mode: `?mock=1`, `&wakeups=fail` breaks the load.
 
-## 18. GitHub and Slack webhook adapters (stage 10, 2026-10-06)
+<a id="contract-18"></a>
 
-For schedules of kind `hook` (`schedules.kind = 'hook'`), two specialized adapters are provided alongside generic `POST /hooks/{id}`:
+## 18. GitHub, Slack, and Mailgun webhook adapters (stage 10, 2026-10-06)
+
+For schedules of kind `hook` (`schedules.kind = 'hook'`), three specialized adapters are provided alongside generic `POST /hooks/{id}`:
 
 - `POST /hooks/{id}/github`: GitHub webhook adapter.
 - `POST /hooks/{id}/slack`: Slack Events API adapter.
+- `POST /hooks/{id}/email/{token}/json`: signed Mailgun inbound email in JSON mode.
 
-Both adapters maintain the 64 KiB request body limit (413 `invalid` if exceeded), schedule enabled and active owner validation (otherwise 404), and the uniform 202 `{"status":"accepted"}` response rule for queued and skipped events. Missing or invalid signature responds with 403 `forbidden`. The signature over the raw body is verified before any JSON parsing (invalid JSON with a bad signature gives 403, with a valid one 400 `invalid`); the 64 KiB limit is enforced from `Content-Length` and while streaming the body; the signature is compared as bytes, so non-ASCII in the header gives 403.
+GitHub and Slack retain a 64 KiB body limit and return 202 `{"status":"accepted"}` for queued and skipped events. Mailgun allows 1 MiB and returns 200 for accepted mail. All three check that the schedule is enabled and its owner active (otherwise 404). Missing or invalid signatures return 403. Signatures cover the raw body and are checked before JSON parsing.
 
 #### GitHub adapter (`POST /hooks/{id}/github`)
 
@@ -1087,6 +1120,7 @@ Both adapters maintain the 64 KiB request body limit (413 `invalid` if exceeded)
 2. **Event handling.**
    - URL verification (`url_verification`): if payload is `{"type": "url_verification", "challenge": "..."}`, core returns `{"challenge": "..."}` with HTTP status 200.
    - Event callbacks (`event_callback`): for `app_mention` and `message` (without `bot_id` and without `subtype` to ignore bot and system messages), formats a prompt with channel, user, and text (up to 2000 characters), queuing a bot turn via shared core dispatch logic.
+   - When a Slack Bot Token is configured, a completed hook turn sends its final answer to the same channel and thread with `chat.postMessage`. Delivery failure is logged without changing the turn status. The token is checked with `auth.test` and bound to its workspace.
    - Other events: respond 202 `{"status":"accepted"}` without queuing a turn.
 3. **Slack setup.**
    - In Slack App configuration (api.slack.com/apps), navigate to "Event Subscriptions" and enable the toggle.
@@ -1096,6 +1130,12 @@ Both adapters maintain the 64 KiB request body limit (413 `invalid` if exceeded)
    - Under "Subscribe to bot events", add required events: `app_mention` and `message.channels`.
    - Save changes and reinstall the app into the target Slack workspace.
 
+#### Mailgun inbound email (`POST /hooks/{id}/email/{token}/json`)
+
+The owner configures a hook schedule with an Email Signing Key and gives Mailgun the JSON route URL. The route requires `application/json`, a separate URL token, and valid `X-Mailgun-Timestamp` and `X-Mailgun-Signature` headers. It verifies HMAC-SHA256 over the timestamp and raw body before parsing JSON. Requests outside the 15-minute window or without valid authentication get 403. The body limit is 1 MiB; attachments are ignored. Signed duplicate deliveries return 200 without creating another turn. While the email key is configured, the schedule's generic, GitHub, and Slack hook routes return 403. The legacy `/hooks/{id}/email` route always returns 403.
+
+
+<a id="contract-19"></a>
 
 ## 19. Bot-to-bot delegation (stage 11, migration `027_delegation.sql`)
 
@@ -1144,6 +1184,8 @@ Bot token only. Only the bot that delegated reads it: another bot's, a missing, 
 
 In the target thread a message with `payload.delegated_from` is drawn inside `.msg-user-wrap` with a `[data-delegated-from]` label "От бота <name>" (shown as "From bot" in English) above the `.msg-user` bubble; the bot name and the task text are data (`data-i18n-skip`). The activity feed shows "Бот передал задачу другому боту" and "Поручение выполнено" (error and stop have their own captions) with a "<from> → <to>" line. Mock mode `?mock=1`: Scout handed Archive a contract-scan sorting task (thread `t-archive`).
 
+<a id="contract-20"></a>
+
 ## 20. Action checker model (stage 11, migration `029_action_checker.sql`)
 
 A second opinion on a risky bot action before the owner sees it. Optional: nothing changes unless it is set.
@@ -1167,3 +1209,51 @@ The fixed system prompt (English, `checker.SYSTEM_PROMPT`) demands one strict JS
 **Events.** `approval_req.payload.checker` = `{"verdict","reason"}` (optional), `approval_dec.payload.reason = "checker_denied"` and `checker`, a new kind `checker_denied` with payload `{"approval_id","tool","reason"}`. Activity feed (section 16): an `approval` item with code `checker_denied` instead of `approval_rejected` when the checker closed the approval.
 
 **PWA.** The approval card (thread, "Решения" screen): a line "Проверка: <verdict> · <reason>" under the title; an auto-rejection reads "Отклонено проверяющей моделью" with no buttons. Mock `?mock=1`: `ap2` carries an `ask` hint.
+
+<a id="contract-21"></a>
+
+## 21. Bot group chat (stage 11, migration `030_group_chat.sql`)
+
+The owner assembles a discussion from 2–6 of their own bots. The bots answer in turn in one shared thread, see each other's replies, and may agree or argue. Each bot's turn is an ordinary turn of that bot (its container, model, budget, approvals); the core only copies its answer into the shared thread.
+
+**Data.**
+- `threads.kind`: new values `group` (the shared thread of a group) and `group_bot` (a helper thread per group and bot pair, where the bot's turns run; `threads.group_id` points at the shared thread, auto-compact is off). Neither kind appears in `GET /api/threads`; `POST /api/threads/{id}/turns` and `compact` refuse them. `threads.bot_id` is now nullable (a `group` thread has no bot). Group settings live on the shared thread row: `group_mode`, `group_max_rounds`, `group_moderator`, `group_token_budget`.
+- `group_members(thread_id, bot_id, position, turn_thread_id)`: members and their helper threads.
+- `group_runs`: one discussion run (`id`, `thread_id`, `owner_id`, `status` `running|done|stopped|failed`, `mode`, `round`, `max_rounds`, `tokens_used`, `token_budget`, `started_at`, `finished_at`, `stop_reason`) plus the state machine fields (`owner_text`, `phase`, `pending`, `agreed`, `current_turn_id`, `current_bot_id`, `user_seq`, `waiting_notice`). At most one `running` run per thread (partial unique index).
+- `turns.group_run_id`: a bot turn inside a discussion, `client='group'`.
+- Activity feed: log codes `group_started` and `group_finished` (kind `group`, empty `bot_id`, `thread_id` is the shared thread; params `title`, `rounds`, `status`, `run_id`).
+
+**API** (owner, session cookie; a foreign group, foreign bot or archived group is 404).
+- `POST /api/groups` `{title, bot_ids, mode, max_rounds?, moderator_bot_id?, token_budget?}`. `title` 1–120 characters after trimming (422), `bot_ids` 2–6 own bots (422; duplicates 400; a foreign or unknown bot 404 `bot_not_found`), `mode` `round|debate|moderated`, `max_rounds` 1–10 (default 3, 422), `token_budget` 1000–2000000 (422). `moderator_bot_id` is for `moderated` only and must be in `bot_ids` (400); if omitted, the first member. Response 201 `{id, title, kind:"group", members:[{bot_id,name,avatar,position}], mode, max_rounds, moderator_bot_id, token_budget, created_at, last_run}`; `id` is the shared thread id.
+- `GET /api/groups`, `GET /api/groups/{id}`: same shape; `last_run` is `{id, status, round, max_rounds, stop_reason}` of the latest run or `null`. Events are read with the usual `GET /api/threads/{id}/events` and WS `/api/ws?thread_id=`.
+- `PATCH /api/groups/{id}` `{title?, mode?, max_rounds?, moderator_bot_id?, token_budget?}`: an empty body is 400; while a discussion runs only `title` may change (otherwise 409 `group_busy`).
+- `DELETE /api/groups/{id}`: a running run is stopped (`stop_reason: stopped`), the shared and helper threads are archived (the event log stays, like every thread), members are removed. Response `{ok:true}`.
+- `POST /api/groups/{id}/messages` `{text}` (1–8000 characters, not blank after trimming, otherwise 422) → 202 `{run_id}`: a `user_msg` (`actor: owner`) in the shared thread, a `group_started` feed entry, and the discussion starts. A discussion is already running: 409 `group_busy`.
+- `POST /api/groups/{id}/stop` → 200 `{run_id, status:"stopped"}`: the run closes (`stop_reason: stopped`), a queued bot turn is closed, a running one is stopped like any turn (`stop_turn`), no new turns start. No running run: 409 `group_idle`.
+
+**Discussion flow.** `group_tick` drives the state machine (one step per `running` run under a lock on the run row); the worker loop calls it after every pass. All state is in the database, so the core can restart: a turn cut off by the restart (`recover_stale_turns`) closes the run as `failed` with `stop_reason: core_restart`.
+- A bot turn is created in its helper thread as an ordinary turn (`group_run_id`, `client='group'`) and waits in the bot's shared turn queue: while the bot is busy in a direct thread, the group turn waits. Before each turn the helper thread's `cli_session_id` is cleared: the prompt is self-contained. When the turn is done, its answer (`final_text`, as in section 19) is written to the shared thread as `assistant_msg` with `payload {text, bot_id, bot_name, round, run_id, turn_id}` and `actor: bot:<id>`; an empty answer produces a `system` event `group_empty_reply`.
+- `round`: in every round all bots answer once in `position` order, `max_rounds` rounds; ends `done`, `stop_reason: max_rounds`.
+- `debate`: like `round`, but if every bot that answered in a round started a line with `[СОГЛАСЕН]`, `[AGREE]`, `[ПАС]` or `[PASS]` (case-insensitive, marker at the start of any line), the discussion ends early: `done`, `stop_reason: agreed`.
+- `moderated`: after each round the moderator takes a turn; the moderator does not speak in the ordinary rounds, the other members answer in `position` order. It ends its answer with a JSON line `{"next":"<bot_id>"|null,"done":true|false}`; the line is cut from the text. `next` names the bot that opens the next round (the rest follow in order); `done` or the last round ends the discussion: the moderator's answer always carries `payload.role="moderator"`, and the summary also `payload.summary=true`, `stop_reason: moderator_done` or `max_rounds`. No JSON: `done=false`, `next=null`. Moderator unavailable: `failed`, `no_participants`.
+- A paused bot, or one in `no_model` or `error_starting`, is skipped with a system event (`kind: system`, `payload {text, code:"group_skip", bot_id, reason}`); a round with no answers at all: `failed`, `no_participants`. A turn waiting for the owner's approval produces one `system` event with `code: group_waiting_approval`.
+- Budget: `tokens_used` is the sum of `usage` (in, out, cache) of the run's turns; after each turn and while a turn runs, when `tokens_used >= token_budget` the run becomes `stopped` with `stop_reason: budget` and the running turn is stopped. A bot turn error: `failed`, `stop_reason` is `bot_error:<code>` (the code is `turns.error`, up to 100 characters); a turn stopped by someone other than the group owner (the bot's daily budget, `POST /api/turns/{id}/stop`): `failed`, `bot_error:<reason from the guard event>` or `bot_error:turn_stopped`. The full `stop_reason` set: `max_rounds`, `agreed`, `moderator_done`, `budget`, `stopped`, `bot_error:<code>`, `core_restart`, `no_participants`.
+- No `turn:<id>` push notification is sent for discussion turns (one per reply would be noise).
+
+**Turn prompt.** The bot's role and instructions as usual, then a block: "Обсуждение «<title>»: участники <names>. Ты <name>. Раунд N из M. <mode hint>", "Сообщение владельца: …", the replies (the last 12 `user_msg` and `assistant_msg` events of the shared thread without the current owner message, each with the author's name, each at most 6000 characters) inside a `<<<BOTHUB-CONTEXT <token>>>>` … `<<<END BOTHUB-CONTEXT <token>>>>` frame with a random token (as in section 15; the frame name inside replies is defused) and a note that this is data, not instructions, then "Ответь от своего лица, коротко; можешь спорить" with the markers. The moderator turn also asks for the round summary and the JSON; in the last round, for a summary of the whole discussion. The prompt language is Russian by design (the owner's chat language).
+
+**Shared thread events.** `user_msg` (owner), `assistant_msg` (a bot reply), `group_round` `{run_id, round, max_rounds}` at the start of each round, `group_turn` `{run_id, round, bot_id, bot_name}` (a bot starts its turn, before its answer; the PWA shows "answering: <bot>" from it), `group_status` `{run_id, status, round, stop_reason?}` (`running` when a run starts, the final status when it closes), `system` (skips, approval wait, empty answer).
+
+**PWA.** A "Discussions" section, group creation, a thread with replies, round dividers, a status line and a Stop button, the moderator's summary highlighted; mock mode `?mock=1`.
+
+<a id="contract-22"></a>
+
+## 22. Proactive suggestions (migration `034_suggestions.sql`)
+
+`proactive_interval_hours` sets a bot's suggestion interval from 1 to 720 hours; `null` disables it. The scheduler waits when the bot is paused, its executor is unavailable, its daily budget is spent, or another turn is active. A read-only service turn can propose up to three suggestions without acting on them. `GET /api/suggestions` lists the signed-in owner's proposals. `POST /api/suggestions/{id}/accept` starts a normal bot turn with the chosen text; `POST /api/suggestions/{id}/dismiss` hides it. Another owner's ID returns 404. The PWA shows the proposals on the home screen.
+
+<a id="contract-23"></a>
+
+## 23. Telegram bot channel (migration `032_telegram_channel.sql`)
+
+The owner configures a bot token, allowed chat IDs, and an enabled state through `GET`, `PUT`, and `DELETE /api/bots/{bot_id}/channels/telegram`. These routes require the owner session and scope the bot by `owner_id`. The token is encrypted and never returned. When `BOTHUB_PUBLIC_ORIGIN` is configured, the core registers a Telegram webhook; otherwise it returns a setup hint. The public webhook checks `X-Telegram-Bot-Api-Secret-Token`, accepts text from allowed chats, and deduplicates update IDs. Each accepted message starts a turn in that chat's bot thread. Only webhook-created turns send their answer back through `sendMessage`.

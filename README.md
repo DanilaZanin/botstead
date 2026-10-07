@@ -1,6 +1,20 @@
 # Botstead
 
-Botstead is an open-source, self-hosted platform for running autonomous AI bots. Each bot runs on its own isolated virtual computer with a dedicated Linux container and a dedicated headed web browser.
+Botstead is an open-source, self-hosted platform for running autonomous AI bots. Each container-backed bot runs on its own isolated virtual computer with a dedicated Linux container and a dedicated headed web browser.
+
+## See it in action
+
+**Create from catalog.** Pick the research template, name the bot Researcher, and open its thread.
+
+![Create a bot from the template catalog](docs/assets/demos/create-from-catalog.gif)
+
+**Group debate.** Set a topic and watch two bots compare ideas.
+
+![Two bots debate a question](docs/assets/demos/group-debate.gif)
+
+**Chat and approval.** Send a message, then review and approve a pending action.
+
+![Chat with a bot and approve an action](docs/assets/demos/chat-and-approval.gif)
 
 You bring your own models. Botstead supports direct API keys (Anthropic, OpenAI, OpenAI-compatible endpoints, Google Gemini API) as well as subscription-based developer CLIs (Claude Code, OpenAI Codex, Antigravity CLI `agy`).
 
@@ -10,19 +24,31 @@ Access is strictly invite-only. The system supports a primary administrator and 
 
 ### Core and Orchestration
 - **Async Execution Engine**: Built with FastAPI and PostgreSQL 16. Manages asynchronous turn queues, thread events, and background workers.
-- **Spending and Budget Limits**: Enforces daily token budgets per bot and per user. Closes turns immediately when limits are exceeded.
+- **Spending and Budget Limits**: Enforces daily token budgets per bot. Closes turns immediately when limits are exceeded.
 - **Schedules and Webhooks**: Triggers bot routines via cron schedules or authenticated external HTTP webhook payloads.
-- **Bot Self-Wakeup**: Bots schedule future turns using the `schedule_wakeup` MCP tool, with scheduler execution and operator cancellation.
+- **Bot Self-Wakeup**: Bots schedule future turns using the `schedule_wakeup` MCP tool, with scheduler execution and operator cancellation ([contract 17](docs/en/contracts.md#contract-17)).
 - **GitHub and Slack Event Triggers**: Dedicated webhook adapters verify HMAC signatures and convert repository events or chat messages into bot turns.
+- **Slack Replies**: With a Bot Token, completed hook turns post their final answer to the same channel and thread ([contract 18](docs/en/contracts.md#contract-18)).
+- **Mailgun Inbound Email**: Signed incoming email can start a bot turn through a hook schedule ([contract 18](docs/en/contracts.md#contract-18)).
+- **Telegram Channel**: A bot accepts text from allowed chats and replies to webhook-created turns in the same chat ([contract 23](docs/en/contracts.md#contract-23)).
 - **Bot Templates**: Export and import complete bot configurations, schedules, and procedures as portable JSON files without secrets.
+- **Template Catalog**: Ready-made configurations from `templates/` appear when creating a bot ([contract 9](docs/en/contracts.md#contract-9)).
+- **Proactive Suggestions**: A bot can propose up to three actions for its owner to accept or dismiss ([contract 22](docs/en/contracts.md#contract-22)).
+- **Group Chat**: Two to six bots discuss a message in one thread over configured rounds ([contract 21](docs/en/contracts.md#contract-21)).
+- **Bot Delegation**: A bot can assign a task to another bot of the same owner and retrieve its result ([contract 19](docs/en/contracts.md#contract-19)).
+- **Activity CSV**: Owners can export their activity feed for 1, 7, 30, or 90 days ([contract 16](docs/en/contracts.md#contract-16)).
 - **Persistent Memory**: Stores both shared and per-bot facts with versioning and status lifecycle.
 - **Audit Outbox**: Append-only event log with reliable push notification deliveries via Web Push (VAPID).
+
+![Activity feed and estimated usage costs](docs/assets/demos/activity-and-usage.gif)
 
 ### Container Isolation and Security
 - **Least Privilege Execution**: Bot processes run under UID 1000 (`bot`) with dropped capabilities (`--cap-drop ALL`), `no-new-privileges`, read-only rootfs, and no host mounts.
 - **Dual-Layer Seccomp Filtering**: A custom Docker seccomp profile allows Chromium user namespaces while stripping dangerous syscalls. A static C binary (`bot-guard`) strips user namespace creation (`CLONE_NEWUSER`, `unshare`, `setns`) from all bot code.
 - **Strict Network Policies**: Dedicated bridge network per user (`bothub-u-<owner>`). Automatic iptables rules block bot access to host ports, PostgreSQL, private subnets (RFC 1918, CGNAT, link-local, cloud metadata), and other users' containers.
 - **Per-Bot MCP Allow-List**: Restricts external MCP tools per bot using exact names or patterns, enforced at core and runner layers.
+- **Action Checker**: An optional model reviews selected risky actions before owner approval and can reject an action ([contract 20](docs/en/contracts.md#contract-20)).
+- **Input Limits**: API field length checks reject oversized bot and browser inputs ([contract 13](docs/en/contracts.md#contract-13)).
 - **Privilege Separation Daemon**: The core application has no access to `docker.sock`. A dedicated daemon (`launcher`) manages containers and iptables over an authenticated local unix domain socket.
 - **Optional gVisor Support**: Native configuration flag to run bot containers under gVisor (`runsc`) for kernel-level sandboxing.
 
@@ -34,6 +60,8 @@ Access is strictly invite-only. The system supports a primary administrator and 
 - **SSRF and Rebinding Protection**: The gateway resolves upstream hostnames, pins validated IP addresses, blocks private networks, and requires administrator approval for private LAN targets.
 - **Interactive Subscription Login**: Ephemeral login containers with PTY streaming allow operators to authenticate subscription CLIs directly through the web interface.
 - **Self-Confirming Subscription Login**: Pre-checks authentication status when opening the login screen, confirming active sessions without launching a terminal.
+- **Model-Priced Cost Estimates**: Usage summaries estimate dollars from each model's stored input and output token prices and flag incomplete totals ([contract 2](docs/en/contracts.md#contract-2)).
+- **Quota Panel**: The PWA shows API bot token use and estimated costs for the day and month, or a CLI quota meter when available ([contract 2](docs/en/contracts.md#contract-2)).
 
 ### Headed Browser and Human Takeover
 - **Dedicated Headed Chromium**: Runs under UID 1001 (`browser`) on an internal Xvfb virtual display with a hardened Openbox window manager.
@@ -41,6 +69,8 @@ Access is strictly invite-only. The system supports a primary administrator and 
 - **Safe Human Takeover**: Operators can take over the browser at any time. When takeover begins, all bot processes are frozen, and a clean Chromium instance is launched for the operator without remote debugging ports.
 - **Clean Cookie Synchronization**: Upon return, persistent session cookies are merged into the bot profile, temporary operator files are wiped, X11 clipboards are cleared, and the bot is unfrozen.
 - **Input Masking**: Password fields, card numbers, OTP codes, and sensitive credentials are automatically masked from model context, event logs, and approvals.
+
+![Review browser steps and take control](docs/assets/demos/browser-takeover.gif)
 
 ### Recorded Procedures
 - **Structured Browser Automation**: Define, record, import, and export sequences of browser actions (navigation, clicks, input, keypresses, assertions).
@@ -55,6 +85,9 @@ Access is strictly invite-only. The system supports a primary administrator and 
 ### Clients and Optional Mac Agent
 - **Responsive Web App (PWA)**: Fast, dependency-free web interface for desktop and mobile browsers. Supports real-time thread streaming, approvals, and screen viewing.
 - **Optional Mac Agent**: A lightweight Python agent running on macOS via LaunchAgent. Connects to the core over WebSocket to provide local tools (file search via `mdfind`, preview generation, shell execution, Shortcuts, and sub-agent delegation).
+- **Multiple Macs**: An owner can register separate Mac agents with individual tokens ([contract 5](docs/en/contracts.md#contract-5)).
+
+![Botstead on a phone, from the bot list to a thread and home suggestions](docs/assets/demos/mobile.gif)
 
 ## Architecture Overview
 
@@ -113,7 +146,7 @@ Botstead assumes that AI bots may execute untrusted code and consume malicious w
 2. **System Call Restrictions**: The custom seccomp profile and the `bot-guard` binary prevent unprivileged processes from creating user namespaces or accessing sensitive kernel network subsystems.
 3. **Network Isolation**: Bot containers cannot reach the host, local databases, or private networks unless explicitly allowed by the operator.
 4. **Credential Isolation**: Upstream API keys are never exposed to bot containers. Per-turn gateway tokens restrict access to approved models within budget limits.
-5. **Approval Barriers**: Destructive actions (payments, data deletion, credential entry, external data transmissions) always require explicit human confirmation.
+5. **Approval Barriers**: Payments, data deletion, and login actions require explicit human confirmation. Other actions follow server-side risk checks and owner-defined approval rules.
 
 For details on security boundaries, guarantees, and residual risks, see:
 - [Security Model and Isolation](docs/security-model.md)
@@ -123,7 +156,7 @@ For details on security boundaries, guarantees, and residual risks, see:
 
 ## Quick Start
 
-To set up Botstead on a Linux host with Docker, follow the step-by-step instructions in the [Quick Start Guide](docs/quickstart.md).
+To set up Botstead on a Linux host with Docker, follow the step-by-step instructions in the [Quick Start Guide](docs/en/quickstart.md).
 
 Summary of installation steps:
 1. Verify host prerequisites (`br_netfilter`, iptables, and user namespaces).

@@ -21,6 +21,7 @@ const KINDS = [
   { value: 'schedule', label: 'Рутины', icon: ICONS.routines },
   { value: 'procedure', label: 'Процедуры', icon: ICONS.checklist },
   { value: 'memory', label: 'Память', icon: ICONS.memory },
+  { value: 'group', label: 'Обсуждения', icon: ICONS.users },
   { value: 'pause', label: 'Паузы', icon: ICONS.stop },
 ];
 const KIND_ICON = Object.fromEntries(KINDS.map((k) => [k.value, k.icon]));
@@ -55,6 +56,8 @@ const TITLES = {
   memory_proposed: 'Бот предложил запомнить',
   bot_paused: 'Бот поставлен на паузу',
   bot_resumed: 'Бот возобновил работу',
+  group_started: 'Началось обсуждение ботов',
+  group_finished: 'Обсуждение ботов завершено',
 };
 const SKIPPED = {
   executor_unavailable: 'Запуск пропущен: компьютер бота недоступен',
@@ -118,6 +121,10 @@ export function details(item) {
       if (params.name) out.push({ text: params.name, user: true });
       if (params.paused) out.push({ text: 'Расписание на паузе, возобновится автоматически', user: false });
       break;
+    case 'group_started':
+    case 'group_finished':
+      if (params.title) out.push({ text: params.title, user: true });
+      break;
     case 'procedure_started':
     case 'procedure_finished':
       if (params.name) out.push({ text: params.name, user: true });
@@ -140,6 +147,7 @@ export function details(item) {
 export function targetHref(item) {
   const params = (item.title && item.title.params) || {};
   if (item.kind === 'procedure' && params.run_id) return `#/procedure-runs/${encodeURIComponent(params.run_id)}`;
+  if (item.thread_id && (item.kind === 'group' || /^group_/.test((item.title && item.title.code) || ''))) return `#/groups/${encodeURIComponent(item.thread_id)}`;
   if (item.thread_id) return `#/threads/${encodeURIComponent(item.thread_id)}`;
   if (item.kind === 'schedule' && params.schedule_id) return `#/routines/${encodeURIComponent(params.schedule_id)}`;
   return '';
@@ -214,7 +222,7 @@ export async function viewActivity() {
   const app = c.app;
   const state = {
     bots: [], botsError: false, botFilter: '', kinds: new Set(), items: [], next: null,
-    feed: 'loading', feedSeq: 0, moreBusy: false, notices: [],
+    feed: 'loading', feedSeq: 0, moreBusy: false, notices: [], exportBusy: false,
   };
 
   await c.frame({
@@ -229,7 +237,18 @@ export async function viewActivity() {
         <div id="act-bots">${loadingHtml('Загружаем ботов…')}</div>
       </section>
       <section class="stack gap-3" aria-labelledby="act-feed-h">
-        <h2 class="section-label" id="act-feed-h">Журнал действий</h2>
+        <div class="act-head">
+          <h2 class="section-label" id="act-feed-h">Журнал действий</h2>
+          <div class="act-head-actions">
+            <label class="sr-only" for="act-export-days">Период CSV</label>
+            <select id="act-export-days" class="input">
+              <option value="7" selected>7 дней</option>
+              <option value="30">30 дней</option>
+              <option value="90">90 дней</option>
+            </select>
+            <button type="button" class="btn btn-secondary" data-act="export-csv">${ICONS.download}Скачать CSV</button>
+          </div>
+        </div>
         <div id="act-filters" class="stack gap-2"></div>
         <div id="act-feed" tabindex="-1">${loadingHtml('Загружаем журнал…')}</div>
         <div id="act-more"></div>
@@ -412,6 +431,30 @@ export async function viewActivity() {
     if (keep) box.querySelector(`[data-chip="${keep[0]}"][data-value="${CSS.escape(keep[1])}"]`)?.focus();
   }
 
+  async function exportCsv(button) {
+    if (state.exportBusy) return;
+    state.exportBusy = true;
+    const days = Number($('#act-export-days').value) || 7;
+    setBusy(button, true, 'Скачиваю', 'Скачать CSV');
+    try {
+      const csv = await api.exportActivityCsv(days);
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `activity-${days}-days.csv`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      setAlert($('#act-more'), 'Не удалось скачать CSV', failText(err));
+    } finally {
+      state.exportBusy = false;
+      setBusy(button, false, '', 'Скачать CSV');
+    }
+  }
+
   // Выбор фильтра меняет только aria-pressed у существующих кнопок: узлы не пересоздаются, фокус остаётся на нажатом чипе.
   function syncChips() {
     root.querySelectorAll('[data-chip]').forEach((button) => {
@@ -543,6 +586,7 @@ export async function viewActivity() {
     else if (action === 'retry-feed') loadFeed();
     else if (action === 'retry-bots') { $('#act-bots').innerHTML = loadingHtml('Загружаем ботов…'); loadBots(); }
     else if (action === 'reset-filters') { state.botFilter = ''; state.kinds.clear(); syncChips(); loadFeed(); }
+    else if (action === 'export-csv') exportCsv(act);
   });
 
   // Каркас и состояния загрузки уже на экране: данные догружаются в фоне. Если дождаться их здесь, render() держит экран

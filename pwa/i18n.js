@@ -63,6 +63,7 @@ export async function loadLang(targetLang) {
         import('./i18n/en-app.js'),
         import('./i18n/en-features.js'),
         import('./i18n/en-extra.js'),
+        import('./i18n/en-groups.js'),
       ]).then((mods) => {
         // Каталоги сливаются по порядку: более поздний дополняет, но не затирает уже известный перевод.
         const map = new Map();

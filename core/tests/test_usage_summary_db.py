@@ -309,6 +309,53 @@ async def test_usage_summary_days_edges_are_accepted():
             assert len(body['daily']) == days
 
 
+async def month_start(app):
+    """Полночь первого числа текущего месяца, как её считает база (та же date_trunc, что в маршруте)."""
+    async with app.state.pool.acquire() as con:
+        return await con.fetchval("select date_trunc('month',now())")
+
+
+async def test_usage_summary_bot_tokens_month():
+    """tokens_month накапливает расход с начала календарного месяца независимо от days (панель «Квоты»)."""
+    async with client_for() as (client, app):
+        await make_bot(client, 'month-bot')
+        thread = await make_thread(client, 'month-bot')
+        now = datetime.now(NOW)
+        this_month = await month_start(app)
+        await add_usage(app, 'month-bot', thread_id=thread, tokens_in=60, tokens_out=40, ts=now)  # сегодня
+        await add_usage(app, 'month-bot', thread_id=thread, tokens_in=120, tokens_out=80, ts=this_month)  # ровно с начала месяца
+        await add_usage(app, 'month-bot', thread_id=thread, tokens_in=480, tokens_out=320, ts=now - timedelta(days=45))  # до месяца
+
+        async with app.state.pool.acquire() as con: first_of_month = await con.fetchval("select date_trunc('day',now())=date_trunc('month',now())")
+        r1 = await client.get('/api/usage/summary', params={'days': 1}, headers=OWNER)
+        assert r1.status_code == 200, r1.text
+        bot = r1.json()['bots'][0]
+        assert bot['tokens_today'] == (300 if first_of_month else 100)
+        assert bot['tokens_month'] == 300
+        assert bot['tokens_period'] == (300 if first_of_month else 100)
+
+
+async def test_usage_summary_bot_tokens_month_own_data_only():
+    """Чужой расход не попадает в tokens_month (та же изоляция owner_id, что у остальных полей)."""
+    async with client_for() as (client, app):
+        await make_bot(client, 'mine')
+        thread_mine = await make_thread(client, 'mine')
+        await add_usage(app, 'mine', thread_id=thread_mine, tokens_in=100, tokens_out=50)
+
+        _, member_headers = await add_member(client, app, 'monthly@example.com')
+        await make_bot(client, 'foreign', headers=member_headers)
+        thread_foreign = await make_thread(client, 'foreign', headers=member_headers)
+        await add_usage(app, 'foreign', thread_id=thread_foreign, tokens_in=3000, tokens_out=1000)
+
+        mine = (await client.get('/api/usage/summary', headers=OWNER)).json()
+        assert [b['bot_id'] for b in mine['bots']] == ['mine']
+        assert mine['bots'][0]['tokens_month'] == 150
+
+        other = (await client.get('/api/usage/summary', headers=member_headers)).json()
+        assert [b['bot_id'] for b in other['bots']] == ['foreign']
+        assert other['bots'][0]['tokens_month'] == 4000
+
+
 async def test_usage_summary_period_boundary_is_calendar_day_start():
     """Период начинается с полуночи суток (days-1) дней назад: запись ровно days суток назад в него не входит."""
     async with client_for() as (client, app):

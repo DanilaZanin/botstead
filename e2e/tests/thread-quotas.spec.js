@@ -57,13 +57,46 @@ test.describe('«Квоты» в боковой панели треда', () => 
     await expect(aside.getByText('Codex')).toHaveCount(0);
   });
 
-  test('сводки расхода нет: бот на API-ключе получает сноску со ссылкой на экран «Расход»', async ({ page }, testInfo) => {
+  test('бот на API-ключе: видит расход за сегодня и месяц в долларах и токенах', async ({ page }, testInfo) => {
+    test.skip(isMobile(testInfo), 'панель «Квоты» только в десктопной раскладке');
+    const aside = await openThread(page, 't-coder');
+
+    // Карточка с расходами перед метром дневного бюджета.
+    const spendCard = aside.locator('.card.card-pad').filter({ hasText: 'Сегодня' });
+    await expect(spendCard).toBeVisible();
+
+    // Строка «Сегодня» содержит долларовую сумму и количество токенов.
+    const todayRow = spendCard.locator('.row').filter({ hasText: 'Сегодня' });
+    const todayText = await todayRow.innerText();
+    expect(todayText).toMatch(/≈\s*\$\d+,\d{2}/);
+    expect(todayText).toContain('токенов');
+
+    // Строка «За месяц» содержит долларовую сумму.
+    const monthRow = spendCard.locator('.row').filter({ hasText: 'За месяц' });
+    const monthText = await monthRow.innerText();
+    expect(monthText).toMatch(/≈\s*\$\d+,\d{2}/);
+    expect(monthText).toContain('токенов');
+  });
+
+  test('бот на подписке Claude: не видит долларовых сумм в панели «Квоты»', async ({ page }, testInfo) => {
+    test.skip(isMobile(testInfo), 'панель «Квоты» только в десктопной раскладке');
+    const aside = await openThread(page, 't-mac');
+
+    await expect(aside.locator('.meter-label')).toHaveText('Claude');
+    // В режиме подписки нет карточки с расходами «Сегодня»/«За месяц».
+    await expect(aside.getByText('Сегодня')).toHaveCount(0);
+    await expect(aside.getByText('За месяц')).toHaveCount(0);
+  });
+
+  test('сводки расхода нет: бот на API-ключе видит дневной бюджет без квот подписок', async ({ page }, testInfo) => {
     test.skip(isMobile(testInfo), 'панель «Квоты» только в десктопной раскладке');
     const aside = await openThread(page, 't-coder', '&usage=none');
 
-    await expect(aside.locator('.meter-row')).toHaveCount(0);
-    await expect(aside.getByRole('link', { name: 'Расход по токенам: экран «Расход»' }))
-      .toHaveAttribute('href', '#/usage');
+    await expect(aside.locator('.meter-row')).toHaveCount(1);
+    await expect(aside.locator('.meter-row .meter-label')).toHaveText('Кодер');
+    await expect(aside.locator('[role="meter"]')).toHaveAttribute('aria-valuenow', '0');
+    await expect(aside.locator('.meter-row .meter-label').filter({ hasText: /^(Claude|Codex|Gemini)$/ })).toHaveCount(0);
+    await expect(aside.getByText(/Сегодня: 0 из 200[\u202F0-9]+ токенов дневного бюджета/)).toBeVisible();
   });
 
   test('телефон: на экране треда панели «Квоты» нет', async ({ page }, testInfo) => {

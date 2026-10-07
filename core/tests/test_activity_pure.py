@@ -31,7 +31,7 @@ def test_unknown_kind_is_rejected_without_echo(value):
 
 def test_every_documented_kind_is_accepted():
     assert activity.parse_kinds(','.join(activity.KINDS)) == list(activity.KINDS)
-    assert activity.KINDS == ('turn', 'approval', 'browser', 'takeover', 'schedule', 'procedure', 'memory', 'pause')
+    assert activity.KINDS == ('turn', 'approval', 'browser', 'takeover', 'schedule', 'procedure', 'memory', 'pause', 'group')
 
 
 def test_limit_defaults_to_50_and_is_bounded_1_to_100():

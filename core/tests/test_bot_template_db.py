@@ -84,7 +84,7 @@ async def test_export_omits_ids_owner_provider_and_procedures_use_export_documen
         doc = response.json()
         assert doc['format'] == 'botstead-bot' and doc['version'] == 1
         assert set(doc) == {'format', 'version', 'name', 'role', 'instructions', 'avatar', 'executor',
-                            'auto_allow', 'mcp_allow', 'budget_daily_tokens', 'auto_compact_percent',
+                            'auto_allow', 'mcp_allow', 'budget_daily_tokens', 'auto_compact_percent', 'proactive_interval_hours',
                             'schedules', 'procedures'}
         for leaked in (bot['id'], 'fixture@example.com', 'provider_id', 'model_id', 'fake', SENTINEL):
             assert leaked not in response.text

@@ -77,16 +77,23 @@ async def test_legacy_credentials_stay_bound_to_setup_user_after_demotion(monkey
     monkeypatch.setenv("BOTHUB_PROXY_SECRET", "proxy-secret")
     monkeypatch.setenv("BOTHUB_OWNER_USER", "configured-owner")
     async for client, app in _client():
+        async with app.state.pool.acquire() as con:
+            await con.execute("insert into bothub.mac_status(state,info) values('offline','{}'::jsonb)")
         first = await _setup(client)
         second = await _invite(client, "b@example.com", "admin")
         first_bot, first_thread = await _bot_thread(client)
+        monkeypatch.setenv("MAC_AGENT_TOKEN", "legacy-env-only-token")
+        client.cookies.clear()
+        probe = await client.post("/api/files", data={"thread_id": str(uuid.uuid4())},
+            files={"file": ("probe.txt", b"x")}, headers={"Authorization": "Bearer legacy-env-only-token"})
+        assert probe.status_code == 404, probe.text
         login_b = await client.post("/api/auth/login", json={"email": "b@example.com", "password": PASSWORD})
         assert login_b.status_code == 200
         await _bot_thread(client, _write_session(login_b), "Second")
         demote = await client.patch(f"/api/users/{first['id']}", json={"role": "member"}, headers=_write_session(login_b))
         assert demote.status_code == 200, demote.text
         client.cookies.clear()  # иначе запрос пройдёт по cookie сессии B из банки клиента, а не по legacy-токену
-        for headers in (OWNER, {"Authorization": "Bearer test-mac"},
+        for headers in (OWNER, {"Authorization": "Bearer legacy-env-only-token"},
                         {"X-Bothub-Proxy": "proxy-secret", "Remote-User": "configured-owner"}):
             assert (await client.get("/api/bots", headers=headers)).status_code == 401
         async with app.state.pool.acquire() as con:
@@ -116,29 +123,44 @@ async def test_disabled_setup_admin_does_not_fall_through_to_another_admin():
         assert (await client.get("/api/bots", headers=OWNER)).status_code == 401
 
 
-async def test_malformed_setup_user_id_denies_legacy_access():
+async def test_malformed_setup_user_id_denies_legacy_access(monkeypatch):
     async for client, app in _client():
+        async with app.state.pool.acquire() as con:
+            await con.execute("insert into bothub.mac_status(state,info) values('offline','{}'::jsonb)")
         await _setup(client)
+        monkeypatch.setenv("MAC_AGENT_TOKEN", "legacy-env-only-token")
+        probe = await client.post("/api/files", data={"thread_id": str(uuid.uuid4())},
+            files={"file": ("probe.txt", b"x")}, headers={"Authorization": "Bearer legacy-env-only-token"})
+        assert probe.status_code == 404, probe.text
         async with app.state.pool.acquire() as con:
             await con.execute("update bothub.settings set value='\"not-a-uuid\"'::jsonb where key='setup_user_id'")
-        for token in ("test-owner", "test-mac"):
+        for token in ("test-owner", "legacy-env-only-token"):
             response = await client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
             assert response.status_code == 401, response.text
 
 
-def test_legacy_websockets_reject_demoted_setup_user():
+def test_legacy_websockets_reject_demoted_setup_user(monkeypatch):
     app = create_app()
     with TestClient(app, base_url="https://testserver") as client:
+        async def seed_old_status():
+            async with app.state.pool.acquire() as con:
+                await con.execute("insert into bothub.mac_status(state,info) values('offline','{}'::jsonb)")
+        client.portal.call(seed_old_status)
         first = client.post("/api/setup", json={"email": "a@example.com", "password": PASSWORD}, headers=OWNER).json()
+        client.post("/api/mac/token", headers=OWNER)
+        monkeypatch.setenv("MAC_AGENT_TOKEN", "legacy-env-only-token")
+        with client.websocket_connect("/agent/mac", headers={"Authorization": "Bearer legacy-env-only-token"}) as ws:
+            ws.send_json({"type": "hello"})
         bot = client.post("/api/bots", json={"name": "Scout", "provider": "fake", "model": "fake"}, headers=OWNER).json()
         thread = client.post("/api/threads", json={"bot_id": bot["id"]}, headers=OWNER).json()
         invite = client.post("/api/invites", json={"role": "admin"}, headers=OWNER).json()
         client.post("/api/invites/accept", json={"token": invite["token"], "email": "b@example.com", "password": PASSWORD})
         login = client.post("/api/auth/login", json={"email": "b@example.com", "password": PASSWORD})
         assert client.patch(f"/api/users/{first['id']}", json={"role": "member"}, headers=_write_session(login)).status_code == 200
-        for path in (f"/api/ws?thread_id={thread['id']}&token=test-owner", "/agent/mac?token=test-mac"):
+        for path, headers in ((f"/api/ws?thread_id={thread['id']}&token=test-owner", {"Origin": "https://testserver"}),
+                              ("/agent/mac", {"Origin": "https://testserver", "Authorization": "Bearer legacy-env-only-token"})):
             with pytest.raises(WebSocketDisconnect) as denied:
-                with client.websocket_connect(path, headers={"Origin": "https://testserver"}) as ws:
+                with client.websocket_connect(path, headers=headers) as ws:
                     ws.receive_json()
             assert denied.value.code == 4401
 
@@ -230,14 +252,15 @@ async def test_setup_mode_persists_legacy_auth_and_reports_it(setup_with_owner, 
 
 async def test_password_change_revokes_mac_token():
     async for client, app in _client():
-        await _setup(client)
+        setup = await _setup(client)
         login = await client.post("/api/auth/login", json={"email": "a@example.com", "password": PASSWORD})
         mac = await client.post("/api/mac/token", headers=_write_session(login))
         assert mac.status_code == 201, mac.text
         changed = await client.post("/api/auth/password", json={"old_password": PASSWORD, "new_password": "new-long-password"}, headers=_write_session(login))
         assert changed.status_code == 200, changed.text
         async with app.state.pool.acquire() as con:
-            assert await con.fetchval("select revoked_at from bothub.mac_tokens where token_hash=$1", auth.token_hash(mac.json()["token"])) is not None
+            stored_hash = await con.fetchval("select token_hash from bothub.macs where owner_id=$1", uuid.UUID(setup["id"]))
+            assert stored_hash != auth.token_hash(mac.json()["token"])
         assert (await client.get("/api/mac/status", headers={"Authorization": "Bearer " + mac.json()["token"]})).status_code == 401
 
 
@@ -276,7 +299,7 @@ def test_websocket_header_and_subprotocol_tokens_and_query_warning(caplog):
         assert any("deprecated" in record.getMessage().lower() for record in caplog.records)
 
 
-def test_mac_websocket_header_token_and_query_warning(caplog):
+def test_mac_websocket_header_token_and_query_rejection():
     app = create_app()
     with TestClient(app, base_url="https://testserver") as client:
         client.post("/api/setup", json={"email": "a@example.com", "password": PASSWORD}, headers=OWNER)
@@ -284,16 +307,14 @@ def test_mac_websocket_header_token_and_query_warning(caplog):
         token = client.post("/api/mac/token", headers=_write_session(login)).json()["token"]
         with client.websocket_connect("/agent/mac", headers={"Authorization": "Bearer " + token}) as ws:
             ws.send_json({"type": "hello"})
-        caplog.clear()
-        with caplog.at_level(logging.WARNING, logger="bothub"):
+        with pytest.raises(WebSocketDisconnect) as denied:
             with client.websocket_connect("/agent/mac?token=wrong", headers={"Authorization": "Bearer " + token}) as ws:
                 ws.send_json({"type": "hello"})
-        assert not any("deprecated" in record.getMessage().lower() for record in caplog.records)
-        caplog.clear()
-        with caplog.at_level(logging.WARNING, logger="bothub"):
+        assert denied.value.code == 4401
+        with pytest.raises(WebSocketDisconnect) as denied:
             with client.websocket_connect("/agent/mac?token=" + token) as ws:
                 ws.send_json({"type": "hello"})
-        assert any("deprecated" in record.getMessage().lower() for record in caplog.records)
+        assert denied.value.code == 4401
 
 
 async def test_hook_accepts_header_token_and_warns_on_query(caplog):

@@ -54,7 +54,12 @@ def primary_available(url: str, timeout: float = HEALTH_TIMEOUT) -> bool:
 async def _try_connect(url: str, config: Config, timeout: float = CONNECT_TIMEOUT):
     try:
         return await asyncio.wait_for(
-            websockets.connect(config.ws_url_for(url), ping_interval=20, ping_timeout=20),
+            websockets.connect(
+                config.ws_url_for(url),
+                additional_headers={"Authorization": f"Bearer {config.mac_agent_token}"},
+                ping_interval=20,
+                ping_timeout=20,
+            ),
             timeout=timeout,
         )
     except Exception as e:

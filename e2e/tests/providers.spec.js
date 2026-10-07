@@ -1,4 +1,6 @@
-import { expect, test } from '@playwright/test';
+import { expect as baseExpect, test } from '@playwright/test';
+
+const expect = baseExpect;
 
 // Провайдеры, модели, выбор модели бота, состояния ботов и терминал входа по подписке.
 // Мок-режим: ?mock=1 (по умолчанию вошёл админ), &role=member, &auth=none, &providers=none|fail|slow,
@@ -13,6 +15,25 @@ import { expect, test } from '@playwright/test';
 // localhost и 127.* всегда запрещены. Подробные сценарии проверки ключа и запросов админу: provider-verify.spec.js.
 
 const isMobile = (testInfo) => testInfo.project.name === 'mobile-chromium';
+
+// Терминал входа держится на цепочках таймеров мока (запуск 250 мс, вывод, выход, проверка входа, отчёт о ботах): под нагрузкой
+// обычные 5 с на проверку мало, поэтому в блоках терминала входа срок ожидания 15 с. Строгость проверок не меняется.
+const termExpect = baseExpect.configure({ timeout: 15000 });
+// &login_delay=0 снимает 2,5-секундную паузу мока перед выводом (она для глаз). Тесты, которым нужен видимый шаг 1,
+// берут &login_hold=1 и сами решают, когда терминал начнёт печатать: release(page) отпускает вывод текущего сокета.
+async function release(page) {
+  await baseExpect.poll(() => page.evaluate(() => {
+    const m = window.__loginMock;
+    if (!m || !m.socket || !m.socket.releaseOutput) return false;
+    m.release();
+    return true;
+  }), { message: 'сокет терминала входа открыт и ждёт release', timeout: 15000 }).toBe(true);
+}
+// Срок ожидания ссылки в моке ручной (&login_timeout=manual): ждём, пока экран его взведёт, и «истекаем» вызовом.
+async function expireLinkTimer(page) {
+  await baseExpect.poll(() => page.evaluate(() => typeof (window.__loginMock && window.__loginMock.linkTimeout)), { message: 'таймер ссылки взведён', timeout: 15000 }).toBe('function');
+  await page.evaluate(() => window.__loginMock.linkTimeout());
+}
 const SECRET = 'sk-ant-TESTSECRET-4f2a91';
 
 const list = (page) => page.locator('.provider-row');
@@ -565,9 +586,10 @@ test.describe('удаление', () => {
 });
 
 test.describe('терминал входа по подписке', () => {
+  const expect = termExpect;
   // По умолчанию claude: сценарий «код с сайта» (поле «Код из браузера»). Сценарий codex «код с экрана» задаётся явно.
   // &cli_auth=out: подписки не залогинены, иначе проверка входа при открытии экрана сразу показывает «Вход уже выполнен».
-  const login = (id = 'p-claude', query = '') => `/?mock=1&cli_auth=out${query}#/settings/providers/${id}/login`;
+  const login = (id = 'p-claude', query = '') => `/?mock=1&cli_auth=out&login_delay=0${query}#/settings/providers/${id}/login`;
   const term = (page) => page.locator('#cl-term');
   const status = (page) => page.locator('#cl-status');
   const closeLink = (page, testInfo) => (isMobile(testInfo)
@@ -591,7 +613,9 @@ test.describe('терминал входа по подписке', () => {
     await expect(status(page)).toContainText('Шаг 2 из 3. Откройте ссылку и войдите');
     await expect(term(page)).toHaveAttribute('role', 'log');
     await expect(term(page)).toHaveAttribute('aria-label', 'Терминал входа');
-    await expect(term(page)).toContainText('oauth/authorize') // первая строка вывода на телефоне уходит из видимого буфера, ссылка остаётся;
+    // Видимый буфер короткий (на телефоне несколько строк): начало вывода из него уходит, а целую ссылку проверяет href ниже.
+    // Поэтому по терминалу сверяем последнюю строку вывода, она всегда на виду.
+    await expect(term(page)).toContainText('Paste code here if prompted');
     // ссылка из вывода дублируется обычной кнопкой: новая вкладка, без передачи opener
     const open = page.getByRole('link', { name: 'Открыть страницу входа' });
     await expect(open).toHaveAttribute('href', CLAUDE_LINK);
@@ -606,7 +630,7 @@ test.describe('терминал входа по подписке', () => {
     await expect(term(page)).toContainText('Login successful.');
     await expect(status(page)).toContainText('Вход выполнен');
     await expect(status(page)).toBeFocused(); // фокус на итоге, а не на скрытом поле кода
-    await expect(page.locator('#cl-result')).toContainText('Перезапущены бот: Мак.', { timeout: 8000 });
+    await expect(page.locator('#cl-result')).toContainText('Перезапущены бот: Мак.');
     await expect(page.getByLabel('Код из браузера')).toHaveValue('');
     await expect(page.getByRole('link', { name: 'Выбрать модели' })).toHaveAttribute('href', '#/settings/providers/p-claude');
     // вывод терминала нигде не сохранён: ни в памяти браузера, ни в консоли
@@ -632,7 +656,7 @@ test.describe('терминал входа по подписке', () => {
     await expect(page.getByRole('heading', { name: 'Вход: Codex' })).toBeVisible();
     await expect(status(page)).toContainText('Шаг 2 из 3. Откройте ссылку и войдите');
     await expect(status(page)).toContainText('Шаг 3: ввести на ней код с экрана.');
-    await expect(term(page)).toContainText('Enter this one-time code');
+    await expect(term(page)).toContainText('Never share this code'); // последние строки вывода всегда на виду, начало на телефоне прокручено
     const open = page.getByRole('link', { name: 'Открыть страницу входа' });
     await expect(open).toHaveAttribute('href', 'https://auth.openai.com/codex/device');
     await expect(open).toHaveAttribute('rel', /noopener/);
@@ -681,16 +705,18 @@ test.describe('терминал входа по подписке', () => {
     await expect(page.locator('#cl-link-card')).toBeHidden();
     await expect(page.locator('#cl-actions .btn-primary')).toHaveCount(1);
     await page.getByRole('button', { name: 'Получить новый код' }).click();
-    await expect(status(page)).toContainText('Шаг 2 из 3. Откройте ссылку и войдите', { timeout: 8000 });
+    await expect(status(page)).toContainText('Шаг 2 из 3. Откройте ссылку и войдите');
     await expect(page.locator('#cl-device-code')).toHaveText('ABCD-12345');
   });
 
-  // Срок ожидания ссылки 60 с, в моке сокращён до 4 с (&login_timeout=4000): вывод мока начинается через 2,5 с.
+  // Срок ожидания ссылки 60 с. В моке он ручной (&login_timeout=manual): тест сам «истекает» его через expireLinkTimer,
+  // поэтому шаг 1 до этого момента держится сколько нужно, а не 4 с на часах.
   test('терминал молчит: за отведённое время ссылки нет, сессия закрывается, предлагается начать заново', async ({ page }) => {
-    await page.goto(login('p-claude', '&login=silent&login_timeout=4000'));
+    await page.goto(login('p-claude', '&login=silent&login_timeout=manual'));
     await expect(status(page)).toContainText('Шаг 1 из 3. Жду ссылку для входа');
+    await expireLinkTimer(page);
     const alert = page.getByRole('alert').filter({ hasText: 'Ссылка для входа не появилась' });
-    await expect(alert).toBeVisible({ timeout: 10000 });
+    await expect(alert).toBeVisible();
     await expect(alert).toContainText('Сессия на сервере закрыта');
     await expect(page.locator('#cl-link-card')).toBeHidden();
     await expect(page.locator('#cl-form')).toBeHidden();
@@ -704,29 +730,32 @@ test.describe('терминал входа по подписке', () => {
   });
 
   test('codex: ссылка есть, а кода нет: тот же срок, сообщение про код', async ({ page }) => {
-    await page.goto(login('p-codex', '&login=nocode&login_timeout=4000'));
+    await page.goto(login('p-codex', '&login=nocode&login_timeout=manual'));
     await expect(page.getByRole('link', { name: 'Открыть страницу входа' })).toHaveAttribute('href', 'https://auth.openai.com/codex/device');
     await expect(status(page)).toContainText('Шаг 1 из 3. Жду ссылку и код для входа'); // без кода шаг 2 не наступает
     await expect(page.locator('#cl-device-card')).toBeHidden();
-    await expect(page.getByRole('alert').filter({ hasText: 'Код для входа не появился' })).toBeVisible({ timeout: 10000 });
+    await expireLinkTimer(page);
+    await expect(page.getByRole('alert').filter({ hasText: 'Код для входа не появился' })).toBeVisible();
     await expect(page.locator('#cl-link-card')).toBeHidden();
   });
 
   test('ссылка на чужой хост не становится кнопкой: ни в OSC 8, ни простым текстом', async ({ page }) => {
-    await page.goto(login('p-claude', '&login=foreign&login_timeout=4000'));
+    await page.goto(login('p-claude', '&login=foreign&login_timeout=manual'));
     await expect(term(page)).toContainText('evil.example');
     await expect(page.locator('#cl-link-card')).toBeHidden();
     await expect(page.getByRole('link', { name: 'Открыть страницу входа' })).toBeHidden();
     await expect(status(page)).toContainText('Шаг 1 из 3. Жду ссылку для входа');
-    await expect(page.getByRole('alert').filter({ hasText: 'Ссылка для входа не появилась' })).toBeVisible({ timeout: 10000 });
+    await expireLinkTimer(page);
+    await expect(page.getByRole('alert').filter({ hasText: 'Ссылка для входа не появилась' })).toBeVisible();
   });
 
   test('codex: чужая ссылка и настоящий код, шага 2 нет', async ({ page }) => {
-    await page.goto(login('p-codex', '&login=foreign&login_timeout=4000'));
+    await page.goto(login('p-codex', '&login=foreign&login_timeout=manual'));
     await expect(term(page)).toContainText('evil.example');
     await expect(page.locator('#cl-link-card')).toBeHidden();
     await expect(status(page)).toContainText('Шаг 1 из 3');
-    await expect(page.getByRole('alert').filter({ hasText: 'Ссылка для входа не появилась' })).toBeVisible({ timeout: 10000 });
+    await expireLinkTimer(page);
+    await expect(page.getByRole('alert').filter({ hasText: 'Ссылка для входа не появилась' })).toBeVisible();
   });
 
   test('чужая ссылка после настоящей пропускается: кнопка остаётся на хосте провайдера', async ({ page }) => {
@@ -780,7 +809,7 @@ test.describe('терминал входа по подписке', () => {
     await expect(status(page)).toContainText('Шаг 2 из 3');
     await sendCode(page, 'ok');
     await expect(status(page)).toContainText('Вход выполнен');
-    await expect(page.locator('#cl-result')).toContainText('Перезапущены бот: Мак.', { timeout: 8000 });
+    await expect(page.locator('#cl-result')).toContainText('Перезапущены бот: Мак.');
     await expect(page.locator('#cl-result')).toContainText('Перезапустятся после текущей задачи: SRE.');
   });
 
@@ -802,7 +831,7 @@ test.describe('терминал входа по подписке', () => {
   });
 
   test('сессия уже открыта в другом месте (4409)', async ({ page }) => {
-    await page.goto(`/?mock=1&login=busy#/settings/providers/p-codex/login`);
+    await page.goto(`/?mock=1&login=busy&login_delay=0#/settings/providers/p-codex/login`);
     await expect(page.getByRole('alert').filter({ hasText: 'Вход уже открыт в другом месте' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Повторить' })).toBeVisible();
     await expect(page.getByRole('alert')).not.toContainText('потеряна');
@@ -811,14 +840,17 @@ test.describe('терминал входа по подписке', () => {
   });
 
   test('нет прав (4404) и сессия отозвана (4401)', async ({ page }) => {
-    await page.goto(`/?mock=1&login=forbidden#/settings/providers/p-codex/login`);
+    await page.goto(`/?mock=1&login=forbidden&login_delay=0#/settings/providers/p-codex/login`);
     await expect(page.getByRole('alert').filter({ hasText: 'Нет доступа к этому входу' })).toBeVisible();
-    await page.goto(`/?mock=1&login=revoked#/settings/providers/p-codex/login`);
+    await page.goto(`/?mock=1&login=revoked&login_delay=0#/settings/providers/p-codex/login`);
     await expect(page.getByRole('alert').filter({ hasText: 'Сессия botstead закрыта' })).toBeVisible();
   });
 
   test('связь потеряна: сессия на сервере закрыта, можно подключиться снова', async ({ page }) => {
-    await page.goto(`/?mock=1&login=lost#/settings/providers/p-codex/login`);
+    // hold: обрыв наступает по release(), а после «Подключиться снова» новый сокет молчит, и шаг 1 виден без гонки с выводом
+    await page.goto(`/?mock=1&login=lost&login_delay=0&login_hold=1#/settings/providers/p-codex/login`);
+    await expect(status(page)).toContainText('Шаг 1 из 3');
+    await release(page);
     const alert = page.getByRole('alert').filter({ hasText: 'Связь с терминалом потеряна' });
     await expect(alert).toBeVisible();
     await expect(alert).toContainText('вход нужно начать заново');
@@ -828,17 +860,19 @@ test.describe('терминал входа по подписке', () => {
   });
 
   test('тайм-аут сессии (1001) и сбой запуска (1011)', async ({ page }) => {
-    await page.goto(`/?mock=1&login=timeout#/settings/providers/p-codex/login`);
+    await page.goto(`/?mock=1&login=timeout&login_delay=0#/settings/providers/p-codex/login`);
     await expect(page.getByRole('alert').filter({ hasText: 'Сессия закрыта по времени' })).toContainText('30 минут');
-    await page.goto(`/?mock=1&login=start#/settings/providers/p-codex/login`);
+    await page.goto(`/?mock=1&login=start&login_delay=0#/settings/providers/p-codex/login`);
     await expect(page.getByRole('alert').filter({ hasText: 'Терминал не запустился' })).toBeVisible();
   });
 
   test('подключение: сначала шаг 1, терминал подписан и не ловит фокус вкладкой', async ({ page }) => {
-    await page.goto(login());
+    await page.goto(login('p-claude', '&login_hold=1')); // вывода нет, пока тест не отпустит: шаг 1 не гонка с моком
     await expect(status(page)).toContainText('Шаг 1 из 3');
     await expect(term(page)).toHaveAttribute('aria-label', 'Терминал входа');
     await expect(page.getByLabel('Ввод в терминал входа')).toHaveCount(1);
+    await release(page);
+    await expect(status(page)).toContainText('Шаг 2 из 3');
   });
 
   test('resize уходит кадром по контракту: cols 20–300, rows 5–100', async ({ page }, testInfo) => {
@@ -1109,8 +1143,9 @@ test.describe('словарь: без жаргона в экранах пров�
 });
 
 test.describe('терминал входа: ошибки, обрыв, клавиатура, телефон', () => {
+  const expect = termExpect;
   // claude: сценарий «код с сайта», поле «Код из браузера» есть (сценарий codex проверяется выше)
-  const login = (query = '') => `/?mock=1&cli_auth=out${query}#/settings/providers/p-claude/login`;
+  const login = (query = '') => `/?mock=1&cli_auth=out&login_delay=0${query}#/settings/providers/p-claude/login`;
   const status = (page) => page.locator('#cl-status');
   const term = (page) => page.locator('#cl-term');
 
@@ -1124,7 +1159,7 @@ test.describe('терминал входа: ошибки, обрыв, клави
     ];
     for (const [mode, title, primary] of cases) {
       await page.goto(login(`&login=${mode}`));
-      await expect(page.getByRole('alert').filter({ hasText: title })).toBeVisible({ timeout: 8000 });
+      await expect(page.getByRole('alert').filter({ hasText: title })).toBeVisible();
       await expect(page.locator('#cl-link-card'), mode).toBeHidden();
       await expect(page.locator('#cl-form'), mode).toBeHidden();
       await expect(page.getByRole('link', { name: 'Открыть страницу входа' }), mode).toBeHidden();
@@ -1135,7 +1170,8 @@ test.describe('терминал входа: ошибки, обрыв, клави
   });
 
   test('возврат из браузера: «Связь прервалась, пока приложение было свёрнуто», код в поле сохраняется', async ({ page }) => {
-    await page.goto(login());
+    await page.goto(login('&login_hold=1'));
+    await release(page);
     await expect(status(page)).toContainText('Шаг 2 из 3');
     await page.getByLabel('Код из браузера').fill('abc-123');
     // страница уснула: сокет мёртв без события close, при возврате приходит visibilitychange
@@ -1146,8 +1182,9 @@ test.describe('терминал входа: ошибки, обрыв, клави
     await expect(page.locator('#cl-form')).toBeHidden();
     await expect(page.locator('#cl-link-card')).toBeHidden();
     await page.getByRole('button', { name: 'Подключиться снова' }).click();
-    await expect(status(page)).toContainText('Шаг 1 из 3');
-    await expect(status(page)).toContainText('Шаг 2 из 3. Откройте ссылку и войдите', { timeout: 8000 });
+    await expect(status(page)).toContainText('Шаг 1 из 3'); // новый сокет молчит до release
+    await release(page);
+    await expect(status(page)).toContainText('Шаг 2 из 3. Откройте ссылку и войдите');
     await expect(page.getByLabel('Код из браузера')).toHaveValue('abc-123');
   });
 

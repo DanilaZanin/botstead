@@ -26,7 +26,7 @@ export function openThreadStream(threadId, sinceSeq, onEvent) {
 
   function connectMock() {
     tailRead();
-    mockTimer = setInterval(tailRead, 1500);
+    mockTimer = setInterval(tailRead, String(threadId).startsWith('g-') ? 300 : 1500);
   }
 
   function connectReal() {

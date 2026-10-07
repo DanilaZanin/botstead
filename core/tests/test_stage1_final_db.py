@@ -262,7 +262,8 @@ def test_mac_approval_works_once_with_websocket_agent():
     tool = "mcp__bothub__mac_type_text"
     args = {"text": "hello"}
     with TestClient(app) as client:
-        assert client.post("/api/bots", json={"id": "scout", "name": "Scout", "provider": "fake", "model": "fake", "mac_full_control": True}, headers=OWNER).status_code in (200, 201)
+        mac = client.post("/api/macs", json={"name": "Test Mac"}, headers=OWNER).json()
+        assert client.post("/api/bots", json={"id": "scout", "name": "Scout", "provider": "fake", "model": "fake", "mac_id": mac["id"], "mac_full_control": True}, headers=OWNER).status_code in (200, 201)
         thread = client.post("/api/threads", json={"bot_id": "scout"}, headers=OWNER).json()
         turn = client.post(f"/api/threads/{thread['id']}/turns", json={"prompt": "type", "client": "api"}, headers=OWNER).json()
         for _ in range(50):
@@ -279,7 +280,7 @@ def test_mac_approval_works_once_with_websocket_agent():
             return client.post("/api/mac/call", json={"thread_id": thread["id"], "turn_id": turn["id"], "tool": "type_text", "args": args, "timeout": 3}, headers=bot_token("scout"))
 
         approve()
-        with client.websocket_connect("/agent/mac?token=test-mac") as ws:
+        with client.websocket_connect("/agent/mac", headers={"Authorization": "Bearer " + mac["token"]}) as ws:
             ws.send_json({"type": "hello", "host": "t", "os": "macOS", "agent_version": "1", "permissions": {}})
             for _ in range(20):
                 if client.get("/api/mac/status", headers=OWNER).json()["state"] == "online":

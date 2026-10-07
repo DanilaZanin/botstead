@@ -5,6 +5,7 @@ import { AVATAR_KINDS } from './avatars.js';
 const TOKEN_KEY = 'bothub_owner_token';
 const params = new URLSearchParams(location.search);
 export const MOCK = params.get('mock') === '1';
+const MOCK_DEMO = MOCK && params.get('demo') === '1';
 
 export function getToken() {
   return localStorage.getItem(TOKEN_KEY) || '';
@@ -78,6 +79,11 @@ const minutesAhead = (m) => new Date(now + m * 60000).toISOString();
 
 const MOCK_DEFAULT_MODEL = { claude: 'Sonnet 5', codex: 'GPT-6 Sol', gemini: 'Gemini 3.1 Pro' };
 
+const mockMacs = [
+  { id: 'm-main', name: 'MacBook Pro', state: 'online', last_seen_at: minutesAgo(1) },
+];
+let mockMacSeq = 0;
+
 const mockBots = [
   {
     id: 'scout', name: 'Скаут', role: 'Ищет вакансии и заявки', avatar: 'scout',
@@ -90,7 +96,7 @@ const mockBots = [
   },
   {
     id: 'mac', name: 'Мак', role: 'Ищет файлы, открывает приложения, делает скриншоты', avatar: 'mac',
-    provider: 'claude', model: 'Sonnet 5', executor: 'mac', mac_full_control: true,
+    provider: 'claude', model: 'Sonnet 5', executor: 'mac', mac_id: 'm-main', mac_full_control: true,
     status: 'idle', location: 'Mac',
     summary: 'Нашёл 3 файла: договор аренды 2025',
     status_label: 'Готово', status_kind: 'success',
@@ -117,7 +123,7 @@ const mockBots = [
   },
   {
     id: 'archive', name: 'Архив', role: 'Раскладывает файлы и сканы по папкам', avatar: 'archive',
-    provider: 'gemini', model: 'Gemini 3.8 Flash', executor: 'mac', mac_full_control: true,
+    provider: 'gemini', model: 'Gemini 3.8 Flash', executor: 'mac', mac_id: 'm-main', mac_full_control: true,
     status: 'idle', location: 'Mac',
     summary: 'Ждёт файлы в ~/BotHub/inbox',
     status_label: 'Ждёт события', status_kind: 'neutral',
@@ -144,7 +150,8 @@ const mockBots = [
 const MOCK_PROVIDERS_MODE = params.get('providers') || '';
 const MOCK_LOGIN_MODE = params.get('login') || '';
 // Экран входа ждёт ссылку (и код устройства у codex) 60 с. В моке срок можно сократить: &login_timeout=<мс>.
-export const MOCK_LOGIN_TIMEOUT_MS = MOCK ? Number(params.get('login_timeout')) || 0 : 0;
+// &login_timeout=manual: таймер не взводится, тест сам вызывает window.__loginMock.linkTimeout() (-1 для кода экрана).
+export const MOCK_LOGIN_TIMEOUT_MS = MOCK ? (params.get('login_timeout') === 'manual' ? -1 : Number(params.get('login_timeout')) || 0) : 0;
 const MOCK_RUNNER = { anthropic_api: 'claude', openai_api: 'codex', openai_compatible: 'codex', google_api: 'gemini' };
 const MOCK_CLI_RUNNER = { claude: 'claude', codex: 'codex', agy: 'gemini' };
 const MOCK_VENDOR_MODELS = {
@@ -455,8 +462,8 @@ const mockSchedules = [
   { id: 's1', bot_id: 'sre', name: 'Проверка серверов', kind: 'cron', cron: '0 3 * * *', prompt: 'Проверить здоровье серверов', enabled: true, next_run_at: minutesAgo(-17 * 60), last_run: { ok: true, at: 'сегодня 03:00', seconds: 120 },
     catch_up: false, skipped_count: 6, last_skipped_at: minutesAgo(30), last_skip_reason: 'executor_unavailable', paused_by_unavailable: true },
   { id: 's2', bot_id: 'archive', name: 'Разбор почты', kind: 'cron', cron: '30 8 * * 1-5', prompt: 'Разобрать почту', enabled: false, paused_since: '20 сен', catch_up: false, skipped_count: 0, paused_by_unavailable: false },
-  { id: 's3', bot_id: 'sre', name: 'Алерт → диагностика', kind: 'hook', has_slack_signing_secret: false, prompt: 'Диагностировать алерт', enabled: true, last_run: { at: 'сегодня 09:12', detail: '502 на webapp' },
-    catch_up: false, skipped_count: 2, last_skipped_at: minutesAgo(45), last_skip_reason: 'bot_paused', paused_by_unavailable: false },
+  { id: 's3', bot_id: 'sre', name: 'Алерт → диагностика', kind: 'hook', hook_token: 'mock-hook-token', email_route_token: 'mock-email-token', has_slack_signing_secret: false, has_email_signing_key: false, prompt: 'Диагностировать алерт', enabled: true, last_run: { at: 'сегодня 09:12', detail: '502 на webapp' },
+    has_slack_bot_token: false, catch_up: false, skipped_count: 2, last_skipped_at: minutesAgo(45), last_skip_reason: 'bot_paused', paused_by_unavailable: false },
   { id: 's4', bot_id: 'archive', name: 'Папка ~/BotHub/inbox', kind: 'mac_folder', prompt: 'Разложить новые файлы', enabled: true, last_run: { at: 'вчера', detail: '4 скана разложены по папкам' } },
 ];
 
@@ -575,6 +582,8 @@ function buildMockUsage(days = 7, empty = false) {
     return {
       days,
       total_tokens: 0,
+      cost_usd_total: null,
+      cost_partial: false,
       bots: [],
       models: [],
       daily: [],
@@ -582,9 +591,110 @@ function buildMockUsage(days = 7, empty = false) {
       guard: null,
     };
   }
+  if (MOCK_DEMO) {
+    const round4 = (value) => Math.round(value * 10000) / 10000;
+    const demoDailyTokens = [32000, 36000, 40000, 34000, 38000, 36000, 42000];
+    const daily = Array.from({ length: days }, (_, i) => {
+      const date = new Date(now - (days - i - 1) * 86400000).toISOString().slice(0, 10);
+      return { date, total_tokens: demoDailyTokens[i % demoDailyTokens.length] };
+    });
+    const total_tokens = daily.reduce((sum, d) => sum + d.total_tokens, 0);
+    const scale = total_tokens / 258000;
+    const models = [
+      { provider: 'claude', model: 'claude-sonnet-5', tokens_in: 91500, tokens_out: 18500, tokens_cache_read: 18000, tokens_cache_write: 4000, turns: 38, cost_usd: 0.618 },
+      { provider: 'codex', model: 'gpt-5.4', tokens_in: 64000, tokens_out: 12000, tokens_cache_read: 0, tokens_cache_write: 0, turns: 24, cost_usd: 0.20 },
+      { provider: 'gemini', model: 'gemini-3.1-pro-preview', tokens_in: 42000, tokens_out: 8000, tokens_cache_read: 0, tokens_cache_write: 0, turns: 17, cost_usd: 0.0925 },
+    ].map((m) => {
+      const row = { ...m, tokens_in: Math.round(m.tokens_in * scale), tokens_out: Math.round(m.tokens_out * scale), tokens_cache_read: Math.round(m.tokens_cache_read * scale), tokens_cache_write: Math.round(m.tokens_cache_write * scale), turns: Math.round(m.turns * scale), cost_usd: round4(m.cost_usd * scale) };
+      row.total_tokens = row.tokens_in + row.tokens_out + row.tokens_cache_read + row.tokens_cache_write;
+      return row;
+    });
+    models[2].tokens_in += total_tokens - models.reduce((sum, m) => sum + m.total_tokens, 0);
+    models[2].total_tokens = models[2].tokens_in + models[2].tokens_out;
+    const sonnetCost = models[0].cost_usd;
+    const macCost = round4(0.20 * scale);
+    const digestCost = round4(0.20 * scale);
+    const bots = [
+      ['scout', 50000, models[2].cost_usd], ['mac', 45000, macCost], ['sre', 55000, digestCost],
+      ['coder', 76000, models[1].cost_usd], ['archive', 32000, round4(sonnetCost - macCost - digestCost)],
+    ].map(([bot_id, baseTokens, cost_usd]) => {
+      const tokens_period = Math.round(baseTokens * scale);
+      return { bot_id, tokens_today: Math.round((daily.at(-1)?.total_tokens || 0) * baseTokens / 258000), tokens_period, tokens_month: tokens_period, budget: 200000, last_activity: minutesAgo(15), cost_usd, cost_usd_today: round4(cost_usd / Math.max(days, 1)), cost_usd_month: cost_usd };
+    });
+    bots[4].tokens_period += total_tokens - bots.reduce((sum, b) => sum + b.tokens_period, 0);
+    bots[4].tokens_month = bots[4].tokens_period;
+    return { days, total_tokens, cost_usd_total: round4(models.reduce((sum, m) => sum + m.cost_usd, 0)), cost_partial: false, bots, models, daily,
+      providers: [{ provider: 'claude', pct_week: 24, reset_at: 'Monday 03:00' }, { provider: 'codex', pct_week: 11, reset_at: 'Monday 03:00' }, { provider: 'gemini', pct_week: 8, reset_at: 'Monday 03:00' }], guard: null };
+  }
   const daily = buildMockDaily(days);
   const total_tokens = daily.reduce((sum, d) => sum + d.total_tokens, 0);
   const mult = Math.max(1, Math.min(days, 30));
+  // Цены моделей в USD за 1M токенов (mock OpenRouter): ключ — название модели, in/out — цена за 1M токенов.
+  // Отсутствие модели в карте = подписка, цена неизвестна → null (на экране ничего не рисуется).
+  const PRICE_PER_MTOK = {
+    'claude-sonnet-5':        { in: 3.00,  out: 15.00 },
+    'gpt-5.4':                { in: 1.25,  out: 10.00 },
+    'gemini-3.1-pro-preview': { in: 1.25,  out: 5.00  },
+  };
+  const round4 = (n) => Math.round(n * 10000) / 10000;
+  const costForModel = (m) => {
+    const p = PRICE_PER_MTOK[m.model];
+    if (!p) return null;
+    const inTok = (m.tokens_in || 0) + (m.tokens_cache_read || 0) + (m.tokens_cache_write || 0);
+    const outTok = m.tokens_out || 0;
+    return round4((inTok * p.in + outTok * p.out) / 1e6);
+  };
+  const allModels = [
+    { provider: 'claude', model: 'claude-sonnet-5', tokens_in: 180000 * mult, tokens_out: 45000 * mult, tokens_cache_read: 120000 * mult, tokens_cache_write: 30000 * mult, total_tokens: 375000 * mult, turns: 42 * mult },
+    { provider: 'claude', model: 'claude-opus-5-5', tokens_in: 90000 * mult, tokens_out: 25000 * mult, tokens_cache_read: 60000 * mult, tokens_cache_write: 15000 * mult, total_tokens: 190000 * mult, turns: 18 * mult },
+    { provider: 'codex', model: MOCK_USAGE_MODE === 'xss' ? MOCK_USAGE_XSS : 'gpt-5.4', tokens_in: 110000 * mult, tokens_out: 30000 * mult, tokens_cache_read: 0, tokens_cache_write: 0, total_tokens: 140000 * mult, turns: 25 * mult },
+    { provider: 'gemini', model: 'gemini-3.1-pro-preview', tokens_in: 30000 * mult, tokens_out: 10000 * mult, tokens_cache_read: 0, tokens_cache_write: 0, total_tokens: 40000 * mult, turns: 12 * mult },
+  ];
+  // usage=full-cost: убираем подписочную модель, чтобы cost_partial=false (используется в e2e для проверки «полной» оценки).
+  const models = (MOCK_USAGE_MODE === 'full-cost' ? allModels.filter((m) => m.model !== 'claude-opus-5-5') : allModels)
+    .map((m) => ({ ...m, cost_usd: costForModel(m) }));
+  // Распределение моделей по ботам в моке: какие модели использует каждый бот.
+  // usage=full-cost: SRE переключаем на claude-sonnet-5, чтобы у всех ботов была известная цена.
+  const BOT_MODEL_COSTS = {
+    scout:   ['gemini-3.1-pro-preview'],
+    mac:     ['claude-sonnet-5'],
+    sre:     MOCK_USAGE_MODE === 'full-cost' ? ['claude-sonnet-5'] : ['claude-opus-5-5'],
+    coder:   ['gpt-5.4'],
+    archive: ['claude-sonnet-5', 'gemini-3.1-pro-preview'],
+  };
+  const costForBot = (bot_id) => {
+    const names = BOT_MODEL_COSTS[bot_id] || [];
+    if (!names.length) return null;
+    let sum = 0;
+    let anyKnown = false;
+    for (const name of names) {
+      const m = models.find((x) => x.model === name);
+      if (m && m.cost_usd !== null) { sum += m.cost_usd; anyKnown = true; }
+    }
+    return anyKnown ? round4(sum) : null;
+  };
+  // Стоимость «за сегодня» и «за месяц» для панели «Квоты»: в моке сегодня = доля периода, месяц = весь период.
+  const splitCost = (cost) => (cost === null ? { cost_usd_today: null, cost_usd_month: null }
+    : { cost_usd_today: round4(cost / mult), cost_usd_month: cost });
+  const bots = [
+    { bot_id: 'scout', tokens_today: 128000, tokens_period: 128000 * mult, tokens_month: 128000 * mult, budget: 200000, last_activity: minutesAgo(12) },
+    { bot_id: 'mac', tokens_today: 24000, tokens_period: 24000 * mult, tokens_month: 24000 * mult, budget: 200000, last_activity: minutesAgo(45) },
+    { bot_id: 'sre', tokens_today: 70000, tokens_period: 70000 * mult, tokens_month: 70000 * mult, budget: 200000, last_activity: minutesAgo(120) },
+    { bot_id: 'coder', tokens_today: 200000, tokens_period: 200000 * mult, tokens_month: 200000 * mult, budget: 200000, last_activity: minutesAgo(30) },
+    { bot_id: 'archive', tokens_today: 10000, tokens_period: 10000 * mult, tokens_month: 10000 * mult, budget: 200000, last_activity: minutesAgo(360) },
+  ].map((b) => ({ ...b, cost_usd: costForBot(b.bot_id), ...splitCost(costForBot(b.bot_id)) }));
+  // Общая стоимость = сумма известных цен по моделям. cost_partial=true, если хоть у одной модели или бота цена неизвестна.
+  let costSum = 0;
+  let costKnown = false;
+  let costPartial = false;
+  for (const m of models) {
+    if (m.cost_usd === null) { costPartial = true; continue; }
+    costSum += m.cost_usd;
+    costKnown = true;
+  }
+  for (const b of bots) {
+    if (b.cost_usd === null) costPartial = true;
+  }
   return {
     days,
     total_tokens,
@@ -593,19 +703,10 @@ function buildMockUsage(days = 7, empty = false) {
       { provider: 'codex', pct_week: 18, reset_at: 'пн 03:00' },
       { provider: 'gemini', pct_week: 7, reset_at: 'пн 03:00' },
     ],
-    bots: [
-      { bot_id: 'scout', tokens_today: 128000, tokens_period: 128000 * mult, budget: 200000, last_activity: minutesAgo(12) },
-      { bot_id: 'mac', tokens_today: 24000, tokens_period: 24000 * mult, budget: 200000, last_activity: minutesAgo(45) },
-      { bot_id: 'sre', tokens_today: 70000, tokens_period: 70000 * mult, budget: 200000, last_activity: minutesAgo(120) },
-      { bot_id: 'coder', tokens_today: 200000, tokens_period: 200000 * mult, budget: 200000, last_activity: minutesAgo(30) },
-      { bot_id: 'archive', tokens_today: 10000, tokens_period: 10000 * mult, budget: 200000, last_activity: minutesAgo(360) },
-    ],
-    models: [
-      { provider: 'claude', model: 'claude-sonnet-5', tokens_in: 180000 * mult, tokens_out: 45000 * mult, tokens_cache_read: 120000 * mult, tokens_cache_write: 30000 * mult, total_tokens: 375000 * mult, turns: 42 * mult },
-      { provider: 'claude', model: 'claude-opus-5-5', tokens_in: 90000 * mult, tokens_out: 25000 * mult, tokens_cache_read: 60000 * mult, tokens_cache_write: 15000 * mult, total_tokens: 190000 * mult, turns: 18 * mult },
-      { provider: 'codex', model: MOCK_USAGE_MODE === 'xss' ? MOCK_USAGE_XSS : 'gpt-5.4', tokens_in: 110000 * mult, tokens_out: 30000 * mult, tokens_cache_read: 0, tokens_cache_write: 0, total_tokens: 140000 * mult, turns: 25 * mult },
-      { provider: 'gemini', model: 'gemini-3.1-pro-preview', tokens_in: 30000 * mult, tokens_out: 10000 * mult, tokens_cache_read: 0, tokens_cache_write: 0, total_tokens: 40000 * mult, turns: 12 * mult },
-    ],
+    bots,
+    models,
+    cost_usd_total: costKnown ? round4(costSum) : null,
+    cost_partial: costPartial,
     daily,
     guard: { bot_id: 'coder', thread_id: 't-coder', reason: 'repeat_error', detail: 'npm ERR! ERESOLVE unable to resolve dependency tree' },
   };
@@ -631,6 +732,11 @@ const DRAFT_MODELS = ['claude-haiku-4-5-20251001', 'claude-sonnet-5', 'claude-op
 const DRAFT_MODEL_LABEL = { [DRAFT_MODELS[0]]: 'Haiku', [DRAFT_MODELS[1]]: 'Sonnet', [DRAFT_MODELS[2]]: 'Opus' };
 
 function buildMockDraft(description) {
+  if (MOCK_DEMO) {
+    return { id: `draft-${hashStr(description).toString(36)}`, name: 'Researcher', role: description.slice(0, 70), avatar: 'scout', provider: 'claude', model: 'claude-sonnet-5', executor: 'container', mac_full_control: false,
+      auto_allow: [{ tool: 'WebSearch' }], instructions: `Research the request and cite the sources: ${description}`, schedule: null,
+      rationale: 'Sonnet handles research and short summaries. This bot runs in a container and waits for a message.' };
+  }
   const lower = description.toLowerCase();
   const h = hashStr(description);
   const id = `draft-${h.toString(36).slice(0, 8)}`;
@@ -1106,7 +1212,10 @@ async function mockRecreateBot(id) {
 // nocode (codex печатает ссылку без кода); foreign (ссылка на чужой хост вместо настоящей); mixed (чужая ссылка
 // после настоящей). Печатные символы ввода эхом возвращаются как «*», управляющие клавиши как <Esc>, <Tab>, <Up>, <C-c>.
 // window.__loginMock.frames хранит только управляющие JSON-кадры клиента (resize, close), вводимые данные не пишутся.
-const MOCK_LOGIN_FIRST_OUTPUT_MS = 2500;
+// &login_delay=<мс>: задержка первого вывода (по умолчанию 2500, для глаз; тесты ставят 0).
+// &login_hold=1: вывод и сбой соединения начинаются только после window.__loginMock.release() (шаг 1 держится сколько нужно).
+const MOCK_LOGIN_FIRST_OUTPUT_MS = MOCK && params.get('login_delay') !== null ? Number(params.get('login_delay')) || 0 : 2500;
+const MOCK_LOGIN_HOLD = MOCK && params.get('login_hold') === '1';
 const MOCK_KEY_NAMES = { '\x1b': '<Esc>', '\t': '<Tab>', '\x1b[A': '<Up>', '\x1b[B': '<Down>', '\x1b[C': '<Right>', '\x1b[D': '<Left>' };
 export const MOCK_CLAUDE_URL = 'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference&code_challenge=mock-challenge&code_challenge_method=S256&state=mock-state';
 export const MOCK_AGY_URL = 'https://accounts.google.com/o/oauth2/auth?client_id=mock-agy.apps.googleusercontent.com&response_type=code&scope=openid+email&redirect_uri=urn%3Aietf%3Awg%3Aoauth%3A2.0%3Aoob&state=mock-state';
@@ -1149,6 +1258,7 @@ class MockLoginSocket {
     this.line = '';
     window.__loginMock = window.__loginMock || { frames: [] };
     window.__loginMock.socket = this;
+    window.__loginMock.release = () => { const s = window.__loginMock.socket; if (s && s.releaseOutput) s.releaseOutput(); };
     // Для e2e: соединение молча обрывается, как у свёрнутой страницы на телефоне (onclose не вызывается).
     window.__loginMock.silentDrop = () => { if (window.__loginMock.socket) window.__loginMock.socket.readyState = 3; };
     // codex: человек ввёл код устройства на сайте (approve) или код просрочился (expire); CLI завершается сам.
@@ -1176,9 +1286,14 @@ class MockLoginSocket {
     const cli = this.provider.cli;
     const lines = mockLoginChunks(cli, mode);
     // Первый вывод приходит не сразу: шаг 1 («жду ссылку») должен продержаться дольше шага опроса в тестах и быть виден глазами.
-    lines.forEach((text, i) => setTimeout(() => this.out(text), MOCK_LOGIN_FIRST_OUTPUT_MS + 60 * (i + 1)));
-    if (mode === 'lost') setTimeout(() => this.finish(1006), MOCK_LOGIN_FIRST_OUTPUT_MS + 700);
-    if (mode === 'timeout') setTimeout(() => this.finish(1001), MOCK_LOGIN_FIRST_OUTPUT_MS + 700);
+    // С &login_hold=1 вывод ждёт release(): тест сам решает, когда кончается шаг 1.
+    this.releaseOutput = () => {
+      this.releaseOutput = null;
+      lines.forEach((text, i) => setTimeout(() => this.out(text), MOCK_LOGIN_FIRST_OUTPUT_MS + 60 * (i + 1)));
+      if (mode === 'lost') setTimeout(() => this.finish(1006), MOCK_LOGIN_FIRST_OUTPUT_MS + 700);
+      if (mode === 'timeout') setTimeout(() => this.finish(1001), MOCK_LOGIN_FIRST_OUTPUT_MS + 700);
+    };
+    if (!MOCK_LOGIN_HOLD) this.releaseOutput();
   }
   send(data) {
     if (this.readyState !== 1) return;
@@ -1507,6 +1622,37 @@ export async function listBots() {
   return request('/bots');
 }
 
+export async function listMacs() {
+  if (MOCK) { await delay(); return clone(mockMacs); }
+  return request('/macs');
+}
+
+export async function createMac(body) {
+  if (MOCK) {
+    await delay();
+    mockRequireSession();
+    const name = typeof body?.name === 'string' ? body.name.trim() : '';
+    if (!name || name.length > 80) mockFail(422, 'invalid', 'name: expected 1..80 characters');
+    const mac = { id: `m-${++mockMacSeq}`, name, state: 'offline', last_seen_at: null };
+    mockMacs.push(mac);
+    return { ...clone(mac), token: `mock_mac_token_${Math.random().toString(36).slice(2)}` };
+  }
+  return request('/macs', { method: 'POST', body });
+}
+
+export async function deleteMac(id) {
+  if (MOCK) {
+    await delay();
+    mockRequireSession();
+    const index = mockMacs.findIndex((mac) => mac.id === id);
+    if (index < 0) mockFail(404, 'not_found', 'Mac not found');
+    mockMacs.splice(index, 1);
+    for (const bot of mockBots) if (bot.mac_id === id) bot.mac_id = null;
+    return { ok: true };
+  }
+  return request(`/macs/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
 // ---------------------------------------------------------------------------
 // Вход, инвайты, пользователи, сессии (docs/contracts.md §10)
 // ---------------------------------------------------------------------------
@@ -1709,7 +1855,10 @@ async function mockBotTemplateValidate(doc) {
   if (doc.budget_daily_tokens !== undefined && (!Number.isInteger(doc.budget_daily_tokens) || doc.budget_daily_tokens < 0 || doc.budget_daily_tokens > 1e12)) {
     mockFail(422, 'invalid', 'budget_daily_tokens: out_of_range: expected 0..1000000000000');
   }
-  const known = new Set(['format', 'version', 'name', 'role', 'instructions', 'avatar', 'executor', 'auto_allow', 'mcp_allow', 'budget_daily_tokens', 'auto_compact_percent', 'schedules', 'procedures']);
+  const known = new Set(['format', 'version', 'name', 'role', 'instructions', 'avatar', 'executor', 'auto_allow', 'mcp_allow', 'budget_daily_tokens', 'auto_compact_percent', 'proactive_interval_hours', 'schedules', 'procedures']);
+  if (doc.proactive_interval_hours != null && (!Number.isInteger(doc.proactive_interval_hours) || doc.proactive_interval_hours < 1 || doc.proactive_interval_hours > 720)) {
+    mockFail(422, 'invalid', 'proactive_interval_hours: out_of_range: expected 1..720 or null');
+  }
   for (const key of Object.keys(doc)) if (!known.has(key)) mockFail(422, 'invalid', 'body: unknown_field: unknown field');
   if (doc.auto_compact_percent !== null && doc.auto_compact_percent !== undefined) {
     if (!Number.isInteger(doc.auto_compact_percent) || doc.auto_compact_percent < 50 || doc.auto_compact_percent > 95) {
@@ -1746,6 +1895,7 @@ export async function exportBotTemplate(id) {
       auto_allow: clone(b.auto_allow || []), mcp_allow: [...(b.mcp_allow || [])],
       budget_daily_tokens: b.budget_daily_tokens || 200000,
       auto_compact_percent: b.auto_compact_percent === undefined ? 80 : b.auto_compact_percent,
+      proactive_interval_hours: b.proactive_interval_hours ?? null,
       schedules: (b.schedules || []).map((s) => ({ cron: s.cron, timezone: s.timezone, prompt: s.prompt, enabled: s.enabled !== false, ...(s.name ? { name: s.name } : {}) })),
       procedures: (b.procedures || []).map((p) => ({ format: PROC_FORMAT, name: p.name, description: p.description || '', params: clone(p.params || []), steps: clone(p.steps || []) })),
     };
@@ -1805,6 +1955,75 @@ export async function importBotTemplate(body) {
   }
   return request('/bots/import', { method: 'POST', body });
 }
+
+// Каталог готовых шаблонов: в проде GET /api/templates/catalog, в моке — шесть демонстрационных карточек.
+export async function listCatalog() {
+  if (MOCK) {
+    await delay(30);
+    (window.__catalogCalls = window.__catalogCalls || []).push({ name: 'list' });
+    return clone(MOCK_CATALOG);
+  }
+  return request('/templates/catalog');
+}
+// Один шаблон каталога по id (имя файла без .json). В моке отдаёт полный документ в формате импорта.
+export async function getCatalogTemplate(id) {
+  if (MOCK) {
+    await delay(20);
+    (window.__catalogCalls = window.__catalogCalls || []).push({ name: 'get', id });
+    const entry = MOCK_CATALOG.find((x) => x.id === id);
+    if (!entry) mockFail(404, 'not_found', 'catalog template not found');
+    return clone(entry._doc);
+  }
+  return request(`/templates/catalog/${encodeURIComponent(id)}`);
+}
+
+// В мок-режиме полный упрощённый документ лежит в _doc: e2e не возит файлы шаблонов вместе со сценой.
+const MOCK_CATALOG = [
+  {
+    id: 'researcher', name: 'Scout', role: 'Web research with the browser', description: 'Web research with the browser', avatar: 'scout',
+    _doc: { format: 'botstead-bot', version: 1, name: 'Scout', role: 'Web research with the browser', avatar: 'scout', executor: 'container',
+      auto_allow: [{ tool: 'WebSearch' }, { tool: 'Read' }, { tool: 'Glob' }, { tool: 'Grep' }], mcp_allow: [],
+      budget_daily_tokens: 200000, auto_compact_percent: 80,
+      instructions: 'You are a web research scout.', schedules: [], procedures: [] },
+  },
+  {
+    id: 'mail_triage', name: 'Mail Triage', role: 'Sort the inbox and draft replies', description: 'Sort the inbox and draft replies', avatar: 'archive',
+    _doc: { format: 'botstead-bot', version: 1, name: 'Mail Triage', role: 'Sort the inbox and draft replies', avatar: 'archive', executor: 'mac',
+      auto_allow: [{ tool: 'mcp__bothub__mac_find_files' }, { tool: 'mcp__bothub__mac_read_file' }],
+      mcp_allow: ['mcp__gmail__read_mail', 'mcp__gmail__search_mail'],
+      budget_daily_tokens: 200000, auto_compact_percent: 80,
+      instructions: 'You triage the owner\'s mailbox.', schedules: [{ cron: '0 9,14 * * 1-5', timezone: 'Europe/Moscow', prompt: 'triage', enabled: true, name: 'Mail digest' }], procedures: [] },
+  },
+  {
+    id: 'pr_reviewer', name: 'PR Reviewer', role: 'Review pull requests from a GitHub webhook', description: 'Review pull requests from a GitHub webhook', avatar: 'coder',
+    _doc: { format: 'botstead-bot', version: 1, name: 'PR Reviewer', role: 'Review pull requests from a GitHub webhook', avatar: 'coder', executor: 'container',
+      auto_allow: [{ tool: 'Read' }, { tool: 'Grep' }], mcp_allow: ['mcp__github__*'],
+      budget_daily_tokens: 400000, auto_compact_percent: 80,
+      instructions: 'You review pull requests opened against the owner\'s repositories.', schedules: [], procedures: [] },
+  },
+  {
+    id: 'daily_digest', name: 'Daily Digest', role: 'Morning summary on schedule', description: 'Morning summary on schedule', avatar: 'owl',
+    _doc: { format: 'botstead-bot', version: 1, name: 'Daily Digest', role: 'Morning summary on schedule', avatar: 'owl', executor: 'container',
+      auto_allow: [{ tool: 'WebFetch' }, { tool: 'WebSearch' }], mcp_allow: ['mcp__github__*', 'mcp__calendar__read_event'],
+      budget_daily_tokens: 200000, auto_compact_percent: 80,
+      instructions: 'Every morning at the scheduled time you produce a one-screen digest for the owner.',
+      schedules: [{ cron: '0 8 * * 1-5', timezone: 'Europe/Moscow', prompt: 'digest', enabled: true, name: 'Morning digest' }], procedures: [] },
+  },
+  {
+    id: 'house_helper', name: 'House Helper', role: 'Answer questions about the home, no writes', description: 'Answer questions about the home, no writes', avatar: 'cat',
+    _doc: { format: 'botstead-bot', version: 1, name: 'House Helper', role: 'Answer questions about the home, no writes', avatar: 'cat', executor: 'mac',
+      auto_allow: [{ tool: 'mcp__bothub__mac_find_files' }, { tool: 'mcp__bothub__mac_read_file' }],
+      mcp_allow: ['mcp__home_assistant__get_state', 'mcp__home_assistant__list_entities'],
+      budget_daily_tokens: 200000, auto_compact_percent: 80,
+      instructions: 'You are the owner\'s home assistant.', schedules: [], procedures: [] },
+  },
+  {
+    id: 'translator', name: 'Translator', role: 'Translate text between languages', description: 'Translate text between languages', avatar: 'fox',
+    _doc: { format: 'botstead-bot', version: 1, name: 'Translator', role: 'Translate text between languages', avatar: 'fox', executor: 'container',
+      auto_allow: [], mcp_allow: [], budget_daily_tokens: 200000, auto_compact_percent: 80,
+      instructions: 'You translate text between languages.', schedules: [], procedures: [] },
+  },
+];
 
 // ---------------------------------------------------------------------------
 // Реестр провайдеров и моделей, вход по подписке (docs/contracts.md §11–12)
@@ -2082,7 +2301,14 @@ export async function createTurn(threadId, prompt, client = 'iphone') {
     mockPushEvent(threadId, 'status', { turn_id: turnId, status: 'running' }, turnId);
     setTimeout(() => {
       const seq2 = (arr[arr.length - 1]?.seq || 0) + 1;
-      arr.push({ seq: seq2, kind: 'assistant_msg', actor: 'bot:mock', payload: { text: `ok: ${prompt}`, final: true } });
+      const demoReply = {
+        't-scout': 'The main finding is that a small team can start with one shared database. I found three useful references and noted the tradeoffs in the research summary.',
+        't-mac': 'I sorted the inbox into action items, updates, and FYI. Two messages need replies; both drafts are ready for review.',
+        't-sre': 'The weekly report is ready. It covers completed work, open decisions, and next steps; sending it still needs your approval.',
+        't-coder': 'The review found one missing error case in the request handler. I left a suggested patch and a focused test.',
+        't-archive': 'Today\'s digest is ready: one meeting, two project updates, and no urgent home alerts.',
+      };
+      arr.push({ seq: seq2, kind: 'assistant_msg', actor: 'bot:mock', payload: { text: MOCK_DEMO ? (demoReply[threadId] || 'I reviewed the request and prepared a short summary with the next steps.') : `ok: ${prompt}`, final: true } });
     }, 500);
     setTimeout(() => mockFinishTurn(threadId, turnId), 700);
     return { id: turnId, status: 'queued', turn_type: 'chat' };
@@ -2102,6 +2328,199 @@ export async function stopTurn(turnId) {
     return { id: turnId, status: 'stopped' };
   }
   return request(`/turns/${turnId}/stop`, { method: 'POST' });
+}
+
+// ---------------------------------------------------------------------------
+// Обсуждения ботов: групповой чат (контракт этапа 11). Тред группы читается обычным getEvents и потоком openThreadStream.
+// ---------------------------------------------------------------------------
+const MOCK_GROUPS_MODE = params.get('groups') || '';
+const MOCK_GROUP_DELAY = Math.max(50, Number(params.get('groupdelay')) || 700);
+const mockGroups = [];
+const mockGroupRuns = {};
+let mockGroupSeq = 0;
+let mockGroupTurnSeq = 0;
+const mockGroupMember = (botId, position) => {
+  const bot = mockBots.find((b) => b.id === botId);
+  return { bot_id: botId, name: bot.name, avatar: bot.avatar, position };
+};
+function mockGroupView(g) {
+  const run = mockGroupRuns[g.id];
+  return {
+    id: g.id, title: g.title, kind: 'group', members: clone(g.members), mode: g.mode, max_rounds: g.max_rounds,
+    moderator_bot_id: g.moderator_bot_id || null, token_budget: g.token_budget || null,
+    last_run: run ? { id: run.id, status: run.status, round: run.round, max_rounds: g.max_rounds, stop_reason: run.stop_reason || null } : null,
+  };
+}
+function mockGroupFind(id) {
+  const g = mockGroups.find((x) => x.id === id);
+  if (!g) mockFail(404, 'not_found');
+  return g;
+}
+function mockCreateGroupRecord(body) {
+  const g = {
+    id: `g-${++mockGroupSeq}`, title: body.title, mode: body.mode, max_rounds: body.max_rounds,
+    moderator_bot_id: body.mode === 'moderated' ? body.moderator_bot_id : null, token_budget: body.token_budget || null,
+    members: body.bot_ids.map((id, i) => mockGroupMember(id, i)),
+  };
+  mockGroups.push(g);
+  mockEvents[g.id] = [];
+  return g;
+}
+if (MOCK && MOCK_GROUPS_MODE !== 'none') {
+  mockCreateGroupRecord({ title: MOCK_DEMO ? 'Database choice for a single server' : 'Выбор стека для бота', bot_ids: ['scout', 'coder'], mode: 'debate', max_rounds: 3 });
+}
+function mockGroupValidate(body, partial) {
+  const bad = (field) => mockFail(422, 'invalid', field);
+  if (!partial || body.title !== undefined) {
+    const title = typeof body.title === 'string' ? body.title.trim() : '';
+    if (title.length < 1 || title.length > 120) bad('title');
+  }
+  if (!partial) {
+    const ids = body.bot_ids;
+    if (!Array.isArray(ids) || ids.length < 2 || ids.length > 6 || new Set(ids).size !== ids.length || ids.some((id) => !mockBots.some((b) => b.id === id))) bad('bot_ids');
+  }
+  if (body.mode !== undefined && !['round', 'debate', 'moderated'].includes(body.mode)) bad('mode');
+  if (!partial && body.mode === undefined) bad('mode');
+  if (body.max_rounds !== undefined && !(Number.isInteger(body.max_rounds) && body.max_rounds >= 1 && body.max_rounds <= 10)) bad('max_rounds');
+  if (body.token_budget != null && !(Number.isInteger(body.token_budget) && body.token_budget >= 1000 && body.token_budget <= 2000000)) bad('token_budget');
+}
+if (MOCK) window.__pushGroupEvent = (threadId, kind, payload) => mockPushEvent(threadId, kind, payload);  // для e2e: событие группы напрямую в тред
+export async function listGroups() {
+  if (MOCK) { await delay(); return mockGroups.map(mockGroupView); }
+  return request('/groups');
+}
+export async function getGroup(id) {
+  if (MOCK) { await delay(); return mockGroupView(mockGroupFind(id)); }
+  return request(`/groups/${encodeURIComponent(id)}`);
+}
+// body: {title, bot_ids, mode, max_rounds?, moderator_bot_id?, token_budget?}
+export async function createGroup(body) {
+  if (MOCK) {
+    await delay(250);
+    mockGroupValidate(body, false);
+    const rounds = body.max_rounds === undefined ? 3 : body.max_rounds;
+    if (body.mode === 'moderated' && !body.bot_ids.includes(body.moderator_bot_id)) mockFail(422, 'invalid', 'moderator_bot_id');
+    return mockGroupView(mockCreateGroupRecord({ ...body, title: body.title.trim(), max_rounds: rounds }));
+  }
+  return request('/groups', { method: 'POST', body });
+}
+export async function patchGroup(id, body) {
+  if (MOCK) {
+    await delay();
+    const g = mockGroupFind(id);
+    mockGroupValidate(body, true);
+    Object.assign(g, body);
+    return mockGroupView(g);
+  }
+  return request(`/groups/${encodeURIComponent(id)}`, { method: 'PATCH', body });
+}
+export async function deleteGroup(id) {
+  if (MOCK) {
+    await delay();
+    const g = mockGroupFind(id);
+    mockGroups.splice(mockGroups.indexOf(g), 1);
+    delete mockEvents[id];
+    return null;
+  }
+  return request(`/groups/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+// 202 {run_id}; 409 group_busy, если обсуждение уже идёт.
+export async function sendGroupMessage(id, text) {
+  if (MOCK) {
+    await delay(150);
+    const g = mockGroupFind(id);
+    const t = String(text || '');
+    if (t.length < 1 || t.length > 8000) mockFail(422, 'invalid', 'text');
+    const prev = mockGroupRuns[id];
+    if (prev && prev.status === 'running') mockFail(409, 'group_busy', 'group_busy');
+    if (MOCK_GROUPS_MODE === 'busy') mockFail(409, 'group_busy', 'group_busy');  // &groups=busy: обсуждение «уже идёт» для любой отправки
+    return { run_id: mockStartGroupRun(g, t) };
+  }
+  return request(`/groups/${encodeURIComponent(id)}/messages`, { method: 'POST', body: { text } });
+}
+export async function stopGroup(id) {
+  if (MOCK) {
+    await delay(150);
+    mockGroupFind(id);
+    const run = mockGroupRuns[id];
+    if (!run || run.status !== 'running') mockFail(409, 'not_running', 'not_running');
+    run.stopped = true;
+    mockGroupFinish(run, 'stopped', 'stopped');
+    return { run_id: run.id, status: 'stopped' };
+  }
+  return request(`/groups/${encodeURIComponent(id)}/stop`, { method: 'POST' });
+}
+
+// Реплики мок-обсуждения: два бота спорят, во втором раунде все соглашаются. Дальше (режим round) повторяют позиции.
+const MOCK_GROUP_LINES = [
+  ['Предлагаю начать с простого: один сервис, одна база, без очередей.', '[СОГЛАСЕН] Таблица задач в базе, брокер откладываем.', 'Повторю итог: один сервис и таблица задач.'],
+  ['Не согласен: без брокера при сбое потеряем задачи, нужен хотя бы Redis.', '[СОГЛАСЕН] Redis добавим позже, когда упрёмся в нагрузку.', 'Остаюсь на таблице задач.'],
+];
+function mockGroupLine(index, round) {
+  if (MOCK_DEMO) {
+    const lines = [
+      ['SQLite keeps setup simple on one server. WAL mode can handle our expected traffic.', '[AGREE] Start with Postgres if the existing service already runs it; that avoids a migration.'],
+      ['Postgres gives us stronger concurrent writes and familiar backups, with one more service to operate.', '[AGREE] For this hub, Postgres is already available. Use it and keep the task schema small.'],
+    ];
+    return lines[index % lines.length][Math.min(round, 2) - 1];
+  }
+  const row = MOCK_GROUP_LINES[index % MOCK_GROUP_LINES.length];
+  return row[Math.min(round, row.length) - 1];
+}
+function mockGroupPush(run, kind, payload, actor = 'system', turnId = null) {
+  mockPushEvent(run.thread_id, kind, payload, turnId, actor);
+}
+function mockGroupLog(run, code, extra = {}) {
+  const g = mockGroups.find((x) => x.id === run.thread_id);
+  mockActivity.unshift({ id: `mock:g${String(++mockActivitySeq).padStart(4, '0')}`, at: new Date().toISOString(), bot_id: null, thread_id: run.thread_id, kind: 'group',
+    title: { code, params: { title: g ? g.title : '', rounds: run.round, status: run.status } }, ...extra });
+}
+function mockGroupFinish(run, status, reason) {
+  if (run.status !== 'running') return;
+  run.status = status;
+  run.stop_reason = reason || null;
+  mockGroupPush(run, 'group_status', { run_id: run.id, status, round: run.round, ...(reason ? { stop_reason: reason } : {}) });
+  mockGroupLog(run, 'group_finished', { status });
+}
+function mockStartGroupRun(g, text) {
+  const run = { id: `run-${++mockGroupSeq}`, thread_id: g.id, status: 'running', round: 1, stopped: false };
+  mockGroupRuns[g.id] = run;
+  mockGroupPush(run, 'user_msg', { text }, 'owner');
+  mockGroupPush(run, 'group_status', { run_id: run.id, status: 'running', round: 1 });
+  mockGroupLog(run, 'group_started');
+  const all = g.members.slice().sort((a, b) => a.position - b.position);
+  const moderator = g.mode === 'moderated' ? all.find((m) => m.bot_id === g.moderator_bot_id) : null;
+  const members = moderator ? all.filter((m) => m !== moderator) : all; // модератор в обычных раундах не говорит
+  const step = (ms) => new Promise((r) => setTimeout(r, ms));
+  const say = async (m, text2, extra = {}) => {
+    mockGroupPush(run, 'group_turn', { run_id: run.id, round: run.round, bot_id: m.bot_id, bot_name: m.name });
+    await step(MOCK_GROUP_DELAY);
+    if (run.stopped) return false;
+    mockGroupPush(run, 'assistant_msg', { text: text2, final: true, bot_id: m.bot_id, bot_name: m.name, ...extra }, `bot:${m.bot_id}`, `turn-grp-${++mockGroupTurnSeq}`);
+    return true;
+  };
+  (async () => {
+    let reason = 'max_rounds';
+    for (let round = 1; round <= g.max_rounds; round += 1) {
+      run.round = round;
+      mockGroupPush(run, 'group_round', { round, max_rounds: g.max_rounds });
+      let agreed = 0;
+      for (let i = 0; i < members.length; i += 1) {
+        const line = mockGroupLine(i, round);
+        if (!(await say(members[i], line))) return;
+        if (/^\[(СОГЛАСЕН|AGREE|ПАС|PASS)\]/.test(line)) agreed += 1;
+      }
+      if (g.mode === 'debate' && agreed === members.length) { reason = 'agreed'; break; }
+      if (moderator) {
+        const last = round === g.max_rounds;
+        const text3 = last ? 'Итог: берём таблицу задач в базе, брокер откладываем.' : `Раунд ${round} закончен, продолжаем.`;
+        if (!(await say(moderator, text3, { role: 'moderator', ...(last ? { summary: true } : {}) }))) return;
+        if (last) { reason = 'moderator_done'; break; }
+      }
+    }
+    mockGroupFinish(run, 'done', reason);
+  })();
+  return run.id;
 }
 
 export async function listApprovals(status = 'pending') {
@@ -2261,15 +2680,49 @@ export async function listSchedules() {
   if (MOCK) { await delay(); return clone(mockSchedules); }
   return request('/schedules');
 }
+const MOCK_SUGGESTIONS_MODE = params.get('suggestions') || '';
+let mockSuggestionsFailed = false;
+const mockSuggestions = [
+  { id: 's1', bot_id: 'scout', text: 'Создать напоминание о дедлайне проекта в пятницу' },
+  { id: 's2', bot_id: 'coder', text: 'Прогнать линтер перед коммитом в репозиторий bothub' },
+];
+
+export async function listSuggestions() {
+  if (MOCK) {
+    await delay();
+    if (MOCK_SUGGESTIONS_MODE === 'fail' && !mockSuggestionsFailed) {
+      mockSuggestionsFailed = true;
+      throw new Error('Server error');
+    }
+    if (MOCK_SUGGESTIONS_MODE === 'none') return [];
+    return clone(mockSuggestions);
+  }
+  return request('/suggestions');
+}
+export async function acceptSuggestion(id) {
+  if (MOCK) { await delay(); return { thread_id: 't-scout' }; }
+  return request(`/suggestions/${encodeURIComponent(id)}/accept`, { method: 'POST' });
+}
+export async function dismissSuggestion(id) {
+  if (MOCK) {
+    await delay();
+    const idx = mockSuggestions.findIndex((s) => s.id === id);
+    if (idx !== -1) mockSuggestions.splice(idx, 1);
+    return { ok: true };
+  }
+  return request(`/suggestions/${encodeURIComponent(id)}/dismiss`, { method: 'POST' });
+}
 export async function patchSchedule(id, body) {
   if (MOCK) {
     await delay();
     const s = mockSchedules.find((x) => x.id === id);
     if (s) {
-      const { slack_signing_secret: secret, ...rest } = body;
+      const { slack_signing_secret: secret, slack_bot_token: botToken, email_signing_key: emailKey, ...rest } = body;
       Object.assign(s, rest);
-      // как на сервере: секрет только на запись, наружу идёт признак; null очищает
+      // как на сервере: секреты только на запись, наружу идут признаки; null очищает
       if ('slack_signing_secret' in body) s.has_slack_signing_secret = secret !== null && secret !== undefined && String(secret).trim() !== '';
+      if ('slack_bot_token' in body) s.has_slack_bot_token = botToken !== null && botToken !== undefined && String(botToken).trim() !== '';
+      if ('email_signing_key' in body) s.has_email_signing_key = emailKey !== null && emailKey !== undefined && String(emailKey).trim() !== '';
     }
     return clone(s);
   }
@@ -2339,6 +2792,15 @@ export async function listActivity({ botId, kinds, before, limit } = {}) {
   if (limit) query.set('limit', String(limit));
   const text = query.toString();
   return request(`/activity${text ? `?${text}` : ''}`);
+}
+
+export async function exportActivityCsv(days = 7) {
+  const period = [1, 7, 30, 90].includes(days) ? days : 7;
+  if (MOCK) {
+    await delay(150);
+    return `\ufefftime,bot,kind,code,title,detail\r\n${mockActivityAt(1)},Скаут,turn,turn_started,Задача начата,\r\n`;
+  }
+  return request(`/activity/export.csv?days=${period}`);
 }
 
 async function mockPauseGate() {
@@ -2601,6 +3063,112 @@ export async function macStatus() {
 export async function pushSubscribe(sub, device) {
   if (MOCK) return { ok: true };
   return request('/push/subscribe', { method: 'POST', body: { ...sub, device } });
+}
+
+// Канал Telegram бота (раздел 22)
+const mockTelegramChannels = new Map();
+export async function getTelegramChannel(botId) {
+  if (MOCK) return clone(mockTelegramChannels.get(botId) || { kind: 'telegram', enabled: false, allowed_chat_ids: [], token_last4: null, bot_id: botId });
+  return request(`/bots/${encodeURIComponent(botId)}/channels/telegram`);
+}
+
+export async function putTelegramChannel(botId, body) {
+  if (MOCK) {
+    const existing = mockTelegramChannels.get(botId);
+    if (!existing && !body.token) mockFail(400, 'invalid', 'token is required for new channel');
+    const channel = {
+      id: existing?.id || 'mock-ch-' + botId, bot_id: botId, kind: 'telegram',
+      enabled: body.enabled !== false, allowed_chat_ids: body.allowed_chat_ids || [],
+      token_last4: body.token ? body.token.slice(-4) : existing.token_last4,
+    };
+    mockTelegramChannels.set(botId, channel);
+    return clone(channel);
+  }
+  return request(`/bots/${encodeURIComponent(botId)}/channels/telegram`, { method: 'PUT', body });
+}
+
+export async function deleteTelegramChannel(botId) {
+  if (MOCK) { mockTelegramChannels.delete(botId); return { ok: true }; }
+  return request(`/bots/${encodeURIComponent(botId)}/channels/telegram`, { method: 'DELETE' });
+}
+
+// Public demo content is isolated from the e2e mock fixtures above.
+if (MOCK_DEMO) {
+  const profiles = {
+    scout: ['Researcher', 'Finds sources and writes concise research briefs', 'Three sources reviewed; summary ready', 'Ready'],
+    mac: ['Inbox Triage', 'Sorts messages and drafts replies', 'Two reply drafts ready for review', 'Ready'],
+    sre: ['Daily Digest', 'Summarizes the day and prepares a weekly report', 'Weekly report awaits approval', 'Waiting for approval'],
+    coder: ['PR Reviewer', 'Reviews pull requests and suggests fixes', 'Review complete; one edge case found', 'Ready'],
+    archive: ['Home Helper', 'Checks home status and answers simple questions', 'No urgent alerts at home', 'Ready'],
+  };
+  for (const bot of mockBots) {
+    const [name, role, summary, status_label] = profiles[bot.id] || ['Assistant', 'Helps with routine tasks', 'Ready for a new request', 'Ready'];
+    Object.assign(bot, { name, role, summary, status_label, status_kind: 'success', status: bot.id === 'sre' ? 'waiting' : 'idle', location: bot.executor === 'mac' ? 'Mac' : 'Server' });
+    const [providerId, model] = bot.id === 'scout' ? ['p-agy', 'gemini-3.1-pro-preview']
+      : bot.id === 'coder' ? ['p-openai', 'gpt-5.4'] : ['p-claude', 'claude-sonnet-5'];
+    Object.assign(bot, { provider_id: providerId, model_id: mockModelId(providerId, model), model, provider: providerId === 'p-agy' ? 'gemini' : providerId === 'p-openai' ? 'codex' : 'claude' });
+  }
+  for (const group of mockGroups) for (const member of group.members) member.name = mockBots.find((b) => b.id === member.bot_id).name;
+  const threads = {
+    scout: ['Compare database options', 'Compare Postgres and SQLite for a single-server bot hub.', ['Check write volume and backup needs', 'Compare setup and maintenance', 'Summarize the recommendation'], 'Postgres fits this setup because it is already running. SQLite is a good option for a new, smaller deployment.'],
+    mac: ['Triage the shared inbox', 'Sort the shared inbox and draft replies.', ['Collect unread messages', 'Mark action items', 'Draft two replies'], 'I found two messages that need replies. Both drafts are ready for review.'],
+    sre: ['Prepare the weekly report', 'Prepare a short weekly report for the team.', ['Gather completed work', 'Write the summary', 'Request approval before sending'], 'The report covers completed work, open decisions, and next steps. It is ready to send once approved.'],
+    coder: ['Review the API change', 'Review the request handler for missing error cases.', ['Read the change', 'Check failure paths', 'Suggest a focused test'], 'One missing error case needs a test. The suggested patch keeps the handler small.'],
+    archive: ['Check home status', 'Are any home sensors reporting an alert?', ['Read current sensor state', 'Summarize alerts'], 'All monitored sensors are normal. No action is needed.'],
+  };
+  for (const [id, [title, prompt, steps, reply]] of Object.entries(threads)) {
+    mockThreads[id].title = title;
+    mockEvents[`t-${id}`] = [
+      { seq: 1, kind: 'user_msg', actor: 'owner', client: 'mac', payload: { text: prompt } },
+      { seq: 2, kind: 'plan', actor: `bot:${id}`, payload: { steps: steps.map((step, index) => ({ id: String(index + 1), title: step, status: index === steps.length - 1 && id === 'sre' ? 'waiting_approval' : 'done' })) } },
+      { seq: 3, kind: 'usage', actor: `bot:${id}`, payload: { tokens_in: 1800, tokens_out: 420, model: mockBots.find((b) => b.id === id).model, seconds: 12 } },
+      { seq: 4, kind: 'assistant_msg', actor: `bot:${id}`, payload: { text: reply, final: true } },
+    ];
+  }
+  mockApprovals.splice(0, mockApprovals.length,
+    { id: 'ap1', thread_id: 't-scout', turn_id: 'tu1', bot_id: 'scout', risk: 'send', title: 'Share the research brief with team@example.com', tool: 'email.send', args: { to: 'team@example.com', subject: 'Database research brief' }, args_hash: 'demo-research', status: 'pending', expires_at: minutesAhead(30) },
+    { id: 'ap2', thread_id: 't-sre', turn_id: 'tu2', bot_id: 'sre', risk: 'send', title: 'Send the weekly report to team@example.com', tool: 'email.send', args: { to: 'team@example.com', subject: 'Weekly report' }, args_hash: 'demo-digest', status: 'pending', expires_at: minutesAhead(40) },
+  );
+  mockEvents['t-scout'].push({ seq: 5, kind: 'approval_req', actor: 'bot:scout', payload: { approval_id: 'ap1', risk: 'send', title: 'Share the research brief with team@example.com', tool: 'email.send', expires_at: minutesAhead(30) } });
+  mockEvents['t-sre'].push({ seq: 5, kind: 'approval_req', actor: 'bot:sre', payload: { approval_id: 'ap2', risk: 'send', title: 'Send the weekly report to team@example.com', tool: 'email.send', expires_at: minutesAhead(40) } });
+  mockEvents['t-sre'].push(...[
+    ['navigate', '', 'https://reports.example.com/weekly'], ['snapshot', '', null],
+    ['click', 'Weekly report', null], ['fill', 'Recipient', null], ['click', 'Preview report', null],
+  ].map(([action, target, url], i) => ({ seq: i + 6, ts: minutesAgo(5 - i), turn_id: 'tu2', kind: 'browser_step', actor: 'bot:sre', payload: { action, target, url, value: null, result: 'ok' } })));
+  mockActivity.length = 0;
+  mockLog(4, 'approval', 'approval_requested', 'scout', { thread_id: 't-scout', risk: 'send', status: 'pending', params: { tool: 'email.send' }, detail: 'Share the research brief with team@example.com' });
+  mockLog(7, 'turn', 'turn_done', 'scout', { thread_id: 't-scout', status: 'done', params: { client: 'mac' } });
+  mockLog(12, 'browser', 'browser_step', 'sre', { thread_id: 't-sre', status: 'ok', params: { action: 'navigate', url: 'https://reports.example.com/weekly' } });
+  mockLog(22, 'turn', 'turn_done', 'coder', { thread_id: 't-coder', status: 'done', params: { client: 'hook' } });
+  mockLog(65, 'schedule', 'schedule_run', 'archive', { thread_id: 't-archive', params: { name: 'Home status check' } });
+  mockLog(140, 'turn', 'turn_done', 'mac', { thread_id: 't-mac', status: 'done', params: { client: 'mac' } });
+  mockActivity.sort((a, b) => b.at.localeCompare(a.at));
+  mockSuggestions.splice(0, mockSuggestions.length,
+    { id: 's1', bot_id: 'scout', text: 'Compare backup options for the shared database' },
+    { id: 's2', bot_id: 'coder', text: 'Review the API error handling before release' });
+  mockWakeups.splice(0, mockWakeups.length,
+    { id: 'w1', bot_id: 'scout', thread_id: 't-scout', scheduled_at: minutesAhead(180), status: 'active', prompt: 'Check whether the database research needs an update', reason: 'Review research sources', skip_reason: null, created_at: minutesAgo(10), fired_at: null },
+    { id: 'w2', bot_id: 'scout', thread_id: 't-scout', scheduled_at: minutesAhead(2 * 24 * 60), status: 'active', prompt: 'Remind the team to review the database brief', reason: 'Review the database brief', skip_reason: null, created_at: minutesAgo(9), fired_at: null });
+  MOCK_CATALOG.find((x) => x.id === 'researcher').name = 'Researcher';
+  MOCK_CATALOG.find((x) => x.id === 'researcher')._doc.name = 'Researcher';
+  for (const [id, name] of [['mail_triage', 'Inbox Triage'], ['house_helper', 'Home Helper']]) {
+    const entry = MOCK_CATALOG.find((x) => x.id === id);
+    entry.name = name;
+    entry._doc.name = name;
+  }
+  mockMemoryProposed.length = 0;
+  mockMemoryActive.length = 0;
+  mockSchedules.length = 0;
+  mockProcs.length = 0;
+  mockProcRuns.length = 0;
+  mockProviders.forEach((p) => {
+    if (p.status === 'error') { p.status = 'ok'; p.last_error = null; }
+    if (p.id === 'p-openai') p._keyBad = false;
+    if (p.id === 'p-ollama') { p.name = 'Local model'; p.base_url = 'https://models.example.com/v1'; }
+  });
+  const demoCodexModel = mockModels.find((m) => m.provider_id === 'p-openai' && m.name === 'gpt-5.4');
+  if (demoCodexModel) demoCodexModel.enabled = true;
+  mockUsers.splice(0, mockUsers.length, { id: 'u-admin', email: 'admin@example.com', role: 'admin', status: 'active', created_at: minutesAgo(60 * 24 * 40) });
 }
 
 export function botById(id) {

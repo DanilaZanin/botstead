@@ -214,6 +214,10 @@ async def test_background_loops_survive_exception_in_one_pass(monkeypatch, caplo
         return None
 
     setattr(app.state, hook, flaky)
+    if loop_name == "worker":
+        async def no_groups():  # group_tick uses the pool; only claim_turn is under test here
+            return False
+        app.state.group_tick = no_groups
     if loop_name == "scheduler":
         async def no_wakeups():  # в этом тесте нет пула; пробуждения проверяются отдельно (test_wakeups_*)
             return None

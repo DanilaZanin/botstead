@@ -235,6 +235,16 @@ async def test_agy_check_with_nonzero_exit_stays_error_even_with_models(monkeypa
 
 
 @pytest.mark.pure
+async def test_failed_check_preserves_expired_login_status(monkeypatch):
+    state = {'status': 'needs_login', 'last_error': None, 'last_check_at': None}
+    client, url, _, synced, _ = _subscription_env(monkeypatch, 'agy', b'', code=1, state=state)
+    async with client:
+        response = await client.post(url, headers=AUTH)
+    assert response.json()['status'] == 'needs_login'
+    assert synced == []
+
+
+@pytest.mark.pure
 def test_parse_agy_models_rules():
     long_name = 'n' * 81
     ok_name = 'n' * 80

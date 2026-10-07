@@ -669,7 +669,9 @@ async def test_mac_call_approval_applies_only_to_same_tool_and_args():
     gate = asyncio.Event()
     runner = Runner(events=[RunnerEvent("assistant_msg", {"text": "w", "final": False}), GATE], gate=gate)
     async with api(runner) as (client, app, _):
-        await make_bot(client, mac_full_control=True)
+        mac = await client.post("/api/macs", json={"name": "Test Mac"}, headers=OWNER)
+        assert mac.status_code == 201, mac.text
+        await make_bot(client, mac_id=mac.json()["id"], mac_full_control=True)
         thread = await make_thread(client)
         turn = await post_turn(client, thread["id"])
         await until(lambda: _is(app, turn["id"], "running"))

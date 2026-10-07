@@ -85,6 +85,16 @@ async def test_invite_single_use_and_cross_user_bot_isolation():
         assert (await client.patch(f"/api/bots/{bot.json()['id']}", json={"name": "Taken"}, headers={"X-CSRF": (await client.get('/api/auth/me')).json()["csrf_token"], "Origin": "https://testserver"})).status_code == 404
 
 
+async def test_invite_accept_rejects_long_email_without_echo():
+    async for client, _ in _client():
+        email = 'a' * 1_000_000 + '@example.com'
+        response = await client.post('/api/invites/accept', json={
+            'token': 'unused', 'email': email, 'password': 'long-password'})
+        assert response.status_code == 400
+        assert response.json() == {'error': 'invalid', 'detail': 'email'}
+        assert email not in response.text
+
+
 async def test_session_hash_only_and_bearer_has_no_csrf():
     async for client, app in _client():
         await client.post("/api/setup", json={"email": "a@example.com", "password": "long-password"}, headers=OWNER)

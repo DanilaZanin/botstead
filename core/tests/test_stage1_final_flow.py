@@ -22,9 +22,12 @@ from starlette.testclient import TestClient
 from bothub.main import canonical, create_app
 from bothub.risk import op_hash
 
+pytestmark = pytest.mark.pure
+
 BOT = "scout"
 THREAD = uuid.uuid4()
 OWNER_ID = uuid.UUID(int=1)
+MAC_ID = uuid.UUID(int=2)
 
 
 def bot_token(bot_id=BOT):
@@ -489,6 +492,8 @@ class MacDB(Turns):
         self.mac_state = "online"
         self.turn_status = "running"
         self.claims = 0
+        self.mac_id = MAC_ID
+        self.mac_token_hash = hashlib.sha256(b"test-mac").hexdigest()
 
     def approve(self, tool, args, remember=False):
         self.approvals.append({"id": uuid.uuid4(), "turn_id": None, "op_hash": op_hash(tool, args), "used_at": None, "remember": remember,
@@ -499,18 +504,26 @@ class MacCon(TurnsCon):
     async def fetchrow(self, sql, *args):
         if "select b.owner_id from bothub.bots b" in sql:
             return await super().fetchrow(sql, *args)
+        if "from bothub.macs" in sql:
+            return {"id": self.db.mac_id, "owner_id": OWNER_ID, "token_hash": self.db.mac_token_hash}
         if "from bothub.turns" in sql and "thread_id=$2" in sql:
             turn = self.db.turns.get(str(args[0]))
-            return {"status": turn["status"] if turn else self.db.turn_status}
+            return {"status": turn["status"] if turn else self.db.turn_status, "turn_type": "normal"}
         if "bothub.threads" in sql and "select" in sql:
             return {"bot_id": BOT}
         if "from bothub.bots" in sql:
-            return {"executor": "mac", "mac_full_control": False, "auto_allow": []}
+            return {"executor": "mac", "mac_full_control": False, "auto_allow": [], "mac_id": self.db.mac_id}
         return await super().fetchrow(sql, *args)
 
     async def fetchval(self, sql, *args):
         if "bothub.settings" in sql:
             return True  # legacy_auth_enabled: поддельная база ведёт себя как установка, обновлённая через OWNER_TOKEN
+        if "select 1 from bothub.macs where id=$1 and owner_id=$2" in sql:
+            return 1 if args == (self.db.mac_id, OWNER_ID) else None
+        if "select 1 from bothub.macs where id=$1 and token_hash=$2" in sql:
+            return 1 if args == (self.db.mac_id, self.db.mac_token_hash) else None
+        if "select 1 from bothub.macs m join bothub.bots b on b.mac_id=m.id" in sql:
+            return 1 if args == (self.db.mac_id, OWNER_ID, BOT) else None
         if "select 1 from bothub.mac_status" in sql:
             return 1
         if "update bothub.approvals set used_at=case when remember" in sql:
@@ -531,7 +544,8 @@ class MacCon(TurnsCon):
                 if approval["id"] == args[0]:
                     approval["used_at"] = None
             return None
-        if "runner_ping_at" in sql or "insert into bothub.mac_status" in sql or "update bothub.mac_status" in sql:
+        if ("runner_ping_at" in sql or "insert into bothub.mac_status" in sql or "update bothub.mac_status" in sql
+                or "update bothub.macs set last_seen_at" in sql):
             return None
         return await super().execute(sql, *args)
 
@@ -578,7 +592,7 @@ def test_mac_approval_works_once_and_repeat_is_blocked(mac_env):
     args = {"text": "hello"}
     db.approve("mcp__bothub__mac_type_text", args)
     body = _call_body(args)
-    with TestClient(app) as client, client.websocket_connect("/agent/mac?token=test-mac") as ws:
+    with TestClient(app) as client, client.websocket_connect("/agent/mac", headers={"Authorization": "Bearer test-mac"}) as ws:
         _hello(ws)
         first = _serve_one(client, ws, body)
         assert first.status_code == 200, first.text
@@ -594,7 +608,7 @@ def test_mac_approval_with_remember_is_not_spent(mac_env):
     args = {"text": "hello"}
     db.approve("mcp__bothub__mac_type_text", args, remember=True)
     body = _call_body(args)
-    with TestClient(app) as client, client.websocket_connect("/agent/mac?token=test-mac") as ws:
+    with TestClient(app) as client, client.websocket_connect("/agent/mac", headers={"Authorization": "Bearer test-mac"}) as ws:
         _hello(ws)
         for _ in range(3):
             assert _serve_one(client, ws, body).status_code == 200
@@ -606,7 +620,7 @@ def test_one_shot_approval_is_spent_before_remembered_one(mac_env):
     args = {"text": "hello"}
     db.approve("mcp__bothub__mac_type_text", args, remember=True)
     db.approve("mcp__bothub__mac_type_text", args)
-    with TestClient(app) as client, client.websocket_connect("/agent/mac?token=test-mac") as ws:
+    with TestClient(app) as client, client.websocket_connect("/agent/mac", headers={"Authorization": "Bearer test-mac"}) as ws:
         _hello(ws)
         assert _serve_one(client, ws, _call_body(args)).status_code == 200
     assert db.approvals[1]["used_at"] is not None and db.approvals[0]["used_at"] is None
@@ -623,7 +637,7 @@ def test_mac_approval_survives_an_offline_mac_and_is_spent_on_the_retry(mac_env)
         assert offline.status_code == 409 and offline.json()["error"] == "mac_unavailable"
         assert db.approvals[0]["used_at"] is None             # до Mac не дошло: одобрение цело
         db.mac_state = "online"
-        with client.websocket_connect("/agent/mac?token=test-mac") as ws:
+        with client.websocket_connect("/agent/mac", headers={"Authorization": "Bearer test-mac"}) as ws:
             _hello(ws)
             assert _serve_one(client, ws, body).status_code == 200
         assert db.approvals[0]["used_at"] is not None
@@ -648,7 +662,7 @@ def test_mac_call_at_turn_limit_waits_in_waiting_mac_and_keeps_approval(monkeypa
     turn_id = body["turn_id"]
     db.turns[turn_id] = {"status": "waiting_mac", "thread_id": THREAD}
     db.turns["other"] = {"status": "running", "thread_id": THREAD}
-    with TestClient(app) as client, client.websocket_connect("/agent/mac?token=test-mac") as ws:
+    with TestClient(app) as client, client.websocket_connect("/agent/mac", headers={"Authorization": "Bearer test-mac"}) as ws:
         _hello(ws)
         queued = _mac_call(client, body)
         assert queued.status_code == 409 and queued.json()["error"] == "queued"

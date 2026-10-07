@@ -197,10 +197,10 @@ async def test_nul_path_ids_are_404_without_a_database_call(client, app):
 
 # ---- п. 3: ValidationError без значения --------------------------------------------------------------------------
 
-async def test_patch_bot_with_a_long_mcp_allow_item_is_422_without_the_value(client, app):
+async def test_patch_bot_with_a_long_mcp_allow_item_is_400_without_the_value(client, app):
     headers = owner_headers(app)
     response = await client.patch("/api/bots/scout", json={"mcp_allow": [LEAK + "x" * 300]}, headers=headers)
-    assert "mcp_allow" in refused(response)["detail"]
+    assert "mcp_allow" in refused(response, 400)["detail"]
 
 
 async def test_patch_bot_other_schema_errors_are_400_without_the_value(client, app):

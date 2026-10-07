@@ -18,6 +18,14 @@ export function runnerKind(provider) {
   return RUNNER[provider.kind] || 'claude';
 }
 
+// Что показывать в панели «Квоты» у треда бота (зеркало quota_panel_mode в core/bothub/main.py):
+// бот на подписочном CLI (провайдер-подписка, cli совпадает с runner-провайдером бота) - метр квоты этого CLI,
+// иначе (API-ключ или «Свой адрес») - расход самого бота в долларах и токенах, без чужих подписок.
+export function quotaPanelMode(bot, provider) {
+  if (provider && provider.kind === 'cli_subscription' && runnerKind(provider) === bot.provider) return 'subscription';
+  return 'usage';
+}
+
 export function kindLabel(provider) {
   if (provider.kind === 'cli_subscription') return 'Подписка';
   if (provider.kind === 'openai_compatible') return 'Свой адрес';
@@ -99,6 +107,7 @@ export function pendingProblem(p) {
 export function providerStatus(p, { ago = true } = {}) {
   const cli = p.kind === 'cli_subscription';
   if (p.status === 'ok') return { kind: 'success', text: cli ? 'Вход выполнен' : `Работает${ago && p.last_check_at ? ` · проверен ${fmtAgo(p.last_check_at)}` : ''}` };
+  if (cli && p.status === 'needs_login') return { kind: 'attention', text: 'Нужен повторный вход', problem: providerProblem(p) };
   if (p.status === 'error') {
     const problem = providerProblem(p);
     return { kind: problem.code === 'login' ? 'attention' : 'danger', text: problem.short, problem };

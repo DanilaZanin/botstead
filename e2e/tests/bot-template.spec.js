@@ -19,7 +19,7 @@ test.describe('экспорт и импорт шаблона бота', () => {
     expect(doc.version).toBe(1);
     expect(Object.keys(doc).sort()).toEqual([
       'auto_allow', 'auto_compact_percent', 'avatar', 'budget_daily_tokens',
-      'executor', 'format', 'instructions', 'mcp_allow', 'name', 'procedures',
+      'executor', 'format', 'instructions', 'mcp_allow', 'name', 'proactive_interval_hours', 'procedures',
       'role', 'schedules', 'version',
     ]);
     expect(doc.name).toBe('Скаут');

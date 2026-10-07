@@ -15,6 +15,8 @@ from bothub.builder import BASE_AUTO_ALLOW, validate_draft
 from bothub.main import create_app, decide_permission
 from bothub.risk import MAC_RISKY_TOOLS, classify, op_hash, permission_class, remember_rule, rule_matches
 
+pytestmark = pytest.mark.pure
+
 SHELL = "mcp__bothub__mac_shell"
 OWNER_PINNED = "owner-pinned"
 
@@ -558,12 +560,12 @@ async def test_mac_call_delegate_rejects_legacy_auto_allow_without_db(monkeypatc
     class Connection:
         async def fetchrow(self, sql, *values):
             if "bothub.turns" in sql:  # запрос turn теперь соединяется с threads ради владельца: проверяем раньше
-                return {"status": "running"}
+                return {"status": "running", "turn_type": "normal"}
             if "bothub.threads" in sql:
                 return {"bot_id": "scout"}
             if "bothub.bots" in sql:
                 return {"executor": "container", "mac_full_control": mac_full_control, "owner_id": uuid.UUID(int=1), "status": "active",
-                        "auto_allow": [{"tool": "mcp__bothub__mac_delegate", "match": args}]}
+                        "auto_allow": [{"tool": "mcp__bothub__mac_delegate", "match": args}], "mac_id": uuid.UUID(int=2)}
             raise AssertionError(sql)
 
         async def execute(self, sql, *values):

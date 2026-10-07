@@ -16,11 +16,12 @@ class TurnContext:
     launcher: object | None = None
     bot_container_id: str | None = None
     exec_env: dict[str, str] = field(default_factory=dict)
-    turn_type: str = 'normal'  # 'compact': служебный ход сжатия, раннер запускает CLI без инструментов (раздел 15 контракта)
+    turn_type: str = 'normal'  # compact/proactive запускаются с ограниченными инструментами CLI
 
     @property
     def compact(self) -> bool:
-        return self.turn_type == 'compact'
+        """Раннер применяет ограничения CLI к обоим служебным ходам."""
+        return self.turn_type in ('compact', 'proactive')
 
 
 @dataclass

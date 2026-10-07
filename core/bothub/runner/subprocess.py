@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 from collections.abc import AsyncIterator
 
@@ -10,6 +11,65 @@ from .base import RunnerEvent, TurnContext
 from bothub.context import usable_window
 from bothub.mcp_policy import McpNotAllowed, mcp_allowed
 from bothub.launcher_client import ExecChunk, ExecExit, LineSplitter
+
+
+CLI_AUTH_EXPIRED = 'cli_auth_expired'
+CLI_AUTH_MESSAGE = 'Provider sign-in expired: sign in again in Settings → Providers'
+
+
+class CliAuthExpired(RuntimeError):
+    def __init__(self):
+        super().__init__(CLI_AUTH_MESSAGE)
+
+
+def is_cli_auth_error(text: str, *, diagnostic: bool = True) -> bool:
+    """Узнаёт отказ входа CLI без публикации диагностического текста в треде."""
+    if not isinstance(text, str):
+        return False
+    if not diagnostic:
+        return bool(re.search(
+            r'^\s*(?:(?:error|fatal|authentication error):\s*)?'
+            r'(?:failed to authenticate|oauth session expired|not logged in|login required|'
+            r'please run\s+/?login\b|invalid_grant|authentication required)',
+            text, re.IGNORECASE,
+        ))
+    if re.search(
+        r'failed to authenticate|oauth session expired|not logged in|login required|'
+        r'please run\s+/?login\b|invalid_grant|authentication required',
+        text, re.IGNORECASE,
+    ):
+        return True
+    return bool(re.search(
+        r'\b(?:http(?:\s+error)?|status(?:\s+code)?|error|unauthorized)\s*[:=]?\s*401\b|'
+        r'^\s*401(?:\s+unauthorized)?\s*$', text, re.IGNORECASE,
+    ))
+
+
+def _auth_error_message(message: dict) -> bool:
+    kind = message.get('type') or message.get('event')
+    item = message.get('item') or {}
+    result = message.get('result') or {}
+    candidates = []
+    if kind in ('error', 'turn.failed') or kind == 'item.completed' and item.get('type') == 'error':
+        candidates.extend((message.get('message'), message.get('error'), item.get('message')))
+    if kind == 'result' and (message.get('is_error') or message.get('subtype') == 'error'):
+        candidates.extend((message.get('result'), message.get('error')))
+    if kind == 'result' and isinstance(result, dict) and result.get('status') == 'ERROR':
+        candidates.append(result.get('error'))
+    if kind == 'assistant':
+        return any(is_cli_auth_error(block.get('text'), diagnostic=False)
+                   for block in (message.get('message') or {}).get('content', ())
+                   if isinstance(block, dict) and block.get('type') == 'text')
+    if kind == 'item.completed' and item.get('type') == 'agent_message':
+        return is_cli_auth_error(item.get('text'), diagnostic=False)
+    if kind == 'step_update' and (message.get('step_update') or {}).get('step_type') == 'agent_response':
+        return is_cli_auth_error(message['step_update'].get('text_delta'), diagnostic=False)
+    for value in candidates:
+        if isinstance(value, dict):
+            value = value.get('message') or value.get('error')
+        if is_cli_auth_error(value):
+            return True
+    return False
 
 
 class SubprocessRunner:
@@ -63,8 +123,12 @@ class SubprocessRunner:
                             try:
                                 message = json.loads(line)
                             except (json.JSONDecodeError, UnicodeError):
+                                if is_cli_auth_error(line.decode('utf-8', 'replace')):
+                                    raise CliAuthExpired()
                                 continue
                             if isinstance(message, dict):
+                                if _auth_error_message(message):
+                                    raise CliAuthExpired()
                                 # codex/claude печатают сбой в stdout JSON-строкой ({"type":"error"} или turn.failed):
                                 # запоминаем текст, чтобы turn_error сказал причину, а не только код выхода
                                 if message.get('type') in ('error', 'turn.failed'):
@@ -83,7 +147,11 @@ class SubprocessRunner:
                 if tail:
                     try: message = json.loads(tail)
                     except (json.JSONDecodeError, UnicodeError): message = None
+                    if message is None and is_cli_auth_error(tail.decode('utf-8', 'replace')):
+                        raise CliAuthExpired()
                     if isinstance(message, dict):
+                        if _auth_error_message(message):
+                            raise CliAuthExpired()
                         for event in self.parse(message):
                             session_id = event.cli_session_id or session_id
                             event.cli_session_id = session_id
@@ -94,13 +162,16 @@ class SubprocessRunner:
                             yield event
                 if exit_code and turn.turn_id not in self._stopped:
                     detail = ' '.join(stderr_tail.decode('utf-8', 'replace').split())[-300:]
+                    if is_cli_auth_error(detail):
+                        raise CliAuthExpired()
                     raise RuntimeError(f'{self.provider} exited with status {exit_code}' + (f': {detail}' if detail else ''))
-            except McpNotAllowed:
+            except (McpNotAllowed, CliAuthExpired) as exc:
                 # закрытие потока не гарантирует остановку процесса в контейнере: убиваем явно, вызов уже не должен идти дальше
                 try:
                     await turn.launcher.stop_exec(turn.turn_id, bot_id=turn.bot_container_id)
                 except Exception:
-                    logging.getLogger(__name__).warning('mcp_not_allowed_stop_failed', extra={'turn_id': turn.turn_id}, exc_info=True)
+                    label = 'cli_auth_stop_failed' if isinstance(exc, CliAuthExpired) else 'mcp_not_allowed_stop_failed'
+                    logging.getLogger(__name__).warning(label, extra={'turn_id': turn.turn_id}, exc_info=True)
                 raise
             finally:
                 self._launchers.pop(turn.turn_id, None)
@@ -118,7 +189,8 @@ class SubprocessRunner:
             start_new_session=True,
         )
         self._processes[turn.turn_id] = process
-        stderr_task = asyncio.create_task(self._drain_stderr(process.stderr))
+        stderr_tail = bytearray()
+        stderr_task = asyncio.create_task(self._drain_stderr(process.stderr, stderr_tail))
         started = asyncio.get_running_loop().time()
         try:
             assert process.stdin and process.stdout
@@ -134,9 +206,13 @@ class SubprocessRunner:
                     try:
                         message = json.loads(line)
                     except (json.JSONDecodeError, UnicodeError):
+                        if is_cli_auth_error(line.decode('utf-8', 'replace')):
+                            raise CliAuthExpired()
                         continue  # Diagnostic text may contain credentials; never publish it.
                     if not isinstance(message, dict):
                         continue
+                    if _auth_error_message(message):
+                        raise CliAuthExpired()
                     for event in self.parse(message):
                         session_id = event.cli_session_id or session_id
                         event.cli_session_id = session_id
@@ -146,7 +222,10 @@ class SubprocessRunner:
                         self.guard(turn, event)
                         yield event
                 code = await process.wait()
+                await stderr_task
             if code and turn.turn_id not in self._stopped:
+                if is_cli_auth_error(stderr_tail.decode('utf-8', 'replace')):
+                    raise CliAuthExpired()
                 raise RuntimeError(f"{self.provider} exited with status {code}")
         except TimeoutError as exc:
             raise TimeoutError(f"{self.provider} exceeded {timeout} seconds") from exc
@@ -207,10 +286,11 @@ class SubprocessRunner:
         await process.wait()
 
     @staticmethod
-    async def _drain_stderr(stream: asyncio.StreamReader | None) -> None:
+    async def _drain_stderr(stream: asyncio.StreamReader | None, tail: bytearray) -> None:
         if stream:
-            while await stream.read(65536):
-                pass
+            while chunk := await stream.read(65536):
+                tail.extend(chunk)
+                del tail[:-2048]
 
 
 def token_count(usage: dict, *keys: str) -> int:

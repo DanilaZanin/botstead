@@ -58,6 +58,12 @@ async def make_bot(client, bot_id="scout", **changes):
     return response.json()
 
 
+async def make_mac(client, name="Test Mac"):
+    response = await client.post("/api/macs", json={"name": name}, headers=OWNER)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
 async def make_thread(client, bot_id="scout"):
     response = await client.post("/api/threads", json={"bot_id": bot_id, "title": "Test"}, headers=OWNER)
     assert response.status_code in (200, 201), response.text
@@ -189,7 +195,8 @@ async def test_mac_call_unavailable():
         await asyncio.sleep(10)
     hang.run = stay
     async with api(hang) as (client, _, _):
-        await make_bot(client, mac_full_control=True)
+        mac = await make_mac(client)
+        await make_bot(client, mac_id=mac["id"], mac_full_control=True)
         thread = await make_thread(client)
         turn = (await client.post(f"/api/threads/{thread['id']}/turns", json={"prompt": "screen", "client": "api"}, headers=OWNER)).json()
         for _ in range(50):
@@ -210,7 +217,8 @@ def test_mac_call_with_websocket_agent():
     hang.run = stay
     app = create_app(lambda provider: hang)
     with TestClient(app) as client:
-        assert client.post("/api/bots", json={"id": "scout", "name": "Scout", "provider": "fake", "model": "fake", "mac_full_control": True}, headers=OWNER).status_code in (200, 201)
+        mac = client.post("/api/macs", json={"name": "Test Mac"}, headers=OWNER).json()
+        assert client.post("/api/bots", json={"id": "scout", "name": "Scout", "provider": "fake", "model": "fake", "mac_id": mac["id"], "mac_full_control": True}, headers=OWNER).status_code in (200, 201)
         thread = client.post("/api/threads", json={"bot_id": "scout"}, headers=OWNER).json()
         turn = client.post(f"/api/threads/{thread['id']}/turns", json={"prompt": "screen", "client": "api"}, headers=OWNER).json()
         for _ in range(50):
@@ -218,7 +226,7 @@ def test_mac_call_with_websocket_agent():
             if any(e["kind"] == "assistant_msg" for e in events):
                 break
             time.sleep(0.05)
-        with client.websocket_connect("/agent/mac?token=test-mac") as ws:
+        with client.websocket_connect("/agent/mac", headers={"Authorization": "Bearer " + mac["token"]}) as ws:
             ws.send_json({"type": "hello", "host": "test", "os": "macOS", "agent_version": "1", "permissions": {"files": True, "screen": True, "automation": True, "accessibility": True}})
             for _ in range(20):
                 if client.get("/api/mac/status", headers=OWNER).json()["state"] == "online":

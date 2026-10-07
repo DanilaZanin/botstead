@@ -60,7 +60,7 @@ class Config:
         return self.bothub_urls or (self.bothub_url,)
 
     def ws_url_for(self, url: str) -> str:
-        return f"{_http_to_ws(url)}?token={self.mac_agent_token}"
+        return _http_to_ws(url)
 
     @property
     def ws_url(self) -> str:
