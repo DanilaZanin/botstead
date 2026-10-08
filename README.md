@@ -2,6 +2,8 @@
 
 Botstead is an open-source, self-hosted platform for running autonomous AI bots. Each container-backed bot runs on its own isolated virtual computer with a dedicated Linux container and a dedicated headed web browser.
 
+> Botstead is my flagship pet project. I build it in the open and treat it like production work: thousands of automated tests, security reviews, and a live staging instance on my own server.
+
 ## See it in action
 
 **Create from catalog.** Pick the research template, name the bot Researcher, and open its thread.
